@@ -1,0 +1,9 @@
+stages:
+  - repo_inventory
+  - current_state_audit
+  - market_gap_analysis
+  - first_principles
+  - flywheel_designer
+  - convergence_contract
+  - product_definition
+  - feedback_agent

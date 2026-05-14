@@ -1,0 +1,25 @@
+stages:
+  - repo_inventory
+  - current_state_audit
+  - baseline_app_shell
+  - market_gap_analysis
+  - first_principles
+  - flywheel_designer
+  - convergence_contract
+  - product_definition
+  - monetization_architect
+  - feedback_agent
+  - builder
+  - independent_qa
+  - release_agent
+  - growth_operator
+  - investor_panel
+
+# Re-run from `convergence_contract` through `investor_panel` until every archetype grade is A- or better,
+# or `max_rounds` is exhausted (then `investor_panel` fails the pipeline). Restarting from
+# `convergence_contract` (instead of `current_state_audit`) keeps the convergence loop tight: repo facts
+# don't change between rounds, only the contract narrows in response to investor objections. The
+# persistent `.foundry/product-ledger.json` preserves parked features across rounds.
+investor_refinement:
+  restart_from: convergence_contract
+  max_rounds: 3

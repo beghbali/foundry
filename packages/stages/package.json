@@ -1,0 +1,34 @@
+{
+  "name": "@foundry/stages",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./repo_inventory": "./src/repo_inventory.ts",
+    "./current_state_audit": "./src/current_state_audit.ts",
+    "./baseline_app_shell": "./src/baseline_app_shell.ts",
+    "./market_gap_analysis": "./src/market_gap_analysis.ts",
+    "./first_principles": "./src/first_principles.ts",
+    "./flywheel_designer": "./src/flywheel_designer.ts",
+    "./convergence_contract": "./src/convergence_contract.ts",
+    "./product_definition": "./src/product_definition.ts",
+    "./monetization_architect": "./src/monetization_architect.ts",
+    "./builder": "./src/builder.ts",
+    "./independent_qa": "./src/independent_qa.ts",
+    "./release_agent": "./src/release_agent.ts",
+    "./growth_operator": "./src/growth_operator.ts",
+    "./feedback_agent": "./src/feedback_agent.ts",
+    "./connectors/web": "./src/connectors/web.ts"
+  },
+  "dependencies": {
+    "@foundry/core": "workspace:*",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@foundry/core": ["./packages/core/src/index.ts"],
+      "@foundry/core/*": ["./packages/core/src/*"],
+      "@foundry/stages": ["./packages/stages/src/index.ts"],
+      "@foundry/stages/*": ["./packages/stages/src/*"]
+    }
+  },
+  "include": ["apps/**/*.ts", "packages/**/*.ts"],
+  "exclude": ["node_modules", "**/node_modules/**"]
+}
