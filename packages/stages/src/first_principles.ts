@@ -1,4 +1,13 @@
 import { writeStageMarkdown } from "@foundry/core/artifacts";
+import {
+  domainSummaryLine,
+  getDomainKeyUserActions,
+  getDomainPrimaryMetric,
+  getDomainPrimaryUserAction,
+  getDomainSuccessExamples,
+  getDomainVocabulary,
+  hasDomain,
+} from "@foundry/core/projectDomain";
 import { StageInputCompositionSchema, type StageInputComposition } from "@foundry/core/stageInputs";
 import type { RunContext, Stage } from "@foundry/core/types";
 import { z } from "zod";
@@ -219,8 +228,18 @@ function buildGeneric(
   complaints: Array<{ theme: string }>,
   gaps: Array<{ gap: string; howWeWin: string }>,
 ): FirstPrinciplesOutput {
-  const northStar = input.config.project.north_star;
-  const topGap = gaps[0]?.gap ?? "core user job";
+  const project = input.config.project;
+  const northStar = project.north_star;
+  // Domain block (when present) anchors all wedge moves on the configured
+  // primary user action / vocabulary instead of the generic "core user job".
+  const domainPresent = hasDomain(project);
+  const domainPrimary = getDomainPrimaryUserAction(project);
+  const domainActions = getDomainKeyUserActions(project);
+  const domainExamples = getDomainSuccessExamples(project);
+  const domainMetric = getDomainPrimaryMetric(project);
+  const domainVocab = getDomainVocabulary(project);
+  const domainSummary = domainSummaryLine(project);
+  const topGap = domainPrimary || gaps[0]?.gap || "core user job";
   const topComplaint = complaints[0]?.theme ?? "high cognitive load";
 
   return {
@@ -253,36 +272,67 @@ function buildGeneric(
           "Design for shareable outcomes before investing in paid acquisition.",
       },
     ],
-    wedge_moves: [
-      {
-        move: `Single-session value for ${topGap.toLowerCase()}`,
-        why_it_wins:
-          "Users who see value in the first session are far more likely to return. Competing products require too much setup.",
-        moat_vector: "workflow" as const,
-        minimum_viable_proof:
-          "50 new users complete the core job in session one; >40% return within 7 days.",
-      },
-      {
-        move: hasSupabase
-          ? "User-context data loop via Supabase-backed profiles"
-          : "User-context data loop from lightweight profiles",
-        why_it_wins:
-          "Every interaction improves future recommendations. This compounds into a data advantage.",
-        moat_vector: "data" as const,
-        minimum_viable_proof:
-          "Recommendation acceptance rate trends upward over 4 weeks of active usage.",
-      },
-      {
-        move: hasExpo
-          ? "Mobile-native contextual capture"
-          : "Low-friction capture at the point of action",
-        why_it_wins:
-          "Capturing user context at the moment of need is an engineering moat that dashboard products cannot replicate.",
-        moat_vector: "engineering" as const,
-        minimum_viable_proof:
-          "Median interaction time for the core action is under 15 seconds.",
-      },
-    ],
+    wedge_moves: domainPresent
+      ? [
+          {
+            move: domainPrimary
+              ? `Make this moment unbeatable: ${domainPrimary}`
+              : `Make the primary ${domainVocab.noun} unbeatable`,
+            why_it_wins: `${domainSummary ?? "The configured primary action"} is the moment users hire the product for. Owning it makes alternatives feel slow or generic.`,
+            moat_vector: "workflow" as const,
+            minimum_viable_proof: domainMetric
+              ? `Hit ${domainMetric} for the primary ${domainVocab.noun} on real ${domainVocab.actor} sessions.`
+              : `${domainVocab.actor.charAt(0).toUpperCase() + domainVocab.actor.slice(1)}s complete the primary ${domainVocab.noun} on the first try without help.`,
+          },
+          {
+            move: domainActions[1]
+              ? `Cover the supporting ${domainVocab.noun}: ${domainActions[1]}`
+              : `Cover supporting ${domainVocab.noun}s ${domainActions.length > 0 ? "" : "documented in project.domain.key_user_actions"}`,
+            why_it_wins: "The primary moment is the wedge; supporting actions retain the user past first session.",
+            moat_vector: "workflow" as const,
+            minimum_viable_proof: `Each supporting ${domainVocab.noun} ships an end-to-end happy path before any new feature.`,
+          },
+          {
+            move: domainExamples[0]
+              ? `Reproduce the success example: ${domainExamples[0]}`
+              : `Document and reproduce 3+ success examples in project.domain.success_examples`,
+            why_it_wins: "Concrete success demos beat abstract feature lists for both QA confidence and investor pitch.",
+            moat_vector: "engineering" as const,
+            minimum_viable_proof: domainExamples.length > 0
+              ? `End-to-end test reproduces "${domainExamples[0]}" deterministically with the configured ${domainVocab.outcome}.`
+              : "Project domain has at least 3 success_examples and each has an automated reproduction.",
+          },
+        ]
+      : [
+          {
+            move: `Single-session value for ${topGap.toLowerCase()}`,
+            why_it_wins:
+              "Users who see value in the first session are far more likely to return. Competing products require too much setup.",
+            moat_vector: "workflow" as const,
+            minimum_viable_proof:
+              "50 new users complete the core job in session one; >40% return within 7 days.",
+          },
+          {
+            move: hasSupabase
+              ? "User-context data loop via Supabase-backed profiles"
+              : "User-context data loop from lightweight profiles",
+            why_it_wins:
+              "Every interaction improves future recommendations. This compounds into a data advantage.",
+            moat_vector: "data" as const,
+            minimum_viable_proof:
+              "Recommendation acceptance rate trends upward over 4 weeks of active usage.",
+          },
+          {
+            move: hasExpo
+              ? "Mobile-native contextual capture"
+              : "Low-friction capture at the point of action",
+            why_it_wins:
+              "Capturing user context at the moment of need is an engineering moat that dashboard products cannot replicate.",
+            moat_vector: "engineering" as const,
+            minimum_viable_proof:
+              "Median interaction time for the core action is under 15 seconds.",
+          },
+        ],
     moat_hypotheses: [
       {
         hypothesis: "Usage data creates a compounding recommendation advantage.",

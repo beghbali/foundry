@@ -50,7 +50,7 @@ export interface StageResult {
    * loop because the contract can self-evolve) from a release-readiness-gate
    * skip (needs Cursor to close the brief first — refinement won't help).
    */
-  skipCause?: "builder" | "qa" | "convergence" | "release_readiness";
+  skipCause?: "builder" | "qa" | "convergence" | "release_readiness" | "directives_unaddressed";
 }
 
 export interface RunManifest {

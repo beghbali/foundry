@@ -1,6 +1,9 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { mintBriefItemId, parseBriefIdComment, stripBriefIdComment } from "@foundry/core/briefIntent";
+import { isEnvironmentalWorkItem, type BuildSpecSlice } from "@foundry/core/buildSpec";
+
 export type WorkPacketSection =
   | "qa"
   | "runtime"
@@ -41,11 +44,20 @@ export type BriefTrackedSection = "must" | "should" | "gaps" | "monetization" | 
 export type BriefOpenItem = {
   section: BriefTrackedSection;
   text: string;
+  /** Stable cross-cycle identity stamped on the brief line (`<!-- id:bf-... -->`). */
+  id?: string;
+};
+
+export type CheckedBriefItem = {
+  section: BriefTrackedSection;
+  text: string;
+  /** Stable cross-cycle identity from the `[x]` line (`<!-- id:bf-... -->`). */
+  id?: string;
 };
 
 type PacketSignals = {
   briefOpenItems: BriefOpenItem[];
-  checkedBriefItems: string[];
+  checkedBriefItems: CheckedBriefItem[];
   qaCodeBlockers: string[];
   builderCodeBlockers: string[];
   manualOnly: string[];
@@ -56,10 +68,27 @@ export type WorkPacketSourceInput = PacketSignals & {
   repoPath: string;
   runId: string;
   maxItems?: number;
+  /** When set, packet scopes to the Grand Wizard primary slice instead of full brief backlog. */
+  buildSpecPrimarySlice?: BuildSpecSlice;
+  freezeBriefToBuildSpec?: boolean;
 };
 
+/** Builder-stage gaps that are ops/infra noise, not product work for Cursor. */
+export function isEnvironmentalBuilderGap(text: string): boolean {
+  return isEnvironmentalWorkItem(text);
+}
+
 function normalizeKey(text: string): string {
-  return text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 180);
+  return stripBriefIdComment(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .slice(0, 180);
+}
+
+/** Brief items now carry stable IDs; prefer them over text-derived keys. */
+function packetItemKey(item: BriefOpenItem | CheckedBriefItem): string {
+  return item.id ?? normalizeKey(item.text);
 }
 
 /** Not addressable by a normal Cursor coding pass — ops, GTM, hosted DB, or device-lab ACs. */
@@ -157,14 +186,16 @@ export async function readOpenBriefItems(briefPath: string): Promise<BriefOpenIt
 
     if (!trimmed.startsWith("- [ ]")) continue;
     if (section === "other") continue;
-    const text = trimmed.replace(/^- \[ \]\s*/, "").trim();
+    const body = trimmed.replace(/^- \[ \]\s*/, "").trim();
+    const id = parseBriefIdComment(body);
+    const text = stripBriefIdComment(body);
     if (!text) continue;
-    out.push({ section, text });
+    out.push({ section, text, id: id ?? mintBriefItemId(section, text) });
   }
   return out;
 }
 
-export async function readCheckedBriefItems(briefPath: string): Promise<string[]> {
+export async function readCheckedBriefItems(briefPath: string): Promise<CheckedBriefItem[]> {
   let raw = "";
   try {
     raw = await readFile(briefPath, "utf8");
@@ -172,7 +203,7 @@ export async function readCheckedBriefItems(briefPath: string): Promise<string[]
     return [];
   }
 
-  const out: string[] = [];
+  const out: CheckedBriefItem[] = [];
   let section: BriefTrackedSection | "other" = "other";
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
@@ -186,9 +217,11 @@ export async function readCheckedBriefItems(briefPath: string): Promise<string[]
 
     if (!trimmed.startsWith("- [x]")) continue;
     if (section === "other") continue;
-    const text = trimmed.replace(/^- \[x\]\s*/, "").trim();
+    const body = trimmed.replace(/^- \[x\]\s*/, "").trim();
+    const id = parseBriefIdComment(body);
+    const text = stripBriefIdComment(body);
     if (!text) continue;
-    out.push(text);
+    out.push({ section, text, id: id ?? mintBriefItemId(section, text) });
   }
   return out;
 }
@@ -266,16 +299,52 @@ export async function createWorkPacket(input: WorkPacketSourceInput): Promise<Wo
     });
   };
 
+  const pushBrief = (item: BriefOpenItem) => {
+    const key = packetItemKey(item);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    candidates.push({
+      id: `pkt-${++seq}`,
+      key,
+      source: "brief",
+      section: item.section,
+      text: item.text,
+      status: "open",
+      priority: priorityForSection(item.section),
+      reopenCount: 0,
+    });
+  };
+
   for (const blocker of input.qaCodeBlockers) push("qa", "qa", blocker);
+
+  if (input.buildSpecPrimarySlice) {
+    const slice = input.buildSpecPrimarySlice;
+    if (slice.tasks.length > 0) {
+      for (const task of slice.tasks) {
+        const filesNote = task.files.length > 0 ? ` (files: ${task.files.map((f) => `\`${f}\``).join(", ")})` : "";
+        push("brief", "must", `[${task.id}] ${task.task}${filesNote}`);
+      }
+    } else {
+      for (const ac of slice.acceptance) {
+        push("brief", "must", `[${slice.title}] ${ac}`);
+      }
+    }
+  }
+
   for (const item of input.briefOpenItems) {
+    if (input.freezeBriefToBuildSpec && item.section !== "runtime") continue;
     if (isStructuralNonCodeBriefItem(item.text)) {
       extraManual.add(`[brief:${item.section}] ${item.text}`);
       continue;
     }
-    push("brief", item.section, item.text);
+    pushBrief(item);
   }
   for (const blocker of input.builderCodeBlockers) {
     if (isNoOpPacketText(blocker)) continue;
+    if (isEnvironmentalBuilderGap(blocker)) {
+      extraManual.add(`[builder:env] ${blocker}`);
+      continue;
+    }
     if (isStructuralNonCodeBriefItem(blocker)) {
       extraManual.add(`[builder] ${blocker}`);
       continue;
@@ -314,10 +383,10 @@ export async function refreshWorkPacket(
   signals: PacketSignals,
 ): Promise<WorkPacket> {
   const openKeys = new Set<string>();
-  for (const item of signals.briefOpenItems) openKeys.add(normalizeKey(item.text));
+  for (const item of signals.briefOpenItems) openKeys.add(packetItemKey(item));
   for (const item of signals.qaCodeBlockers) openKeys.add(normalizeKey(item));
   for (const item of signals.builderCodeBlockers) openKeys.add(normalizeKey(item));
-  const checkedKeys = new Set(signals.checkedBriefItems.map((item) => normalizeKey(item)));
+  const checkedKeys = new Set(signals.checkedBriefItems.map((item) => packetItemKey(item)));
 
   const manualKeys = new Set(signals.manualOnly.map((item) => normalizeKey(item)));
   const items = packet.items.map((item) => {

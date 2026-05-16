@@ -90,6 +90,12 @@ export {
 } from "./feedback_agent.js";
 
 export {
+  grandWizardStage,
+  GrandWizardOutputSchema,
+  type GrandWizardOutput,
+} from "./grand_wizard.js";
+
+export {
   investorPanelStage,
   InvestorPanelOutputSchema,
   type InvestorPanelOutput,

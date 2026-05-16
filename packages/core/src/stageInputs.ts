@@ -35,6 +35,7 @@ export const StageInputCompositionSchema = z.object({
   releaseAgent: z.unknown().optional(),
   growthOperator: z.unknown().optional(),
   feedback: z.unknown().optional(),
+  grandWizard: z.unknown().optional(),
   /**
    * Latest available `investor_panel` output. Populated from the most recent
    * artifact on disk so refinement-loop stages (especially `convergence_contract`)
@@ -92,6 +93,7 @@ export async function getStageInput(
     release_agent: o.release_agent ?? (await readLatestStageOutput("release_agent")),
     growth_operator: o.growth_operator ?? (await readLatestStageOutput("growth_operator")),
     feedback_agent: o.feedback_agent ?? (await readLatestStageOutput("feedback_agent")),
+    grand_wizard: o.grand_wizard ?? (await readLatestStageOutput("grand_wizard")),
     investor_panel: o.investor_panel ?? (await readLatestStageOutput("investor_panel")),
   };
 
@@ -111,6 +113,7 @@ export async function getStageInput(
     releaseAgent: latest.release_agent,
     growthOperator: latest.growth_operator,
     feedback: latest.feedback_agent,
+    grandWizard: latest.grand_wizard,
     investorPanel: latest.investor_panel,
     investorRefinement: ctx.investorRefinementLoop,
   };

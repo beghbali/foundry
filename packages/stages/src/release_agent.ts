@@ -3,6 +3,7 @@ import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { writeStageMarkdown } from "@foundry/core/artifacts";
+import { stripBriefIdComment } from "@foundry/core/briefIntent";
 import { StageInputCompositionSchema, type StageInputComposition } from "@foundry/core/stageInputs";
 import type { RunContext, Stage } from "@foundry/core/types";
 import { z } from "zod";
@@ -77,6 +78,32 @@ function labelForBriefSection(section: "must" | "should" | "gaps" | "monetizatio
 
 async function scanOpenTrackedBriefItems(repoPath: string): Promise<BriefTrackedSummary> {
   const briefPath = join(repoPath, ".foundry", "CURSOR_BRIEF.md");
+
+  // Source of truth: BUILD_SPEC + BUILD_SPEC_LEDGER. The brief markdown's
+  // checkboxes don't survive cycle regenerations, so the release gate now
+  // looks at the wizard spec — a task is "open" iff it isn't in the ledger.
+  try {
+    const [specRaw, ledgerRaw] = await Promise.all([
+      readFile(join(repoPath, ".foundry", "BUILD_SPEC.json"), "utf8"),
+      readFile(join(repoPath, ".foundry", "BUILD_SPEC_LEDGER.json"), "utf8").catch(() => ""),
+    ]);
+    type SpecShape = { slices?: Array<{ tasks?: Array<{ id?: string; task?: string }> }> };
+    type LedgerShape = { tasks?: Record<string, unknown> };
+    const spec = JSON.parse(specRaw) as SpecShape;
+    const ledger = ledgerRaw ? (JSON.parse(ledgerRaw) as LedgerShape) : { tasks: {} };
+    const tasks = spec.slices?.[0]?.tasks ?? [];
+    const closed = ledger.tasks ?? {};
+    const open = tasks.filter((t) => !t.id || !(t.id in closed));
+    const openTrackedLines = open.slice(0, 40).map((t) => {
+      const text = (t.task ?? "").replace(/\s+/g, " ").trim();
+      const truncated = text.length > 280 ? `${text.slice(0, 279)}…` : text;
+      return `[BUILD_SPEC ${t.id ?? "?"}] ${truncated}`;
+    });
+    return { openTrackedItems: open.length, briefPath, openTrackedLines };
+  } catch {
+    /* fall through to legacy brief markdown scan when no spec exists */
+  }
+
   let raw = "";
   try {
     raw = await readFile(briefPath, "utf8");
@@ -99,7 +126,7 @@ async function scanOpenTrackedBriefItems(repoPath: string): Promise<BriefTracked
 
     if (!trimmed.startsWith("- [ ]")) continue;
     if (section === "other") continue;
-    const itemText = trimmed.replace(/^- \[ \]\s*/, "").trim();
+    const itemText = stripBriefIdComment(trimmed.replace(/^- \[ \]\s*/, "").trim());
     if (!itemText) continue;
     openTrackedItems++;
     if (openTrackedLines.length < 40) {

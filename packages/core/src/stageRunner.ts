@@ -182,7 +182,38 @@ function investorPanelMeetsBar(out: unknown, projectFoundry?: { autonomous_inves
   return p.data.meetsMinimumGradeA;
 }
 
+/**
+ * Returns the count of "open" tracked items the runner uses for release/investor
+ * gating.
+ *
+ * Source of truth: **BUILD_SPEC + BUILD_SPEC_LEDGER**. The CURSOR_BRIEF.md
+ * checkbox state was historically the signal here, but the brief is regenerated
+ * every cycle from the wizard's spec, so its checkbox `[x]` state never
+ * survives cycle boundaries (operators saw brief_checked 5 → 0 → 5 → 0 forever).
+ * We now read the primary slice's tasks and subtract whatever the ledger has
+ * recorded as closed; falls back to the legacy markdown scan when no spec
+ * exists (e.g. release-only profile without a wizard).
+ */
 async function countOpenTrackedBriefItems(repoPath: string): Promise<number> {
+  try {
+    const [specRaw, ledgerRaw] = await Promise.all([
+      readFile(join(repoPath, ".foundry", "BUILD_SPEC.json"), "utf8").catch(() => ""),
+      readFile(join(repoPath, ".foundry", "BUILD_SPEC_LEDGER.json"), "utf8").catch(() => ""),
+    ]);
+    if (specRaw) {
+      type SpecShape = { slices?: Array<{ tasks?: Array<{ id?: string }> }> };
+      type LedgerShape = { tasks?: Record<string, unknown> };
+      const spec = JSON.parse(specRaw) as SpecShape;
+      const ledger = ledgerRaw ? (JSON.parse(ledgerRaw) as LedgerShape) : { tasks: {} };
+      const tasks = spec.slices?.[0]?.tasks ?? [];
+      const closed = ledger.tasks ?? {};
+      const openTaskCount = tasks.filter((t) => !t.id || !(t.id in closed)).length;
+      return openTaskCount;
+    }
+  } catch {
+    /* fall through to legacy markdown scan */
+  }
+
   const briefPath = join(repoPath, ".foundry", "CURSOR_BRIEF.md");
   let raw = "";
   try {
@@ -260,7 +291,56 @@ function isNonActionablePacketText(text: string): boolean {
 
 type InvestorPanelGate =
   | { skip: false }
-  | { skip: true; reason: string; cause: "builder" | "qa" | "convergence" | "release_readiness" };
+  | { skip: true; reason: string; cause: "builder" | "qa" | "convergence" | "release_readiness" | "directives_unaddressed" };
+
+/**
+ * Returns the directives from the last investor pitch that have NOT been
+ * matched against an addressed parent in `BUILD_SPEC_LEDGER`. When this list
+ * is non-empty the runner refuses to re-pitch — investors must only see new
+ * pitches when the last critique was actually addressed in code.
+ *
+ * Implemented inline here (rather than imported from `@foundry/stages`) to
+ * avoid a `core → stages` import cycle.
+ */
+async function unaddressedInvestorDirectivesSinceLastPitch(repoPath: string): Promise<string[]> {
+  type State = { lastDirectives?: string[] };
+  type LedgerEntry = { text: string };
+  type Ledger = { addressedParents?: Record<string, LedgerEntry> };
+
+  let state: State | undefined;
+  try {
+    const raw = await readFile(join(repoPath, ".foundry", "INVESTOR_PANEL_STATE.json"), "utf8");
+    state = JSON.parse(raw) as State;
+  } catch {
+    return [];
+  }
+  const dirs = state?.lastDirectives ?? [];
+  if (dirs.length === 0) return [];
+
+  let ledger: Ledger;
+  try {
+    const raw = await readFile(join(repoPath, ".foundry", "BUILD_SPEC_LEDGER.json"), "utf8");
+    ledger = JSON.parse(raw) as Ledger;
+  } catch {
+    return [...dirs];
+  }
+  const addressed = Object.values(ledger.addressedParents ?? {}).map((p) => p.text);
+
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+  const matches = (a: string, b: string): boolean => {
+    const na = norm(a);
+    const nb = norm(b);
+    if (!na || !nb) return false;
+    if (nb.includes(na.slice(0, 40)) || na.includes(nb.slice(0, 40))) return true;
+    const aw = new Set(na.split(" ").filter((w) => w.length > 4));
+    const bw = new Set(nb.split(" ").filter((w) => w.length > 4));
+    let overlap = 0;
+    for (const w of aw) if (bw.has(w)) overlap++;
+    return overlap >= 3 && overlap / Math.max(1, aw.size) >= 0.4;
+  };
+
+  return dirs.filter((d) => !addressed.some((p) => matches(d, p)));
+}
 
 async function shouldSkipInvestorPanelStage(
   repoPath: string,
@@ -313,6 +393,25 @@ async function shouldSkipInvestorPanelStage(
       skip: true,
       cause: "qa",
       reason: `Pipeline QA still lists ${blockers.length} blocker(s); investor_panel deferred until smoke/tests are clean.`,
+    };
+  }
+
+  // DIRECTIVES-ADDRESSED GATE — investors must never re-grade the same critique
+  // without engineering work behind it. Applies even when `relaxInvestorGates`
+  // is on, because the explicit user intent is "do not pitch until previous
+  // feedback is addressed". The check matches each prior directive against
+  // BUILD_SPEC_LEDGER.addressedParents (which the wizard/loop populate as
+  // child tasks close).
+  const unaddressed = await unaddressedInvestorDirectivesSinceLastPitch(repoPath);
+  if (unaddressed.length > 0) {
+    const sample = unaddressed
+      .slice(0, 2)
+      .map((d) => `"${d.slice(0, 90)}${d.length > 90 ? "…" : ""}"`)
+      .join("; ");
+    return {
+      skip: true,
+      cause: "directives_unaddressed",
+      reason: `${unaddressed.length} prior investor directive(s) still unaddressed in BUILD_SPEC_LEDGER (sample: ${sample}). Close child tasks for those parent directives before re-pitching.`,
     };
   }
 

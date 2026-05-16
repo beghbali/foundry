@@ -1,4 +1,13 @@
 import { writeStageMarkdown } from "@foundry/core/artifacts";
+import { ProjectDomainSchema } from "@foundry/core/config";
+import {
+  getDomainKeyUserActions,
+  getDomainPrimaryMetric,
+  getDomainPrimaryUserAction,
+  getDomainSuccessExamples,
+  getDomainVocabulary,
+  hasDomain,
+} from "@foundry/core/projectDomain";
 import type { Stage } from "@foundry/core/types";
 import { z } from "zod";
 
@@ -22,6 +31,7 @@ const FlywheelInputSchema = z.object({
       project_name: z.string(),
       north_star: z.string(),
       core_differentiators: z.array(z.string()).optional(),
+      domain: ProjectDomainSchema.optional(),
     }),
   }),
   repoInventory: RepoInventoryOutputSchema,
@@ -91,8 +101,17 @@ function firstCompetitorName(input: FlywheelInput): string {
 }
 
 function buildProjectContextualFlywheel(input: FlywheelInput): FlywheelOutput {
-  const brand = clip(input.config.project.project_name.trim() || "This product", 48);
-  const north = clip(input.config.project.north_star, 160);
+  const project = input.config.project;
+  const brand = clip(project.project_name.trim() || "This product", 48);
+  const north = clip(project.north_star, 160);
+  // Domain block (optional) lets us anchor copy on the actual product instead
+  // of generic "the primary job customers still struggle to complete" text.
+  const domainPresent = hasDomain(project);
+  const domainPrimary = getDomainPrimaryUserAction(project);
+  const domainActions = getDomainKeyUserActions(project);
+  const domainExamples = getDomainSuccessExamples(project);
+  const domainVocab = getDomainVocabulary(project);
+  const domainMetric = getDomainPrimaryMetric(project);
   const diff = clip(primaryDifferentiator(input), 140);
   const gap1 = clip(input.marketGap.gapsToExploit[0]?.gap ?? "the primary job customers still struggle to complete", 160);
   const gap2 = clip(
@@ -207,21 +226,39 @@ function buildProjectContextualFlywheel(input: FlywheelInput): FlywheelOutput {
       },
     ],
     focusRecommendation: {
-      phase1: [
-        `Instrument the shortest path from first open to the first proof of ${clip(north, 90)}.`,
-        `Ship copy and UX that explicitly defeat ${complaint1} without expanding scope.`,
-        `Make one head-to-head story versus ${competitor} that ${users} can repeat in one sentence.`,
-        `Tie analytics events to the flywheel metrics above, not vanity counts.`,
-        `Gate expansion features until the primary loop hits the north star weekly for active ${users}.`,
-      ],
-      phase2: [
-        `Layer adjacent workflows that deepen ${gap2} without reopening positioning confusion.`,
-        `Use cohort learning to tune recommendations from successful ${users}, not averages alone.`,
-        input.repoInventory.summary.hasSupabase
-          ? "Exploit durable Supabase-backed history for cross-session personalization and audit trails."
-          : "Add durable history storage so personalization survives reinstalls and new devices.",
-        "Introduce partner or ecosystem hooks only after retention on the core loop is proven.",
-      ],
+      phase1: domainPresent && (domainPrimary || domainActions.length > 0)
+        ? [
+            ...(domainPrimary ? [`Ship the primary moment: ${domainPrimary}.`] : []),
+            ...domainActions.slice(0, 3).map((a) => `Cover key ${domainVocab.noun}: ${a}`),
+            ...(domainMetric ? [`Instrument and surface ${domainMetric} so it's visible in-app.`] : []),
+            ...(domainExamples.length > 0
+              ? [`Reproduce ${Math.min(domainExamples.length, 3)} success example(s) end-to-end before adding new features.`]
+              : []),
+          ].slice(0, 5)
+        : [
+            `Instrument the shortest path from first open to the first proof of ${clip(north, 90)}.`,
+            `Ship copy and UX that explicitly defeat ${complaint1} without expanding scope.`,
+            `Make one head-to-head story versus ${competitor} that ${users} can repeat in one sentence.`,
+            `Tie analytics events to the flywheel metrics above, not vanity counts.`,
+            `Gate expansion features until the primary loop hits the north star weekly for active ${users}.`,
+          ],
+      phase2: domainPresent
+        ? [
+            `Cover the long tail of ${domainVocab.noun}s once the primary moment is reliable.`,
+            `Personalize ${domainVocab.outcome}s using accumulated context (history, preferences).`,
+            input.repoInventory.summary.hasSupabase
+              ? "Use Supabase-backed history for cross-device continuity once Phase 1 ships."
+              : "Add durable history storage once Phase 1 ships.",
+            "Open partner or ecosystem hooks only after the primary loop hits the configured metric weekly.",
+          ]
+        : [
+            `Layer adjacent workflows that deepen ${gap2} without reopening positioning confusion.`,
+            `Use cohort learning to tune recommendations from successful ${users}, not averages alone.`,
+            input.repoInventory.summary.hasSupabase
+              ? "Exploit durable Supabase-backed history for cross-session personalization and audit trails."
+              : "Add durable history storage so personalization survives reinstalls and new devices.",
+            "Introduce partner or ecosystem hooks only after retention on the core loop is proven.",
+          ],
     },
   };
 }

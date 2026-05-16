@@ -14,6 +14,14 @@ import {
   hasAutonomousInvestorConvergenceKey,
   resolveAutonomousInvestorConvergenceForRun,
 } from "@foundry/core/investorGrades";
+import {
+  computeUpstreamFingerprint,
+  primaryBuildSpecSlice,
+  readBuildSpecFromRepo,
+  readBuildSpecLedger,
+  taskCompletedByEdits,
+  writeBuildSpecLedger,
+} from "@foundry/core/buildSpec";
 
 import {
   chooseBuilderModel,
@@ -33,6 +41,7 @@ import {
   readBuilderRemainingBlockers,
   readStageJson,
   resolveCursorAutomationSettings,
+  isLikelyCursorTransportFailure,
   runBuilderAgent,
   sampleUncheckedBriefLines,
   shouldRunCursorAutomation,
@@ -235,17 +244,28 @@ function blockedChecklistCount(release: ReleaseAgentBrief | undefined): number {
 
 type LoopProfile = "release" | "investor";
 
-function postCursorPipelineStages(profile: LoopProfile): string[] {
+function postCursorPipelineStages(profile: LoopProfile, includeInvestor: boolean): string[] {
   if (profile === "investor") {
-    return ["independent_qa", "release_agent", "growth_operator", "investor_panel"];
+    const base = ["independent_qa", "release_agent", "growth_operator"];
+    return includeInvestor ? [...base, "investor_panel"] : base;
   }
   return ["independent_qa", "release_agent"];
 }
 
-/** Stabilize loops never run growth/investor after Cursor — only QA + release gates. */
-function postCursorStagesForLoop(profile: LoopProfile, stabilize: boolean): string[] {
+/**
+ * Stabilize loops never run growth/investor after Cursor.
+ * For investor profile, we run investor_panel only ONCE per outer cycle (the final
+ * inner pass) instead of after every inner Cursor pass — investors should grade
+ * the cycle's full delta, not partial in-progress edits. This cuts ~2-3 min/cycle
+ * of LLM panel calls scoring the same product across inner passes.
+ */
+function postCursorStagesForLoop(
+  profile: LoopProfile,
+  stabilize: boolean,
+  isLastInnerPass: boolean,
+): string[] {
   if (stabilize) return ["independent_qa", "release_agent"];
-  return postCursorPipelineStages(profile);
+  return postCursorPipelineStages(profile, isLastInnerPass);
 }
 
 /** Ship-quality release candidate: QA ship + release_agent green + no blocked release checklist rows. */
@@ -549,6 +569,98 @@ async function printFoundryStatusDashboard(repoPath: string): Promise<void> {
   console.log(chalk.bold.dim(`${bar}\n`));
 }
 
+/**
+ * After a Cursor pass commits product code, update BUILD_SPEC_LEDGER:
+ *   - mark tasks whose `files[]` are entirely covered by the diff as complete
+ *   - accumulate LOC totals for those tasks
+ * Logs a one-liner summary so the operator sees which directives actually closed.
+ */
+async function updateBuildSpecLedgerFromPass(
+  repoPath: string,
+  runId: string,
+  builderRun: {
+    changedFiles: string[];
+    diffStats?: Array<{ file: string; added: number; removed: number }>;
+  },
+): Promise<void> {
+  const spec = await readBuildSpecFromRepo(repoPath);
+  if (!spec) return;
+  const ledger = await readBuildSpecLedger(repoPath);
+  const touched = new Set(builderRun.changedFiles);
+  const newlyCompleted: string[] = [];
+
+  const slice = spec.slices[0];
+  if (!slice) return;
+  for (const task of slice.tasks) {
+    if (task.id in ledger.tasks) continue;
+    if (!taskCompletedByEdits(task, builderRun.changedFiles)) continue;
+    const taskStats = (builderRun.diffStats ?? []).filter((s) => task.files.includes(s.file));
+    ledger.tasks[task.id] = {
+      completedAt: new Date().toISOString(),
+      runId,
+      filesTouched: task.files.filter((f) => touched.has(f)),
+      locAdded: taskStats.reduce((s, x) => s + x.added, 0),
+      locRemoved: taskStats.reduce((s, x) => s + x.removed, 0),
+    };
+    newlyCompleted.push(task.id);
+  }
+
+  let newlyAddressedParents: string[] = [];
+  if (Array.isArray(spec.parentDirectives) && spec.parentDirectives.length > 0) {
+    const addressedMap = { ...(ledger.addressedParents ?? {}) };
+    for (const parent of spec.parentDirectives) {
+      if (parent.id in addressedMap) continue;
+      if (parent.childTaskIds.length === 0) continue;
+      const allClosed = parent.childTaskIds.every((cid) => cid in ledger.tasks);
+      if (allClosed) {
+        addressedMap[parent.id] = {
+          text: parent.text,
+          source: parent.source,
+          addressedAt: new Date().toISOString(),
+        };
+        newlyAddressedParents.push(parent.id);
+      }
+    }
+    ledger.addressedParents = addressedMap;
+  }
+
+  if (newlyCompleted.length > 0) {
+    ledger.updatedAt = new Date().toISOString();
+    ledger.stuckCycles = 0;
+    await writeBuildSpecLedger(repoPath, ledger);
+    const totalDone = Object.keys(ledger.tasks).length;
+    const totalTasks = slice.tasks.length;
+    const totalAddressed = Object.keys(ledger.addressedParents ?? {}).length;
+    console.log(
+      chalk.green(
+        `  BUILD_SPEC_LEDGER: closed ${newlyCompleted.length} task(s) this pass (${totalDone}/${totalTasks} cumulative). Closed: ${newlyCompleted.join(", ")}`,
+      ),
+    );
+    if (newlyAddressedParents.length > 0) {
+      console.log(
+        chalk.green(
+          `  BUILD_SPEC_LEDGER: ${newlyAddressedParents.length} parent directive(s) now ADDRESSED (won't re-emit). Cumulative: ${totalAddressed}.`,
+        ),
+      );
+    }
+  } else if (newlyAddressedParents.length > 0) {
+    ledger.updatedAt = new Date().toISOString();
+    await writeBuildSpecLedger(repoPath, ledger);
+    console.log(
+      chalk.green(
+        `  BUILD_SPEC_LEDGER: ${newlyAddressedParents.length} parent directive(s) now ADDRESSED (won't re-emit).`,
+      ),
+    );
+  } else if (slice.tasks.some((t) => !(t.id in ledger.tasks))) {
+    const remaining = slice.tasks.filter((t) => !(t.id in ledger.tasks)).map((t) => t.id);
+    console.log(
+      chalk.yellow(
+        `  BUILD_SPEC_LEDGER: 0 task(s) fully closed by this pass (edits did not cover all files for any open task). Open: ${remaining.slice(0, 4).join(", ")}${remaining.length > 4 ? ` … +${remaining.length - 4}` : ""}`,
+      ),
+    );
+  }
+}
+
 async function buildWorkPacketForRun(params: {
   repoPath: string;
   foundryDir: string;
@@ -563,6 +675,12 @@ async function buildWorkPacketForRun(params: {
   if (params.stabilize) {
     briefOpenItems = filterBriefItemsForStabilizePhase(briefOpenItems, params.pipelineQa);
   }
+  const buildSpec = await readBuildSpecFromRepo(params.repoPath);
+  const ledger = await readBuildSpecLedger(params.repoPath);
+  const primarySliceRaw = buildSpec ? primaryBuildSpecSlice(buildSpec) : undefined;
+  const primarySlice = primarySliceRaw
+    ? { ...primarySliceRaw, tasks: primarySliceRaw.tasks.filter((t) => !(t.id in ledger.tasks)) }
+    : undefined;
   const qaSeparated = separateManualAndCodeItems([
     ...(params.pipelineQa?.blockers ?? []),
     ...(params.pipelineQa?.manualTasks ?? []),
@@ -580,6 +698,8 @@ async function buildWorkPacketForRun(params: {
     builderCodeBlockers: builderSeparated.code,
     manualOnly: [...qaSeparated.manual, ...builderSeparated.manual],
     codeChanged: false,
+    buildSpecPrimarySlice: primarySlice,
+    freezeBriefToBuildSpec: !!buildSpec,
   });
 }
 
@@ -1060,6 +1180,7 @@ const STRICT_RESET_CONSOLIDATE_STAGES = [
   "product_definition",
   "monetization_architect",
   "feedback_agent",
+  "grand_wizard",
   "builder",
 ] as const;
 
@@ -1120,6 +1241,10 @@ const FOUNDRY_GITIGNORE_ENTRIES = [
   ".foundry/feedback-ledger.json",
   ".foundry/LATEST_INSTALL.md",
   ".foundry/CURSOR_BRIEF.md",
+  ".foundry/BUILD_SPEC.json",
+  ".foundry/BUILD_SPEC.md",
+  ".foundry/BUILD_SPEC_LEDGER.json",
+  ".foundry/INVESTOR_PANEL_STATE.json",
   ".foundry/CURSOR_BUILDER_REPORT.md",
   ".foundry/CURSOR_QA_REPORT.md",
   ".foundry/automation/",
@@ -1505,6 +1630,31 @@ program
           '  - "replace me"',
           "core_differentiators:",
           '  - "replace me"',
+          "# Domain block (optional but strongly recommended) — first-class fields for what",
+          "# this app actually does. Drives concrete Must Ship lines, brief items, investor pitch,",
+          "# and growth experiments. Without it, downstream stages fall back to generic SaaS phrasing.",
+          "# domain:",
+          "#   name: \"e.g. ingredient-safety scanner\"",
+          "#   primary_user_action: \"e.g. Point camera at a packaged food → see stomach-safe verdict in <2s\"",
+          "#   key_user_actions:",
+          "#     - \"e.g. Scan a barcode/package and get a verdict (safe / caution / avoid)\"",
+          "#     - \"e.g. Save personal triggers (lactose, FODMAPs, etc.)\"",
+          "#     - \"e.g. Browse history of past verdicts\"",
+          "#   vocabulary:",
+          "#     noun: \"scan\"        # subject (\"a scan\")",
+          "#     verb: \"scan\"        # action (\"to scan a package\")",
+          "#     outcome: \"verdict\"  # result (\"safe verdict\")",
+          "#     actor: \"shopper\"    # who's using it",
+          "#   personas:",
+          "#     - \"IBS sufferer figuring out trigger foods on the go\"",
+          "#     - \"Lactose-intolerant traveler scanning unfamiliar packages\"",
+          "#   success_examples:",
+          "#     - \"Greek yogurt → 'Caution: high FODMAP for IBS' in 1.4s\"",
+          "#     - \"Almond crackers → 'Safe — no listed triggers' in <2s\"",
+          "#   non_goals:",
+          "#     - \"Restaurant menu OCR\"",
+          "#     - \"Calorie/macro tracking\"",
+          "#   primary_metric: \"scan-to-verdict latency p95 < 2s\"",
           "foundry:",
           "  # Unattended loop: optional — relax investor_panel gates and defer ship/EAS prompts until grades hit target.",
           "  # autonomous_investor_convergence:",
@@ -2596,6 +2746,10 @@ program
     "--stabilize",
     "Freeze scope: each outer cycle runs only builder → independent_qa → release_agent (no market/gap/product/monetization/feedback regen). Cursor focuses on QA green (tests/lint/typecheck/Maestro) first; brief backlog in the packet is narrowed until ship+0 blockers. Ignores feedback-queue churn for loop continuation.",
   )
+  .option(
+    "--reset-spec",
+    "Delete .foundry/BUILD_SPEC.{json,md} and .foundry/CURSOR_BRIEF.md before this cycle so Grand Wizard regenerates from scratch with the latest investor directives.",
+  )
   .description(
     "Autonomous loop: full pipeline (default) → optional Cursor inner iterations → post-Cursor QA/release (and investor stages in investor profile). Prints RELEASE_CANDIDATE: YES/NO each cycle.",
   )
@@ -2613,6 +2767,7 @@ program
     wait?: boolean;
     quickPhase1?: boolean;
     stabilize?: boolean;
+    resetSpec?: boolean;
   }) => {
     const repoPath = resolveRepoPath(opts.repo);
     const foundryDir = join(repoPath, ".foundry");
@@ -2634,6 +2789,31 @@ program
     if (!(await exists(foundryDir))) {
       console.error(chalk.red("Missing .foundry/ in target repo. Run `foundry init --repo <path>` first."));
       process.exit(1);
+    }
+
+    if (opts.resetSpec) {
+      const wiped: string[] = [];
+      for (const rel of [
+        "BUILD_SPEC.json",
+        "BUILD_SPEC.md",
+        "BUILD_SPEC_LEDGER.json",
+        "CURSOR_BRIEF.md",
+        "INVESTOR_PANEL_STATE.json",
+      ]) {
+        const abs = join(foundryDir, rel);
+        try {
+          await access(abs);
+          await import("node:fs/promises").then((m) => m.unlink(abs));
+          wiped.push(rel);
+        } catch {
+          /* ignore missing file */
+        }
+      }
+      if (wiped.length > 0) {
+        console.log(chalk.yellow(`  Reset spec: removed ${wiped.join(", ")} — Grand Wizard will regenerate from scratch.`));
+      } else {
+        console.log(chalk.gray("  Reset spec: nothing to remove."));
+      }
     }
 
     const foundryRoot = FOUNDRY_ROOT;
@@ -2729,10 +2909,23 @@ program
 
     let lastReleaseFailureKey = "";
     let repeatedReleaseFailureCount = 0;
+    /**
+     * Counts outer cycles in a row whose Cursor builder agent failed with what
+     * looks like a network/transport stall (`Connection lost, reconnecting…`).
+     * The per-pass watchdog inside `runCursorAgent` already SIGTERMs the agent
+     * after `FOUNDRY_CURSOR_TRANSPORT_GRACE_MS` of reconnect-only output, but a
+     * single cycle's worth of retries can still burn meaningful quota. After
+     * `MAX_CONSECUTIVE_TRANSPORT_FAILURES` cycles in a row die that way, abort
+     * the entire `foundry loop` so the user can address connectivity instead
+     * of bleeding more credits.
+     */
+    let consecutiveTransportFailures = 0;
+    const MAX_CONSECUTIVE_TRANSPORT_FAILURES = 2;
 
     while (true) {
       cycle++;
       let abortLoop = false;
+      let outerCycleHadTransportFailure = false;
       if (maxCycles > 0 && cycle > maxCycles) {
         console.log(chalk.yellow(`\nReached max cycles (${maxCycles}). Stopping.`));
         break;
@@ -2840,6 +3033,43 @@ program
       printUnblockGuidance(
         buildUnblockGuidance(repoPath, foundryDir, pipelineQa, releaseOutput, builderOutput, builderRemainingBlockers),
       );
+      const buildSpec = await readBuildSpecFromRepo(repoPath);
+      if (buildSpec) {
+        const slice = buildSpec.slices[0];
+        const ledger = await readBuildSpecLedger(repoPath);
+        const totalTasks = slice?.tasks.length ?? 0;
+        const doneTasks = (slice?.tasks ?? []).filter((t) => t.id in ledger.tasks).length;
+        const tasksWithFiles = (slice?.tasks ?? []).filter((t) => t.files.length > 0).length;
+        const parents = buildSpec.parentDirectives.length;
+        const parentsCovered = buildSpec.parentDirectives.filter((p) => p.childTaskIds.length > 0).length;
+        const undecomposed = buildSpec.diagnostics.directivesWithoutTasks.length;
+        const stuckCycles = ledger.stuckCycles;
+        const tone = undecomposed > 0 || tasksWithFiles < totalTasks || stuckCycles > 1 ? chalk.yellow : chalk.gray;
+        console.log(
+          tone(
+            `  Grand Wizard: ${doneTasks}/${totalTasks} task(s) done · ${tasksWithFiles}/${totalTasks} have file refs · parents ${parentsCovered}/${parents} decomposed · stuck=${stuckCycles} · source=${buildSpec.source}`,
+          ),
+        );
+        if (undecomposed > 0) {
+          console.log(
+            chalk.yellow(
+              `  ↳ Undecomposed: ${buildSpec.diagnostics.directivesWithoutTasks.slice(0, 3).map((d) => `"${d.slice(0, 70)}"`).join("; ")}`,
+            ),
+          );
+          console.log(
+            chalk.gray(
+              "    Tip: rerun with `--reset-spec` after refining upstream stages, or add `builder.directives` in project.yaml to anchor.",
+            ),
+          );
+        }
+        if (stuckCycles >= 2 && totalTasks > 0 && doneTasks < totalTasks) {
+          console.log(
+            chalk.red(
+              `  ↳ WIZARD STUCK: same upstream fingerprint for ${stuckCycles} cycle(s) with open tasks. Edits aren't covering task.files — Cursor may be editing adjacent files.`,
+            ),
+          );
+        }
+      }
       console.log(chalk.gray(`  Work packet: ${workPacketSummaryLine(workPacket)}`));
       const initialProgress = buildIterationProgress(
         briefMetrics,
@@ -2997,6 +3227,7 @@ program
             inner,
             stabilize ? 0 : implementNowFeedbackCount,
             releaseOutput?.status,
+            !investorPanelMetTarget(investorOutput, foundryConfig.project.foundry, loopProfile),
           );
           const builderSpinner = ora(`Cursor builder agent (${builderChoice.model})`).start();
           console.log(chalk.gray(`  Builder model reason: ${builderChoice.reason}`));
@@ -3139,6 +3370,24 @@ program
                 `  Code files changed: ${changedForLog.length ? changedForLog.slice(0, 8).join(", ") : "(none)"}`,
               ),
             );
+            if (builderRun.diffStats && builderRun.diffStats.length > 0) {
+              const productStats = builderRun.diffStats.filter(
+                (s) => !s.file.startsWith(".foundry/") && !s.file.startsWith(".maestro-debug/"),
+              );
+              const totalAdded = productStats.reduce((s, x) => s + x.added, 0);
+              const totalRemoved = productStats.reduce((s, x) => s + x.removed, 0);
+              const top = [...productStats]
+                .sort((a, b) => b.added + b.removed - (a.added + a.removed))
+                .slice(0, 4)
+                .map((s) => `${s.file} (+${s.added}/-${s.removed})`)
+                .join(", ");
+              console.log(
+                chalk.gray(
+                  `  Diff: ${productStats.length} product file(s), +${totalAdded}/-${totalRemoved} LOC${top ? ` · Top: ${top}` : ""}`,
+                ),
+              );
+              await updateBuildSpecLedgerFromPass(repoPath, manifest.runId, builderRun);
+            }
             if (builderRun.pushWarning) {
               console.log(
                 chalk.yellow(
@@ -3160,13 +3409,30 @@ program
                 ),
               );
             }
+            // Cross-cycle transport-stall watchdog: if Cursor died because of
+            // network / reconnect-only output, the next outer cycle is unlikely
+            // to fare better in the short term and just burns credits. We tag
+            // the cycle as a transport failure so the outer driver can break
+            // the loop after a couple in a row.
+            if (isLikelyCursorTransportFailure(agentBlob)) {
+              outerCycleHadTransportFailure = true;
+              console.log(
+                chalk.yellow(
+                  "\n  Cursor agent died from transport/network errors (\"Connection lost, reconnecting…\"). " +
+                    "If this happens again next cycle, Foundry will exit so you can check Cursor connectivity instead of burning more agent quota.",
+                ),
+              );
+            }
             abortLoop = true;
             break;
           }
 
-          const postStages = postCursorStagesForLoop(loopProfile, stabilize);
+          const isLastInnerPass = inner >= effectiveMaxInner;
+          const postStages = postCursorStagesForLoop(loopProfile, stabilize, isLastInnerPass);
           const rerunSpinner = ora(
-            `Re-running after Cursor: ${postStages.join(" → ")}...`,
+            `Re-running after Cursor: ${postStages.join(" → ")}${
+              loopProfile === "investor" && !isLastInnerPass ? " (investor_panel batched to last inner pass)" : ""
+            }...`,
           ).start();
           try {
             manifest = await runPipeline({
@@ -3350,6 +3616,29 @@ program
             console.log(chalk.cyan(`  Next packet loaded: ${workPacketSummaryLine(workPacket)}`));
           }
         }
+      }
+      // Cross-cycle transport-stall guard: track whether this outer cycle was
+      // killed by Cursor network errors. After two such cycles in a row we
+      // exit the entire loop (regardless of release status) since further
+      // attempts only burn quota until connectivity recovers.
+      if (outerCycleHadTransportFailure) {
+        consecutiveTransportFailures += 1;
+        if (consecutiveTransportFailures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES) {
+          console.log(
+            chalk.red.bold(
+              `\n  Aborting foundry loop: ${consecutiveTransportFailures} consecutive cycles ended in Cursor transport failures.`,
+            ),
+          );
+          console.log(
+            chalk.yellow(
+              "  Check Cursor app/network status, then re-run `foundry loop`. " +
+                "Set FOUNDRY_CURSOR_TRANSPORT_GRACE_MS=0 to disable the per-pass watchdog if you'd rather wait it out.",
+            ),
+          );
+          break;
+        }
+      } else {
+        consecutiveTransportFailures = 0;
       }
       if (
         abortLoop &&

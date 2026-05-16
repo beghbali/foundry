@@ -3,6 +3,19 @@ import { join } from "node:path";
 
 import { writeStageMarkdown } from "@foundry/core/artifacts";
 import {
+  annotateBriefLineWithId,
+  briefIntentToken,
+  mintBriefItemId,
+  parseBriefIdComment,
+  stripBriefIdComment,
+  type BriefSection,
+} from "@foundry/core/briefIntent";
+import {
+  GrandWizardOutputSchema,
+  primaryBuildSpecSlice,
+  type GrandWizardOutput,
+} from "@foundry/core/buildSpec";
+import {
   StageInputCompositionSchema,
   type InvestorRefinementContext,
   type StageInputComposition,
@@ -453,7 +466,7 @@ async function readOpenTrackedBriefItems(briefPath: string): Promise<OpenBriefIt
     if (section === "other") continue;
     out.push({
       section,
-      text: trimmed.replace(/^- \[ \]\s*/, "").trim(),
+      text: stripBriefIdComment(trimmed.replace(/^- \[ \]\s*/, "").trim()),
     });
   }
   return out;
@@ -919,25 +932,26 @@ type CursorBriefAutos = {
   edgeRatePathsDone: Set<string>;
 };
 
-type BriefChecklistSection = "investor" | "must" | "should" | "gaps" | "runtime" | "monetization" | "edge";
+type BriefChecklistSection = BriefSection;
 
+/**
+ * Stable identity for prior `[x]` lines: an ID minted from `(section, intent token)`.
+ * Lines stamped with `<!-- id:bf-... -->` are matched directly; older briefs
+ * without IDs are auto-upgraded by recomputing the same intent-derived ID.
+ */
 type BriefChecklistState = {
-  checked: Set<string>;
+  checkedIds: Set<string>;
 };
-
-function checklistKey(section: BriefChecklistSection, text: string): string {
-  return `${section}::${text.trim().split(/\r?\n/, 1)[0]?.trim() ?? ""}`;
-}
 
 async function readBriefChecklistState(briefPath: string): Promise<BriefChecklistState> {
   let raw = "";
   try {
     raw = await readFile(briefPath, "utf8");
   } catch {
-    return { checked: new Set<string>() };
+    return { checkedIds: new Set<string>() };
   }
 
-  const checked = new Set<string>();
+  const checkedIds = new Set<string>();
   let section: BriefChecklistSection | "other" = "other";
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
@@ -952,9 +966,161 @@ async function readBriefChecklistState(briefPath: string): Promise<BriefChecklis
 
     if (section === "other") continue;
     if (!trimmed.startsWith("- [x]")) continue;
-    checked.add(checklistKey(section, trimmed.replace(/^- \[x\]\s*/, "").trim()));
+    const body = trimmed.replace(/^- \[x\]\s*/, "").trim();
+    const explicit = parseBriefIdComment(body);
+    if (explicit) {
+      checkedIds.add(explicit);
+      continue;
+    }
+    // Back-compat: brief written before ID stamping. Reconstruct the same ID
+    // we would mint today from the human-readable text so old `[x]` lines stay checked.
+    const cleanText = stripBriefIdComment(body);
+    if (briefIntentToken(cleanText) === "" && cleanText === "") continue;
+    checkedIds.add(mintBriefItemId(section, cleanText));
   }
-  return { checked };
+  return { checkedIds };
+}
+
+function generateCursorBriefFromBuildSpec(
+  projectName: string,
+  buildSpec: GrandWizardOutput,
+  audit: z.infer<typeof AuditHint> | undefined,
+  feedback: z.infer<typeof FeedbackHint> | undefined,
+  investorRefinement?: InvestorRefinementContext,
+  previousChecklist?: BriefChecklistState,
+): string {
+  const checkbox = (section: BriefChecklistSection, text: string, defaultChecked = false): string => {
+    const cleanText = stripBriefIdComment(text);
+    const id = mintBriefItemId(section, cleanText);
+    const checked = defaultChecked || (previousChecklist?.checkedIds.has(id) ?? false);
+    return annotateBriefLineWithId(`- [${checked ? "x" : " "}] ${cleanText}`, id);
+  };
+
+  const primary = primaryBuildSpecSlice(buildSpec);
+  const lines: string[] = [
+    `# Cursor Implementation Brief — ${projectName}`,
+    "",
+    "This brief is driven by **`.foundry/BUILD_SPEC.json`** (Grand Wizard).",
+    "Implement **only the concrete tasks** below — do not widen scope to deferred items or restate vague directives.",
+    "",
+    `**Cycle theme:** ${buildSpec.cycleTheme}`,
+    "",
+    "---",
+    "",
+  ];
+
+  if (buildSpec.diagnostics.directivesWithoutTasks.length > 0) {
+    lines.push(
+      "> **Wizard diagnostic:** the following directives could NOT be decomposed to concrete tasks this cycle and are deferred:",
+      "",
+      ...buildSpec.diagnostics.directivesWithoutTasks.map((d) => `> - ${d}`),
+      "",
+    );
+  }
+
+  if (investorRefinement) {
+    lines.push(
+      "## Investor panel refinement (priority)",
+      "",
+      `Round ${investorRefinement.round} — address these in the primary slice:`,
+      "",
+      ...investorRefinement.directives.map((d) => checkbox("investor", d)),
+      "",
+    );
+  }
+
+  lines.push(
+    `## Primary slice — ${primary.title}`,
+    "",
+    `**User story:** ${primary.userStory}`,
+    "",
+  );
+
+  if (primary.tasks.length > 0) {
+    lines.push("### Concrete tasks (decomposed)", "");
+    for (const task of primary.tasks) {
+      const filesNote = task.files.length > 0 ? ` — files: ${task.files.map((f) => `\`${f}\``).join(", ")}` : "";
+      lines.push(checkbox("must", `${task.task}${filesNote}`));
+      lines.push(`  - verify: ${task.verification}`);
+      if (task.decomposedFrom.length > 0) {
+        lines.push(`  - addresses: ${task.decomposedFrom.join(", ")}`);
+      }
+    }
+    lines.push("");
+  } else {
+    lines.push("### Must ship (this cycle)", "", ...primary.acceptance.map((a) => checkbox("must", a)), "");
+  }
+
+  if (buildSpec.parentDirectives.length > 0) {
+    lines.push(
+      "### Parent directives (each closes when all its child tasks are checked)",
+      "",
+      ...buildSpec.parentDirectives.map(
+        (p) => `- **${p.id}** (${p.source}) — ${p.text}\n  - children: ${p.childTaskIds.join(", ") || "_none yet_"}`,
+      ),
+      "",
+    );
+  }
+
+  if (buildSpec.definitionOfDone.length > 0) {
+    lines.push("### Definition of done", "");
+    for (const item of buildSpec.definitionOfDone) {
+      lines.push(checkbox("must", item));
+    }
+    lines.push("");
+  }
+
+  if (primary.files.length > 0) {
+    lines.push("### Target files", "", ...primary.files.map((f) => `- \`${f}\``), "");
+  }
+
+  if (audit?.screens && audit.screens.length > 0) {
+    lines.push("## Existing screens (modify, don't duplicate)", "");
+    lines.push("| Screen | File | Purpose |");
+    lines.push("| --- | --- | --- |");
+    for (const s of audit.screens) {
+      lines.push(`| ${s.name} | \`${s.file}\` | ${s.purposeGuess} |`);
+    }
+    lines.push("");
+  }
+
+  const urgentFeedback = (feedback?.items ?? [])
+    .filter(
+      (item) =>
+        (item.status ?? "open") === "open" &&
+        (item.shouldImplement ?? item.repoActionable ?? true) &&
+        (item.priority ?? "medium") === "high" &&
+        /crash|bug|error/i.test(`${item.type ?? ""} ${item.summary}`),
+    )
+    .slice(0, 6);
+  if (urgentFeedback.length > 0) {
+    lines.push("## Runtime failures (fix before slice if blocking)", "");
+    for (const item of urgentFeedback) {
+      lines.push(checkbox("runtime", item.summary));
+    }
+    lines.push("");
+  }
+
+  if (primary.outOfScope.length > 0 || buildSpec.deferred.length > 0) {
+    lines.push("## Deferred (do not implement this pass)", "");
+    for (const item of [...primary.outOfScope, ...buildSpec.deferred].slice(0, 16)) {
+      lines.push(`- ${item}`);
+    }
+    lines.push("");
+  }
+
+  lines.push(
+    "---",
+    "",
+    "## How to use",
+    "",
+    "1. Read `.foundry/BUILD_SPEC.md` for full context",
+    "2. Implement the primary slice acceptance criteria in product code",
+    "3. Mark items `- [x]` only when implemented and tested",
+    "",
+  );
+
+  return lines.join("\n");
 }
 
 function generateCursorBrief(
@@ -970,8 +1136,11 @@ function generateCursorBrief(
   previousChecklist?: BriefChecklistState,
 ): string {
   const checkbox = (section: BriefChecklistSection, text: string, defaultChecked = false): string => {
-    const checked = defaultChecked || (previousChecklist?.checked.has(checklistKey(section, text)) ?? false);
-    return `- [${checked ? "x" : " "}] ${text}`;
+    const cleanText = stripBriefIdComment(text);
+    const id = mintBriefItemId(section, cleanText);
+    // Cross-cycle preservation: same intent → same id, even if upstream rephrased the line.
+    const checked = defaultChecked || (previousChecklist?.checkedIds.has(id) ?? false);
+    return annotateBriefLineWithId(`- [${checked ? "x" : " "}] ${cleanText}`, id);
   };
   const lines: string[] = [
     `# Cursor Implementation Brief — ${projectName}`,
@@ -1198,6 +1367,7 @@ export const builderStage: Stage<StageInputComposition, BuilderOutput> = {
     const pdParsed = ProductDefHint.safeParse(input.productDefinition);
     const monParsed = MonetizationHint.safeParse(input.monetizationConfig);
     const feedbackParsed = FeedbackHint.safeParse(input.feedback);
+    const gwParsed = GrandWizardOutputSchema.safeParse(input.grandWizard);
 
     const audit = auditParsed.success ? auditParsed.data : undefined;
     const monetization = monParsed.success ? monParsed.data : undefined;
@@ -1497,23 +1667,36 @@ export const builderStage: Stage<StageInputComposition, BuilderOutput> = {
     const planMd = generateImplementationPlan(plan, allFileActions, projectName, gitStatus.branch, gitStatus.headSha);
     await writeStageMarkdown(ctx, "builder", "IMPLEMENTATION_PLAN.md", planMd);
 
-    const cursorBrief = generateCursorBrief(
-      projectName,
-      audit,
-      pdParsed.success ? pdParsed.data : undefined,
-      monetization,
-      plan,
-      allFileActions,
-      feedback,
-      { paywallGatesDone, edgeRatePathsDone },
-      input.investorRefinement,
-      previousChecklist,
-    );
+    const cursorBrief = gwParsed.success
+      ? generateCursorBriefFromBuildSpec(
+          projectName,
+          gwParsed.data,
+          audit,
+          feedback,
+          input.investorRefinement,
+          previousChecklist,
+        )
+      : generateCursorBrief(
+          projectName,
+          audit,
+          pdParsed.success ? pdParsed.data : undefined,
+          monetization,
+          plan,
+          allFileActions,
+          feedback,
+          { paywallGatesDone, edgeRatePathsDone },
+          input.investorRefinement,
+          previousChecklist,
+        );
     await writeStageMarkdown(ctx, "builder", "CURSOR_BRIEF.md", cursorBrief);
 
     await mkdir(join(repoPath, ".foundry"), { recursive: true });
     await writeFile(briefPath, cursorBrief, "utf8");
-    notes.push("Wrote .foundry/CURSOR_BRIEF.md — open this in Cursor to implement features.");
+    notes.push(
+      gwParsed.success
+        ? "Wrote .foundry/CURSOR_BRIEF.md from BUILD_SPEC (Grand Wizard) — template must-ship regen skipped."
+        : "Wrote .foundry/CURSOR_BRIEF.md — open this in Cursor to implement features.",
+    );
 
     // ---- 8. Determine status ----
     const created = allFileActions.filter((a) => a.action === "created").map((a) => a.file);

@@ -16,12 +16,72 @@ const BuilderDirectiveSchema = z.preprocess(
   }),
 );
 
+/**
+ * Domain block — first-class field for *what this app actually does*.
+ *
+ * Why: every stage in the pipeline (`product_definition`, `first_principles`,
+ * `flywheel_designer`, `convergence_contract`, `investor_panel`,
+ * `growth_operator`) was previously inferring "domain" from regex over
+ * `north_star` / `project_name` / `constraints`, which collapsed to generic
+ * SaaS phrasing for anything outside the few hardcoded buckets (gardening /
+ * web data platform). Concrete user actions and vocabulary belong in the
+ * config so all downstream copy can be specific instead of "Outcome
+ * visibility: the user sees a concrete result after each interaction."
+ *
+ * Every field is optional so existing repos keep working unchanged; stages
+ * fall back to legacy `inferDomain` when the block is absent.
+ */
+export const ProjectDomainSchema = z
+  .object({
+    /** Short label for the domain (e.g. "ingredient-safety scanner"). */
+    name: z.string().optional(),
+    /**
+     * The single most important user moment, written as one concrete sentence
+     * with a measurable outcome. Used verbatim where stages need a hero line.
+     * Example: "Point camera at a packaged food → see stomach-safe verdict in <2s".
+     */
+    primary_user_action: z.string().optional(),
+    /**
+     * Concrete user actions the product must support. Each entry becomes a
+     * Must Ship line in the brief (replaces the boilerplate "First-session
+     * value / Outcome visibility / etc."). Keep these specific and verifiable.
+     */
+    key_user_actions: z.array(z.string()).optional(),
+    /**
+     * Domain vocabulary so generated copy uses the same words as the product.
+     * `noun` ("a scan"), `verb` ("scan"), `outcome` ("verdict"), `actor` ("shopper").
+     */
+    vocabulary: z
+      .object({
+        noun: z.string().optional(),
+        verb: z.string().optional(),
+        outcome: z.string().optional(),
+        actor: z.string().optional(),
+      })
+      .optional(),
+    /** Concrete personas this product is built for. */
+    personas: z.array(z.string()).optional(),
+    /**
+     * Specific success demos — `<input> → <expected outcome with metric>`. Used
+     * in the investor pitch and as `requiredEvidence` for objections.
+     */
+    success_examples: z.array(z.string()).optional(),
+    /** Things explicitly out of scope for this product. */
+    non_goals: z.array(z.string()).optional(),
+    /** The single metric that defines product success (e.g. "scan-to-verdict p95 < 2s"). */
+    primary_metric: z.string().optional(),
+  })
+  .strict();
+
+export type ProjectDomain = z.infer<typeof ProjectDomainSchema>;
+
 export const ProjectYamlSchema = z.object({
   project_name: z.string(),
   repo_type: z.string(),
   north_star: z.string(),
   constraints: z.array(z.string()).optional(),
   core_differentiators: z.array(z.string()).optional(),
+  domain: ProjectDomainSchema.optional(),
   market: z
     .object({
       competitors: z
@@ -90,6 +150,8 @@ export const ProjectYamlSchema = z.object({
       builder_economy_model: z.string().optional(),
       /** When true (default), use `builder_economy_model` if QA ship + no code blockers + release is awaiting_approval (not blocked_pre_release). */
       use_builder_economy_near_release: z.boolean().optional(),
+      /** Model for `grand_wizard` consolidation (default `gpt-5.4-high`). */
+      grand_wizard_model: z.string().optional(),
       qa_model: z.string().optional(),
       qa_strict_model: z.string().optional(),
       max_inner_loops: z.coerce.number().int().positive().optional(),
@@ -107,6 +169,12 @@ export const ProjectYamlSchema = z.object({
           install_if_missing: z.boolean().optional(),
           /** When set, run this shell command from the repo root instead of `maestro test …` (e.g. `npm run qa:device -- --debug-output .maestro-debug --flatten-debug-output`). */
           pipeline_command: z.string().optional(),
+          /** When true, attempt to boot an iOS Simulator before running Maestro if none is currently booted. Defaults to true on macOS. */
+          auto_boot_simulator: z.boolean().optional(),
+          /** Preferred simulator name (substring match, e.g. "iPhone 16 Pro"). When unset, the newest available iPhone is selected. */
+          preferred_simulator: z.string().optional(),
+          /** Max seconds to wait for the simulator to reach `Booted` state after `simctl boot`. Default 90s. */
+          boot_timeout_seconds: z.number().int().min(10).max(600).optional(),
         })
         .optional(),
     })
