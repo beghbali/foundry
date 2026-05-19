@@ -38,6 +38,7 @@ import {
   truncateForDisplay,
   preflightCursorCommand,
   preflightCursorModels,
+  manifestStageRan,
   readBuilderRemainingBlockers,
   readStageJson,
   resolveCursorAutomationSettings,
@@ -518,22 +519,23 @@ async function printFoundryStatusDashboard(repoPath: string): Promise<void> {
   console.log("");
 
   console.log(chalk.bold.white("  INVESTOR (same run, if stage ran)"));
-  if (!investor?.investors?.length && !(investor?.combinedRefinementDirectives?.length ?? 0)) {
+  if (!investor || (!investor.investors?.length && !(investor.combinedRefinementDirectives?.length ?? 0))) {
     console.log(chalk.gray("    (no investor_panel output in this run — use `foundry loop --profile investor`)\n"));
   } else {
+    const inv0 = investor;
     console.log(
       chalk.gray(
-        `    meets_A-=${investor.meetsMinimumGradeA ? "yes" : "no"} · worst=${investor.worstGrade ?? "?"} · directives=${investor.combinedRefinementDirectives?.length ?? 0}`,
+        `    meets_A-=${inv0.meetsMinimumGradeA ? "yes" : "no"} · worst=${inv0.worstGrade ?? "?"} · directives=${inv0.combinedRefinementDirectives?.length ?? 0}`,
       ),
     );
-    (investor.investors ?? []).slice(0, 4).forEach((inv) => {
+    (inv0.investors ?? []).slice(0, 4).forEach((inv) => {
       console.log(
         chalk.gray(
           `      ${inv.displayName ?? "?"}: ${inv.grade ?? "?"}`,
         ),
       );
     });
-    const dirs = investor.combinedRefinementDirectives ?? [];
+    const dirs = inv0.combinedRefinementDirectives ?? [];
     dirs.slice(0, 5).forEach((d, i) => {
       console.log(chalk.cyan(`      D${i + 1}. ${truncateForDisplay(d, 110)}`));
     });
@@ -575,6 +577,143 @@ async function printFoundryStatusDashboard(repoPath: string): Promise<void> {
  *   - accumulate LOC totals for those tasks
  * Logs a one-liner summary so the operator sees which directives actually closed.
  */
+/**
+ * Snapshot the BUILD_SPEC_LEDGER and BUILD_SPEC before each Cursor pass so
+ * that if Cursor edits the generated files (despite the prompt telling it
+ * not to), we can detect and restore. Returns the absolute path of the
+ * snapshot file (consumed by `updateBuildSpecLedgerFromPass`).
+ *
+ * Without this, the ledger's `tasks` map gets wiped between inner passes
+ * and the same tasks appear as "newly closed" cycle after cycle.
+ */
+/**
+ * Resolve the canonical snapshot directory. We deliberately put this under
+ * `.foundry/automation/` (already covered by GENERATED_FOUNDRY_PREFIXES and
+ * the .gitignore block) so Cursor's autocommit never picks the snapshot
+ * files up as "changed product files". Prior versions used
+ * `.foundry/.pre-cursor-snapshots/`; if that path exists on disk we
+ * one-time-untrack it from git so old commits don't keep re-staging.
+ */
+function ledgerSnapshotDir(repoPath: string): string {
+  return join(repoPath, ".foundry", "automation", ".pre-cursor-snapshots");
+}
+
+async function untrackLegacySnapshotDirIfPresent(repoPath: string): Promise<void> {
+  const fs = await import("node:fs/promises");
+  const legacy = join(repoPath, ".foundry", ".pre-cursor-snapshots");
+  try {
+    const st = await fs.stat(legacy);
+    if (!st.isDirectory()) return;
+  } catch {
+    return;
+  }
+  try {
+    const cp = await import("node:child_process");
+    await new Promise<void>((res) => {
+      const child = cp.spawn(
+        "git",
+        ["rm", "-rf", "--cached", "--ignore-unmatch", ".foundry/.pre-cursor-snapshots"],
+        { cwd: repoPath, stdio: "ignore" },
+      );
+      child.on("close", () => res());
+      child.on("error", () => res());
+    });
+  } catch {
+    // best-effort
+  }
+  try {
+    await fs.rm(legacy, { recursive: true, force: true });
+  } catch {
+    // best-effort
+  }
+}
+
+async function snapshotBuildSpecArtifactsBeforeCursor(repoPath: string): Promise<void> {
+  await untrackLegacySnapshotDirIfPresent(repoPath);
+  const fs = await import("node:fs/promises");
+  const snapDir = ledgerSnapshotDir(repoPath);
+  await fs.mkdir(snapDir, { recursive: true });
+  for (const rel of ["BUILD_SPEC_LEDGER.json", "BUILD_SPEC.json"]) {
+    const src = join(repoPath, ".foundry", rel);
+    const dst = join(snapDir, rel);
+    try {
+      await fs.copyFile(src, dst);
+    } catch {
+      try { await fs.unlink(dst); } catch { /* ignore */ }
+    }
+  }
+}
+
+function snapshotPathFor(repoPath: string, rel: string): string {
+  return join(ledgerSnapshotDir(repoPath), rel);
+}
+
+/**
+ * Restore the ledger from the pre-Cursor snapshot if Cursor wiped or
+ * truncated it. We trust the snapshot when (a) snapshot has more task
+ * entries than the on-disk file, or (b) snapshot has more addressed
+ * parents. Cursor edits to generated files are silently overwritten.
+ */
+async function restoreLedgerIfCursorWipedIt(repoPath: string): Promise<{ restored: boolean; reason?: string }> {
+  const fs = await import("node:fs/promises");
+  const snapPath = snapshotPathFor(repoPath, "BUILD_SPEC_LEDGER.json");
+  const livePath = join(repoPath, ".foundry", "BUILD_SPEC_LEDGER.json");
+  let snapRaw = "";
+  let liveRaw = "";
+  try { snapRaw = await fs.readFile(snapPath, "utf8"); } catch { return { restored: false }; }
+  try { liveRaw = await fs.readFile(livePath, "utf8"); } catch { liveRaw = ""; }
+
+  type LedgerShape = { tasks?: Record<string, unknown>; addressedParents?: Record<string, unknown> };
+  let snap: LedgerShape = {};
+  let live: LedgerShape = {};
+  try { snap = JSON.parse(snapRaw) as LedgerShape; } catch { return { restored: false }; }
+  try { live = liveRaw ? (JSON.parse(liveRaw) as LedgerShape) : {}; } catch { live = {}; }
+
+  const snapTasks = Object.keys(snap.tasks ?? {}).length;
+  const liveTasks = Object.keys(live.tasks ?? {}).length;
+  const snapParents = Object.keys(snap.addressedParents ?? {}).length;
+  const liveParents = Object.keys(live.addressedParents ?? {}).length;
+
+  if (liveTasks < snapTasks || liveParents < snapParents) {
+    await fs.copyFile(snapPath, livePath);
+    return {
+      restored: true,
+      reason: `tasks ${liveTasks}→${snapTasks}, addressedParents ${liveParents}→${snapParents}`,
+    };
+  }
+  return { restored: false };
+}
+
+/**
+ * Also restore the BUILD_SPEC if Cursor truncated/wiped it. The wizard's
+ * generated spec must persist between passes so the same task IDs continue
+ * to anchor `taskCompletedByEdits` lookups.
+ */
+async function restoreBuildSpecIfCursorWipedIt(repoPath: string): Promise<{ restored: boolean; reason?: string }> {
+  const fs = await import("node:fs/promises");
+  const snapPath = snapshotPathFor(repoPath, "BUILD_SPEC.json");
+  const livePath = join(repoPath, ".foundry", "BUILD_SPEC.json");
+  let snapRaw = "";
+  let liveRaw = "";
+  try { snapRaw = await fs.readFile(snapPath, "utf8"); } catch { return { restored: false }; }
+  try { liveRaw = await fs.readFile(livePath, "utf8"); } catch { liveRaw = ""; }
+
+  type SpecShape = { slices?: Array<{ tasks?: unknown[] }> };
+  let snap: SpecShape = {};
+  let live: SpecShape = {};
+  try { snap = JSON.parse(snapRaw) as SpecShape; } catch { return { restored: false }; }
+  try { live = liveRaw ? (JSON.parse(liveRaw) as SpecShape) : {}; } catch { live = {}; }
+
+  const snapTasks = (snap.slices?.[0]?.tasks ?? []).length;
+  const liveTasks = (live.slices?.[0]?.tasks ?? []).length;
+
+  if (liveTasks < snapTasks) {
+    await fs.copyFile(snapPath, livePath);
+    return { restored: true, reason: `slice tasks ${liveTasks}→${snapTasks}` };
+  }
+  return { restored: false };
+}
+
 async function updateBuildSpecLedgerFromPass(
   repoPath: string,
   runId: string,
@@ -583,6 +722,15 @@ async function updateBuildSpecLedgerFromPass(
     diffStats?: Array<{ file: string; added: number; removed: number }>;
   },
 ): Promise<void> {
+  const restoredSpec = await restoreBuildSpecIfCursorWipedIt(repoPath);
+  if (restoredSpec.restored) {
+    console.log(chalk.yellow(`  BUILD_SPEC was truncated by Cursor — restored from pre-Cursor snapshot (${restoredSpec.reason}).`));
+  }
+  const restoredLedger = await restoreLedgerIfCursorWipedIt(repoPath);
+  if (restoredLedger.restored) {
+    console.log(chalk.yellow(`  BUILD_SPEC_LEDGER was wiped by Cursor — restored from pre-Cursor snapshot (${restoredLedger.reason}).`));
+  }
+
   const spec = await readBuildSpecFromRepo(repoPath);
   if (!spec) return;
   const ledger = await readBuildSpecLedger(repoPath);
@@ -628,7 +776,11 @@ async function updateBuildSpecLedgerFromPass(
     ledger.updatedAt = new Date().toISOString();
     ledger.stuckCycles = 0;
     await writeBuildSpecLedger(repoPath, ledger);
-    const totalDone = Object.keys(ledger.tasks).length;
+    // Count only tasks from the CURRENT spec — ledger.tasks contains entries
+    // from prior specs whose task IDs are different from the current set.
+    // (Previously this read Object.keys(ledger.tasks).length which produced
+    // nonsense like "14/5 cumulative".)
+    const totalDone = slice.tasks.filter((t) => t.id in ledger.tasks).length;
     const totalTasks = slice.tasks.length;
     const totalAddressed = Object.keys(ledger.addressedParents ?? {}).length;
     console.log(
@@ -678,9 +830,22 @@ async function buildWorkPacketForRun(params: {
   const buildSpec = await readBuildSpecFromRepo(params.repoPath);
   const ledger = await readBuildSpecLedger(params.repoPath);
   const primarySliceRaw = buildSpec ? primaryBuildSpecSlice(buildSpec) : undefined;
-  const primarySlice = primarySliceRaw
-    ? { ...primarySliceRaw, tasks: primarySliceRaw.tasks.filter((t) => !(t.id in ledger.tasks)) }
-    : undefined;
+  // Only forward the slice to the work packet when (a) it has unclosed tasks
+  // OR (b) the original spec had no tasks at all (heuristic-only acceptance).
+  // When the original had tasks but ledger closed them all, we drop the slice
+  // entirely so createWorkPacket does NOT replay acceptance criteria as new
+  // "must ship" items.
+  let primarySlice = undefined as ReturnType<typeof primaryBuildSpecSlice> | undefined;
+  if (primarySliceRaw) {
+    const filteredTasks = primarySliceRaw.tasks.filter((t) => !(t.id in ledger.tasks));
+    const originalHadTasks = primarySliceRaw.tasks.length > 0;
+    if (filteredTasks.length > 0) {
+      primarySlice = { ...primarySliceRaw, tasks: filteredTasks };
+    } else if (!originalHadTasks) {
+      primarySlice = primarySliceRaw;
+    }
+    // else: every task is in the ledger -> no `must ship` from this spec.
+  }
   const qaSeparated = separateManualAndCodeItems([
     ...(params.pipelineQa?.blockers ?? []),
     ...(params.pipelineQa?.manualTasks ?? []),
@@ -1245,6 +1410,9 @@ const FOUNDRY_GITIGNORE_ENTRIES = [
   ".foundry/BUILD_SPEC.md",
   ".foundry/BUILD_SPEC_LEDGER.json",
   ".foundry/INVESTOR_PANEL_STATE.json",
+  // Legacy snapshot dir kept here so existing .gitignore files continue to
+  // ignore it after we relocate snapshots under .foundry/automation/.
+  ".foundry/.pre-cursor-snapshots/",
   ".foundry/CURSOR_BUILDER_REPORT.md",
   ".foundry/CURSOR_QA_REPORT.md",
   ".foundry/automation/",
@@ -2868,6 +3036,43 @@ program
     console.log(chalk.gray(`  Feedback interval: ${opts.feedbackInterval}m (ignored when --no-wait)`));
     console.log(chalk.gray(`  Max cycles: ${maxCycles || "unlimited"}\n`));
     if (cursorSettings.enabled) {
+      // Warn early about a known footgun: FOUNDRY_CURSOR_AGENT_CMD pinned to
+      // a versioned `cursor-agent` binary that does NOT match the PATH one.
+      // The user typically runs `cursor-agent login` (PATH-resolved); a stale
+      // env var silently makes Foundry use a different version that may need
+      // its own login and produces confusing "not authenticated" errors.
+      const envPinnedCursor = process.env.FOUNDRY_CURSOR_AGENT_CMD?.trim();
+      if (envPinnedCursor && /\/cursor-agent\/versions\//.test(envPinnedCursor)) {
+        try {
+          const fs = await import("node:fs/promises");
+          await fs.access(envPinnedCursor);
+          const cp = await import("node:child_process");
+          const which = await new Promise<string>((res) => {
+            const child = cp.spawn("bash", ["-lc", "command -v cursor-agent || true"], {
+              env: process.env,
+              stdio: ["ignore", "pipe", "ignore"],
+            });
+            let out = "";
+            child.stdout.on("data", (b) => { out += b.toString(); });
+            child.on("close", () => res(out.trim()));
+            child.on("error", () => res(""));
+          });
+          if (which && which !== envPinnedCursor) {
+            console.log(
+              chalk.yellow(
+                `  WARNING: FOUNDRY_CURSOR_AGENT_CMD is pinned to a versioned binary:\n` +
+                  `    ${envPinnedCursor}\n` +
+                  `  but \`cursor-agent\` on PATH resolves to a different binary:\n` +
+                  `    ${which}\n` +
+                  `  If you ran \`cursor-agent login\`, it authenticated the PATH binary, not the pinned one.\n` +
+                  `  Recommend: \`unset FOUNDRY_CURSOR_AGENT_CMD\` so Foundry uses the same cursor-agent you logged in to.`,
+              ),
+            );
+          }
+        } catch {
+          /* env points to a non-existent path; the preflight will report it. */
+        }
+      }
       const preflight = await preflightCursorCommand(cursorSettings.command, repoPath);
       if (!preflight.ok) {
         console.error(chalk.red(preflight.detail));
@@ -2921,11 +3126,30 @@ program
      */
     let consecutiveTransportFailures = 0;
     const MAX_CONSECUTIVE_TRANSPORT_FAILURES = 2;
+    /**
+     * Count of consecutive outer cycles whose inner loop aborted (no real
+     * code changes, only metadata, monetization-only, etc.). Used to break
+     * the outer loop after persistent no-progress; previously a single
+     * abort would kill autonomous runs even though the user explicitly
+     * passed `--no-wait` expecting continued convergence.
+     */
+    let consecutiveAbortCycles = 0;
 
     while (true) {
       cycle++;
       let abortLoop = false;
       let outerCycleHadTransportFailure = false;
+      // Set when cursor-agent rejected the configured model at runtime.
+      // No retrying inside the loop will help — the operator must edit
+      // project.yaml or set builder_model: "auto" before another run.
+      let modelLookupRejected = false;
+      // Tracks whether *any* inner pass in this outer cycle reached QA-ship.
+      // We use this to force `investor_panel` at end-of-cycle (with QA gate
+      // bypassed) when a later inner pass regressed QA — otherwise convergence
+      // runs go several outer cycles without ever generating investor grades.
+      let cycleHadShipState = false;
+      // Tracks whether an investor_panel actually ran (not skipped) this cycle.
+      let cycleProducedInvestorPanel = false;
       if (maxCycles > 0 && cycle > maxCycles) {
         console.log(chalk.yellow(`\nReached max cycles (${maxCycles}). Stopping.`));
         break;
@@ -3044,12 +3268,24 @@ program
         const parentsCovered = buildSpec.parentDirectives.filter((p) => p.childTaskIds.length > 0).length;
         const undecomposed = buildSpec.diagnostics.directivesWithoutTasks.length;
         const stuckCycles = ledger.stuckCycles;
+        const droppedParentsCount = Object.keys(ledger.droppedParents ?? {}).length;
         const tone = undecomposed > 0 || tasksWithFiles < totalTasks || stuckCycles > 1 ? chalk.yellow : chalk.gray;
         console.log(
           tone(
-            `  Grand Wizard: ${doneTasks}/${totalTasks} task(s) done · ${tasksWithFiles}/${totalTasks} have file refs · parents ${parentsCovered}/${parents} decomposed · stuck=${stuckCycles} · source=${buildSpec.source}`,
+            `  Grand Wizard: ${doneTasks}/${totalTasks} task(s) done · ${tasksWithFiles}/${totalTasks} have file refs · parents ${parentsCovered}/${parents} decomposed · stuck=${stuckCycles} · dropped=${droppedParentsCount} · source=${buildSpec.source}`,
           ),
         );
+        if (droppedParentsCount > 0) {
+          const sampleDropped = Object.values(ledger.droppedParents ?? {})
+            .slice(0, 2)
+            .map((d) => `"${d.text.slice(0, 60)}${d.text.length > 60 ? "…" : ""}"`)
+            .join("; ");
+          console.log(
+            chalk.gray(
+              `  ↳ Parents dropped after ${2}+ undecomposed cycles (use --reset-spec to revive): ${sampleDropped}${droppedParentsCount > 2 ? ` (+${droppedParentsCount - 2} more)` : ""}`,
+            ),
+          );
+        }
         if (undecomposed > 0) {
           console.log(
             chalk.yellow(
@@ -3178,6 +3414,81 @@ program
             );
             break;
           }
+          // Re-derive activePacketCounts from disk before deciding whether to
+          // invoke another Cursor pass. Without this, the value carries over
+          // from before the previous pipeline rerun and can lie about open
+          // items (e.g. a prior iteration closed all real tasks but we still
+          // see counts.total > 0 from stale memory), letting Cursor get
+          // dispatched to do "filler" work that breaks QA.
+          {
+            const freshOpen = stabilize
+              ? filterBriefItemsForStabilizePhase(await readOpenBriefItems(briefPath), pipelineQa)
+              : await readOpenBriefItems(briefPath);
+            const freshChecked = await readCheckedBriefItems(briefPath);
+            workPacket = await refreshWorkPacket(repoPath, workPacket, {
+              briefOpenItems: freshOpen,
+              checkedBriefItems: freshChecked,
+              qaCodeBlockers: separateManualAndCodeItems([
+                ...(pipelineQa?.blockers ?? []),
+                ...(pipelineQa?.manualTasks ?? []),
+              ]).code,
+              builderCodeBlockers: separateManualAndCodeItems([
+                ...extractBuilderBlockers(builderOutput),
+                ...builderRemainingBlockers,
+              ]).code,
+              manualOnly: [
+                ...separateManualAndCodeItems([
+                  ...(pipelineQa?.blockers ?? []),
+                  ...(pipelineQa?.manualTasks ?? []),
+                  ...extractBuilderBlockers(builderOutput),
+                  ...builderRemainingBlockers,
+                ]).manual,
+              ],
+              codeChanged: false,
+            });
+            activePacketCounts = packetBriefCounts(workPacket);
+          }
+          // Guard: don't invoke Cursor when there is literally nothing to do.
+          // Without this, the inner loop fires off a Cursor pass with
+          // "Build targets (0): (none ...)", and Cursor either invents
+          // make-work that breaks QA, crashes with exit 1, or trips the
+          // abort-on-no-product-changes guard and kills the outer loop.
+          // Instead, force a one-off investor_panel run from the current
+          // (good) QA-ship state and break out.
+          if (
+            loopProfile === "investor" &&
+            activePacketCounts.total === 0 &&
+            implementNowFeedbackCount === 0 &&
+            pipelineQa?.recommendation === "ship" &&
+            (pipelineQa?.blockers?.length ?? 0) === 0
+          ) {
+            console.log(
+              chalk.cyan(
+                "\n  No open work-packet items, no queued feedback, QA is ship — skipping further Cursor passes this cycle and running investor_panel from this state.",
+              ),
+            );
+            const ipSpinner = ora("Running investor_panel (no Cursor pass needed)...").start();
+            try {
+              manifest = await runPipeline({
+                repoPath,
+                pipelineName: opts.pipeline,
+                foundryRoot,
+                quiet: true,
+                allowInvestorRefinement: false,
+                investorLoopAutonomousDefaults: true,
+                stagesOverride: ["investor_panel"],
+              });
+              ipSpinner.succeed("investor_panel completed.");
+              investorOutput = await readStageJson<InvestorPanelBrief>(repoPath, manifest, "investor_panel");
+              if (investorOutput && manifestStageRan(manifest, "investor_panel")) {
+                cycleProducedInvestorPanel = true;
+              }
+              logInvestorScoreLine(investorOutput);
+            } catch (err) {
+              ipSpinner.fail(err instanceof Error ? err.message : String(err));
+            }
+            break;
+          }
           inner++;
           const prePacketOpen = workPacketOpenCount(workPacket);
           const preQaBlockers = pipelineQa?.blockers?.length ?? 0;
@@ -3232,6 +3543,7 @@ program
           const builderSpinner = ora(`Cursor builder agent (${builderChoice.model})`).start();
           console.log(chalk.gray(`  Builder model reason: ${builderChoice.reason}`));
           console.log(chalk.gray(`  Live builder log: ${join(repoPath, ".foundry", "automation", manifest.runId, "builder.log")}`));
+          await snapshotBuildSpecArtifactsBeforeCursor(repoPath);
           const builderRun = await runBuilderAgent(repoPath, manifest, cursorSettings, builderChoice.model, {
             innerLoopIndex: inner,
           });
@@ -3364,7 +3676,11 @@ program
                 break;
               }
             }
-            const changedForLog = builderRun.changedFiles.filter((p) => !p.startsWith(".maestro-debug/"));
+            const changedForLog = builderRun.changedFiles.filter(
+              (p) =>
+                !p.startsWith(".maestro-debug/") &&
+                !p.startsWith(".foundry/.pre-cursor-snapshots/"),
+            );
             console.log(
               chalk.gray(
                 `  Code files changed: ${changedForLog.length ? changedForLog.slice(0, 8).join(", ") : "(none)"}`,
@@ -3408,6 +3724,37 @@ program
                   "\n  Cursor `agent` failed to load a native dependency. Reinstall/update Cursor (CLI bundled with the app), verify CPU arch matches the binary, or set `cursor_automation.command` / FOUNDRY_CURSOR_AGENT_CMD to a working agent path.",
                 ),
               );
+            }
+            // Model-not-found: the runtime API call rejected the configured
+            // model even though `agent models` may still list it. Two common
+            // causes: (1) cursor-agent stripped a verbosity suffix and looked
+            // for a base name that doesn't exist (e.g. `claude-opus-4-7-high`
+            // → `claude-opus-4-7`), or (2) the model was deprecated server-
+            // side. Print actionable guidance with the actual valid model
+            // list and abort cleanly — retrying in another cycle won't help.
+            const modelNotFoundMatch = agentBlob.match(/Model name is not valid: "?([^"\n]+)"?/i)
+              ?? agentBlob.match(/AI Model Not Found[^\n]*"([^"\n]+)"/i);
+            if (modelNotFoundMatch) {
+              const rejectedModel = modelNotFoundMatch[1].trim();
+              const configuredModel = builderChoice.model;
+              console.log(
+                chalk.red.bold(
+                  `\n  CURSOR REJECTED MODEL: '${rejectedModel}'${rejectedModel !== configuredModel ? ` (resolved from configured '${configuredModel}')` : ""}.`,
+                ),
+              );
+              console.log(
+                chalk.yellow(
+                  `  Edit .foundry/project.yaml \`cursor_automation\` and set \`builder_model\` / \`builder_fast_model\` to a currently valid model name.\n` +
+                    `  Get the live list with:  ${cursorSettings.command} models\n` +
+                    `  Common Claude Opus 4.7 aliases: claude-opus-4-7-thinking-high, claude-opus-4-7-thinking-xhigh, claude-opus-4-7-high.\n` +
+                    `  Common GPT-5.5 aliases:        gpt-5.5-medium, gpt-5.5-medium-fast, gpt-5.5-high, gpt-5.5-high-fast.\n` +
+                    `  Or set builder_model: "auto" to let Cursor pick its current default (recommended fallback).`,
+                ),
+              );
+              // Mark the whole foundry loop as needing operator action — no
+              // amount of retrying will change which models cursor-agent
+              // accepts. Exit the OUTER loop, not just the inner.
+              modelLookupRejected = true;
             }
             // Cross-cycle transport-stall watchdog: if Cursor died because of
             // network / reconnect-only output, the next outer cycle is unlikely
@@ -3460,6 +3807,15 @@ program
           briefCounts = await countCriticalBriefItems(briefPath);
           briefMetrics = await readBriefMetrics(briefPath);
           pipelineQa = await readStageJson<PipelineIndependentQa>(repoPath, manifest, "independent_qa");
+          // Track cycle-level "ever ship" and "investor panel ran" signals
+          // so we can backfill an investor pitch at end-of-cycle even if a
+          // later inner pass regressed QA.
+          if (pipelineQa?.recommendation === "ship" && (pipelineQa?.blockers?.length ?? 0) === 0) {
+            cycleHadShipState = true;
+          }
+          if (investorOutput && manifestStageRan(manifest, "investor_panel")) {
+            cycleProducedInvestorPanel = true;
+          }
           feedbackOutput = await readStageJson<PipelineFeedbackBrief>(repoPath, manifest, "feedback_agent");
           implementNowFeedbackCount = feedbackOutput?.ledgerSummary?.implementNowItems ?? 0;
           builderRemainingBlockers = await readBuilderRemainingBlockers(repoPath);
@@ -3640,20 +3996,112 @@ program
       } else {
         consecutiveTransportFailures = 0;
       }
+      // If cursor-agent rejected the configured model, no amount of further
+      // cycling can recover — the operator must edit `cursor_automation.builder_model`
+      // in project.yaml (or set it to "auto"). Exit immediately so we don't
+      // burn another full pipeline run that will fail the same way.
+      if (modelLookupRejected) {
+        console.log(
+          chalk.red.bold(
+            "\n  Aborting foundry loop: cursor-agent rejected the configured builder model.",
+          ),
+        );
+        console.log(
+          chalk.yellow(
+            "  Update .foundry/project.yaml \`cursor_automation.builder_model\` (and \`builder_fast_model\`) — see model error above.",
+          ),
+        );
+        break;
+      }
+
+      // Inner loop abort tracking: the inner loop sets `abortLoop = true` when
+      // Cursor commits no real code, only metadata, monetization-only changes,
+      // or trips test-change rules. Previously this would break the OUTER
+      // loop whenever the release wasn't approved, killing autonomous runs
+      // (the user got "Loop finished." after cycle 3 even though they wanted
+      // continued investor convergence). Now we only break the outer loop
+      // after 3 consecutive abort cycles — that's the real "Cursor is
+      // hopelessly stuck" signal. Otherwise we move on to the next cycle so
+      // a fresh pipeline run can produce different work.
+      if (abortLoop) {
+        consecutiveAbortCycles += 1;
+      } else {
+        consecutiveAbortCycles = 0;
+      }
       if (
         abortLoop &&
+        consecutiveAbortCycles >= 3 &&
         releaseOutput?.status !== "awaiting_approval" &&
         releaseOutput?.status !== "approved" &&
         releaseOutput?.status !== "auto_approved"
       ) {
+        console.log(
+          chalk.red.bold(
+            `\n  Aborting foundry loop: ${consecutiveAbortCycles} consecutive cycles ended without product code changes.`,
+          ),
+        );
+        console.log(
+          chalk.yellow(
+            "  Inspect .foundry/CURSOR_BUILDER_REPORT.md and project.yaml — Cursor is repeatedly making no useful changes.",
+          ),
+        );
         break;
       }
       if (abortLoop) {
-        console.log(
-          chalk.yellow(
-            "\n  Inner loop aborted, but release is ready — continuing to approval prompt.\n",
-          ),
-        );
+        if (releaseOutput?.status === "awaiting_approval" ||
+            releaseOutput?.status === "approved" ||
+            releaseOutput?.status === "auto_approved") {
+          console.log(
+            chalk.yellow(
+              "\n  Inner loop aborted, but release is ready — continuing to approval prompt.\n",
+            ),
+          );
+        } else {
+          console.log(
+            chalk.yellow(
+              `\n  Inner loop aborted (consecutive=${consecutiveAbortCycles}/3) — continuing to next outer cycle so a fresh pipeline run can produce new work.\n`,
+            ),
+          );
+        }
+      }
+
+      // End-of-cycle investor backfill: when QA reached `ship` somewhere
+      // inside this outer cycle but the LAST inner pass left QA red (Cursor
+      // tends to invent low-value follow-ons that regress tests), we'd
+      // normally never produce investor grades — the panel gate refuses to
+      // pitch with red QA. Force a one-off investor_panel that bypasses the
+      // QA gate so convergence runs actually move. All other gates (builder
+      // status, convergence, directives-unaddressed) still apply, so this
+      // never re-pitches stale feedback.
+      if (
+        loopProfile === "investor" &&
+        cycleHadShipState &&
+        !cycleProducedInvestorPanel
+      ) {
+        const ipSpinner = ora(
+          "Backfilling investor_panel (QA regressed after cycle reached ship — bypassing QA gate)...",
+        ).start();
+        try {
+          manifest = await runPipeline({
+            repoPath,
+            pipelineName: opts.pipeline,
+            foundryRoot,
+            quiet: true,
+            allowInvestorRefinement: false,
+            investorLoopAutonomousDefaults: true,
+            stagesOverride: ["investor_panel"],
+            forceInvestorPanelBypassQaGate: true,
+          });
+          if (manifestStageRan(manifest, "investor_panel")) {
+            ipSpinner.succeed("investor_panel completed (QA-gate-bypassed backfill).");
+            cycleProducedInvestorPanel = true;
+          } else {
+            ipSpinner.warn("investor_panel still skipped by another gate (builder/convergence/directives).");
+          }
+          investorOutput = await readStageJson<InvestorPanelBrief>(repoPath, manifest, "investor_panel");
+        } catch (err) {
+          ipSpinner.fail(err instanceof Error ? err.message : String(err));
+        }
       }
 
       logReleaseCandidateLine(pipelineQa, releaseOutput);

@@ -324,11 +324,13 @@ export async function createWorkPacket(input: WorkPacketSourceInput): Promise<Wo
         const filesNote = task.files.length > 0 ? ` (files: ${task.files.map((f) => `\`${f}\``).join(", ")})` : "";
         push("brief", "must", `[${task.id}] ${task.task}${filesNote}`);
       }
-    } else {
-      for (const ac of slice.acceptance) {
-        push("brief", "must", `[${slice.title}] ${ac}`);
-      }
     }
+    // When `tasks` is empty here it means the loop filtered all tasks via the
+    // BUILD_SPEC_LEDGER (every spec task is already closed). Do NOT fall back
+    // to listing `slice.acceptance` — that fallback re-emitted "all done" as
+    // "all open" with the slice title prepended (e.g. `[Prove the … loop] Delete …`),
+    // which is exactly what the user reported as "build targets remain the
+    // same, reworded with investor prefix".
   }
 
   for (const item of input.briefOpenItems) {

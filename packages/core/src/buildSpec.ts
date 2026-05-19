@@ -112,6 +112,35 @@ export const BuildSpecLedgerSchema = z.object({
       }),
     )
     .default({}),
+  /**
+   * Tracks each cycle in which a parent directive failed to decompose into any
+   * concrete child task. After STUCK_DROP_THRESHOLD consecutive failures the
+   * directive is moved into `droppedParents` and the wizard stops emitting it.
+   * This prevents abstract directives ("Outcome visibility...", "User-context
+   * data loop...") from blocking every cycle when neither the heuristic nor
+   * the LLM can anchor them in a concrete file.
+   *
+   * Keyed by parent directive text (stable across runs since text is preserved
+   * verbatim). Value is the count of consecutive undecomposed cycles.
+   */
+  undecomposedParentStreak: z.record(z.string(), z.number().int().min(0)).default({}),
+  /**
+   * Parents permanently dropped from re-emission because they failed to
+   * decompose for N consecutive cycles. Operator can revive one with
+   * `foundry loop --reset-spec` (clears the ledger) or by manually editing
+   * BUILD_SPEC_LEDGER.json.
+   */
+  droppedParents: z
+    .record(
+      z.string(),
+      z.object({
+        text: z.string(),
+        source: z.string(),
+        droppedAt: z.string(),
+        afterStreak: z.number().int().min(1),
+      }),
+    )
+    .default({}),
 });
 
 export type BuildSpecLedger = z.infer<typeof BuildSpecLedgerSchema>;
@@ -124,8 +153,20 @@ export function emptyBuildSpecLedger(): BuildSpecLedger {
     tasks: {},
     stuckCycles: 0,
     addressedParents: {},
+    undecomposedParentStreak: {},
+    droppedParents: {},
   };
 }
+
+/** Stable key for a parent directive in the streak/dropped ledgers. Uses
+ *  text rather than ID because IDs are regenerated each cycle (`p1`, `p2`),
+ *  whereas text is preserved verbatim from the upstream stage. */
+export function droppedParentKey(text: string): string {
+  return text.trim().replace(/\s+/g, " ").toLowerCase().slice(0, 200);
+}
+
+/** Default consecutive-failures threshold after which a parent is dropped. */
+export const STUCK_DROP_THRESHOLD = 2;
 
 export async function readBuildSpecLedger(repoPath: string): Promise<BuildSpecLedger> {
   try {

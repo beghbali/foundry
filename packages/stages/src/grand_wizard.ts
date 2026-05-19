@@ -7,7 +7,9 @@ import {
   BUILD_SPEC_MD_REL,
   BUILD_SPEC_REL,
   GrandWizardOutputSchema,
+  STUCK_DROP_THRESHOLD,
   computeUpstreamFingerprint,
+  droppedParentKey,
   isEnvironmentalWorkItem,
   isVagueDirective,
   readBuildSpecLedger,
@@ -335,12 +337,26 @@ function buildHeuristicSpec(input: StageInputComposition, ledger: BuildSpecLedge
   const notes: string[] = [];
 
   const addressedParentIds = new Set(Object.keys(ledger.addressedParents ?? {}));
-  const addressedParentTexts = new Set(
-    Object.values(ledger.addressedParents ?? {}).map((p) => p.text.trim().toLowerCase()),
-  );
+  const addressedParentTextsRaw = Object.values(ledger.addressedParents ?? {}).map((p) => p.text);
+  const addressedParentTexts = new Set(addressedParentTextsRaw.map((t) => t.trim().toLowerCase()));
+  // Parents that failed to decompose for STUCK_DROP_THRESHOLD consecutive
+  // cycles are permanently dropped. Without this, the heuristic emits the
+  // same abstract directive every cycle ("Outcome visibility...",
+  // "User-context data loop...") and the user sees `parents X/Y decomposed`
+  // stuck at the same number forever.
+  const droppedParentTextsRaw = Object.values(ledger.droppedParents ?? {}).map((p) => p.text);
   const incompleteParents = parents.filter((p) => {
     if (addressedParentIds.has(p.id)) return false;
     if (addressedParentTexts.has(p.text.trim().toLowerCase())) return false;
+    // Fuzzy match against addressed parents — the upstream stages (investor,
+    // feedback, convergence_contract) frequently reword the same directive
+    // ("Remove" ⇄ "Delete" ⇄ "Drop"). Without fuzzy comparison, a reworded
+    // version re-emits as a "new" parent every cycle, which is exactly what
+    // the user reported as "build targets remain the same, reworded with
+    // investor prefix".
+    if (addressedParentTextsRaw.some((t) => fuzzyDirectiveMatch(p.text, t))) return false;
+    // Likewise for permanently-dropped parents.
+    if (droppedParentTextsRaw.some((t) => fuzzyDirectiveMatch(p.text, t))) return false;
     return !Object.keys(ledger.tasks).some((taskId) => taskId.startsWith(`${p.id}.`));
   });
   const topParents = (incompleteParents.length > 0 ? incompleteParents : parents).slice(0, MAX_TASKS_PER_SLICE);
@@ -536,7 +552,21 @@ function mergeLlmDraft(
   });
 }
 
-function llmPrompt(input: StageInputComposition, heuristic: GrandWizardOutput): string {
+function llmPrompt(
+  input: StageInputComposition,
+  heuristic: GrandWizardOutput,
+  alreadyAddressed: ReadonlyArray<{ text: string; addressedAt?: string }>,
+): string {
+  const addressedBlock =
+    alreadyAddressed.length > 0
+      ? [
+          "PRIOR-CYCLES ADDRESSED DIRECTIVES — DO NOT RE-EMIT EQUIVALENTS:",
+          "These directives were already resolved in earlier cycles (the relevant product code was edited and the parent was marked addressed in BUILD_SPEC_LEDGER.addressedParents). You MUST NOT create new tasks that re-do these same intents under reworded titles. If upstream directives sound similar (e.g. 'Replace X with Y' / 'Replace X with Z' / 'Remove X' / 'Delete X'), treat them as the SAME and DROP them — do not emit them as parents or tasks.",
+          ...alreadyAddressed.slice(0, 20).map((p, i) => `${i + 1}. ${p.text.replace(/\s+/g, " ").slice(0, 220)}`),
+          "If every current upstream directive matches an addressed one above, emit an EMPTY primarySlice.tasks (`tasks: []`) and explain in `notes`. Do NOT invent make-work to fill the slice.",
+          "",
+        ].join("\n")
+      : "";
   return [
     "You are the Grand Wizard. Your job is to DECOMPOSE vague upstream directives into concrete, code-anchored engineering tasks for the next Cursor pass.",
     "",
@@ -550,6 +580,7 @@ function llmPrompt(input: StageInputComposition, heuristic: GrandWizardOutput): 
     "- 3-7 concrete tasks total in the primary slice. No more.",
     "- Pick ONE specific 'act' / loop step when the directive says 'make one act feel inevitable'. Don't restate the directive — answer it (e.g. 'point camera at packaged food → scan UPC → render deterministic explanation').",
     "",
+    addressedBlock,
     "Output STRICT JSON, no markdown fences:",
     `{
   "cycleTheme": "string (concrete, code-anchored)",
@@ -592,11 +623,12 @@ async function tryRunLlmGrandWizard(
   ctx: RunContext,
   input: StageInputComposition,
   heuristic: GrandWizardOutput,
+  alreadyAddressed: ReadonlyArray<{ text: string; addressedAt?: string }>,
 ): Promise<GrandWizardOutput | undefined> {
   const command =
     input.config.project.cursor_automation?.command ?? process.env.FOUNDRY_CURSOR_AGENT_CMD ?? "agent";
   const model = input.config.project.cursor_automation?.grand_wizard_model ?? "gpt-5.4-high";
-  const prompt = llmPrompt(input, heuristic);
+  const prompt = llmPrompt(input, heuristic, alreadyAddressed);
   const implicitModel = ["auto", "default"].includes(model.trim().toLowerCase());
   const shellCommand = [
     command,
@@ -676,11 +708,14 @@ function carryForwardIncompleteSpec(
   if (!slice) return previous;
   const remainingTasks = slice.tasks.filter((t) => !(t.id in ledger.tasks));
   const completedTaskIds = slice.tasks.filter((t) => t.id in ledger.tasks).map((t) => t.id);
+  const allDone = slice.tasks.length > 0 && remainingTasks.length === 0;
   const carryNotes = uniqueStringsLocal([
     ...previous.notes,
-    completedTaskIds.length > 0
-      ? `Reused BUILD_SPEC (upstream unchanged); ${completedTaskIds.length} task(s) already done: ${completedTaskIds.join(", ")}`
-      : "Reused BUILD_SPEC (upstream unchanged); no tasks completed yet.",
+    allDone
+      ? `Reused BUILD_SPEC (upstream unchanged); ALL ${completedTaskIds.length} task(s) already done: ${completedTaskIds.join(", ")}. Slice now empty — wizard will regenerate next cycle if new directives arrive.`
+      : completedTaskIds.length > 0
+        ? `Reused BUILD_SPEC (upstream unchanged); ${completedTaskIds.length} task(s) already done: ${completedTaskIds.join(", ")}`
+        : "Reused BUILD_SPEC (upstream unchanged); no tasks completed yet.",
   ]);
   return {
     ...previous,
@@ -688,7 +723,13 @@ function carryForwardIncompleteSpec(
     slices: [
       {
         ...slice,
-        tasks: remainingTasks.length > 0 ? remainingTasks : slice.tasks,
+        // CRITICAL: when remainingTasks is empty, return an empty slice — do NOT
+        // fall back to the full task list. The previous fallback caused closed
+        // tasks to reappear as "open" in the work packet every cycle, which is
+        // exactly the "build targets remain the same, reworded with prefix"
+        // symptom: workPacket then prefixed acceptance with the slice title
+        // (e.g. `[Prove the … loop] Delete …`) and the loop replayed the work.
+        tasks: remainingTasks,
       },
     ],
     notes: carryNotes,
@@ -735,7 +776,51 @@ export const grandWizardStage: Stage<StageInputComposition, GrandWizardOutput> =
 
     if (shouldReuse && existingSpec) {
       const carry = carryForwardIncompleteSpec(existingSpec, ledger);
-      await writeCanonicalBuildSpec(ctx, carry, projectName);
+
+      // Even on the cached/reuse path, increment streaks for parents that
+      // still have no child tasks. Otherwise a forever-undecomposed directive
+      // sits in the spec across many cached cycles without ever triggering
+      // the drop. Apply the same threshold check.
+      const cachedStreak: Record<string, number> = { ...(ledger.undecomposedParentStreak ?? {}) };
+      const cachedDropped: Record<string, BuildSpecLedger["droppedParents"][string]> = {
+        ...(ledger.droppedParents ?? {}),
+      };
+      const cachedNewlyDropped: string[] = [];
+      const survivingParents: ParentDirective[] = [];
+      for (const p of carry.parentDirectives) {
+        const key = droppedParentKey(p.text);
+        if (p.childTaskIds.length === 0) {
+          const next = (cachedStreak[key] ?? 0) + 1;
+          if (next >= STUCK_DROP_THRESHOLD) {
+            cachedDropped[key] = {
+              text: p.text,
+              source: p.source,
+              droppedAt: new Date().toISOString(),
+              afterStreak: next,
+            };
+            delete cachedStreak[key];
+            cachedNewlyDropped.push(p.text);
+            // Drop this parent from the cached spec going forward.
+            continue;
+          }
+          cachedStreak[key] = next;
+        } else {
+          delete cachedStreak[key];
+        }
+        survivingParents.push(p);
+      }
+      const carryWithDrops: GrandWizardOutput = cachedNewlyDropped.length > 0
+        ? {
+            ...carry,
+            parentDirectives: survivingParents,
+            notes: uniqueStringsLocal([
+              ...carry.notes,
+              `Dropped ${cachedNewlyDropped.length} parent directive(s) after ${STUCK_DROP_THRESHOLD} consecutive undecomposed cycle(s) (from cached spec).`,
+            ]),
+          }
+        : carry;
+
+      await writeCanonicalBuildSpec(ctx, carryWithDrops, projectName);
       await writeBuildSpecLedger(ctx.repoPath, {
         ...ledger,
         // Update fingerprint to the new upstream tokens so the next cycle
@@ -743,6 +828,8 @@ export const grandWizardStage: Stage<StageInputComposition, GrandWizardOutput> =
         // coverage scan.
         upstreamFingerprint,
         updatedAt: new Date().toISOString(),
+        undecomposedParentStreak: cachedStreak,
+        droppedParents: cachedDropped,
       });
       ctx.logger(
         fingerprintMatches
@@ -754,14 +841,19 @@ export const grandWizardStage: Stage<StageInputComposition, GrandWizardOutput> =
           directivesMatched: coverageReuse.matched,
           directivesTotal: coverageReuse.total,
           completedTasks: Object.keys(ledger.tasks).length,
-          remainingTasks: carry.slices[0]?.tasks.length ?? 0,
+          remainingTasks: carryWithDrops.slices[0]?.tasks.length ?? 0,
+          newlyDroppedParents: cachedNewlyDropped.length,
         },
       );
-      return carry;
+      return carryWithDrops;
     }
 
     const heuristicDraft = applyConcretenessFilter(buildHeuristicSpec(input, ledger));
-    const llmRefined = await tryRunLlmGrandWizard(ctx, input, heuristicDraft);
+    const addressedForPrompt = Object.values(ledger.addressedParents ?? {}).map((p) => ({
+      text: p.text,
+      addressedAt: p.addressedAt,
+    }));
+    const llmRefined = await tryRunLlmGrandWizard(ctx, input, heuristicDraft, addressedForPrompt);
     let output = llmRefined ?? heuristicDraft;
 
     if (Object.keys(ledger.tasks).length > 0) {
@@ -771,7 +863,10 @@ export const grandWizardStage: Stage<StageInputComposition, GrandWizardOutput> =
       if (droppedIds.length > 0) {
         output = {
           ...output,
-          slices: [{ ...slice, tasks: filteredTasks.length > 0 ? filteredTasks : slice.tasks }],
+          // Always use the ledger-filtered task list. NEVER fall back to the
+          // pre-filter `slice.tasks` — that re-emits closed tasks and is the
+          // root cause of repeating "build targets" across cycles.
+          slices: [{ ...slice, tasks: filteredTasks }],
           notes: uniqueStringsLocal([
             ...output.notes,
             `Dropped ${droppedIds.length} task(s) already complete in BUILD_SPEC_LEDGER: ${droppedIds.join(", ")}`,
@@ -780,12 +875,88 @@ export const grandWizardStage: Stage<StageInputComposition, GrandWizardOutput> =
       }
     }
 
+    // Post-LLM hardening: even with the explicit "DO NOT RE-EMIT" prompt
+    // section, the LLM occasionally returns parent directives whose text
+    // is a slight rewording of an already-addressed parent. Apply the same
+    // fuzzy filter we use heuristically so the work packet does not re-list
+    // the same intent under a new title in cycle N+1.
+    const addressedTexts = Object.values(ledger.addressedParents ?? {}).map((p) => p.text);
+    if (addressedTexts.length > 0 && output.parentDirectives.length > 0) {
+      const survivingParents = output.parentDirectives.filter(
+        (p) => !addressedTexts.some((t) => fuzzyDirectiveMatch(p.text, t)),
+      );
+      const droppedParents = output.parentDirectives.length - survivingParents.length;
+      if (droppedParents > 0) {
+        const survivingIds = new Set(survivingParents.map((p) => p.id));
+        const slice = output.slices[0]!;
+        const survivingTasks = slice.tasks.filter((t) =>
+          t.decomposedFrom.length === 0 ? true : t.decomposedFrom.some((id) => survivingIds.has(id)),
+        );
+        output = {
+          ...output,
+          parentDirectives: survivingParents,
+          slices: [{ ...slice, tasks: survivingTasks }],
+          notes: uniqueStringsLocal([
+            ...output.notes,
+            `Dropped ${droppedParents} parent directive(s) already addressed in prior cycles (fuzzy-text match against BUILD_SPEC_LEDGER.addressedParents).`,
+          ]),
+        };
+      }
+    }
+
+    // Track per-parent undecomposed streak. A parent is "undecomposed" this
+    // cycle when it appears in `parentDirectives` but has zero child tasks
+    // (heuristic + LLM both failed to anchor it). After STUCK_DROP_THRESHOLD
+    // consecutive cycles in that state, move it to droppedParents so the
+    // wizard stops emitting it forever. Operator can revive with --reset-spec.
+    const updatedStreak: Record<string, number> = { ...(ledger.undecomposedParentStreak ?? {}) };
+    const updatedDropped: Record<string, BuildSpecLedger["droppedParents"][string]> = {
+      ...(ledger.droppedParents ?? {}),
+    };
+    const newlyDropped: string[] = [];
+    for (const p of output.parentDirectives) {
+      const key = droppedParentKey(p.text);
+      if (p.childTaskIds.length === 0) {
+        const next = (updatedStreak[key] ?? 0) + 1;
+        if (next >= STUCK_DROP_THRESHOLD) {
+          updatedDropped[key] = {
+            text: p.text,
+            source: p.source,
+            droppedAt: new Date().toISOString(),
+            afterStreak: next,
+          };
+          delete updatedStreak[key];
+          newlyDropped.push(p.text);
+        } else {
+          updatedStreak[key] = next;
+        }
+      } else {
+        // Parent got at least one child task this cycle — reset the streak.
+        delete updatedStreak[key];
+      }
+    }
+    if (newlyDropped.length > 0) {
+      // Surface the drop in the wizard output notes so the operator sees
+      // *why* a previously-listed parent disappeared.
+      const droppedSample = newlyDropped.slice(0, 3).map((t) => `"${t.slice(0, 80)}${t.length > 80 ? "…" : ""}"`).join("; ");
+      const moreSuffix = newlyDropped.length > 3 ? ` (+${newlyDropped.length - 3} more)` : "";
+      output = {
+        ...output,
+        notes: uniqueStringsLocal([
+          ...output.notes,
+          `Dropped ${newlyDropped.length} parent directive(s) after ${STUCK_DROP_THRESHOLD} consecutive undecomposed cycle(s): ${droppedSample}${moreSuffix}. Re-add via project.yaml \`builder.directives\` or rerun with \`--reset-spec\` to clear the dropped list.`,
+        ]),
+      };
+    }
+
     await writeCanonicalBuildSpec(ctx, output, projectName);
     await writeBuildSpecLedger(ctx.repoPath, {
       ...ledger,
       updatedAt: new Date().toISOString(),
       upstreamFingerprint,
       stuckCycles: fingerprintMatches ? ledger.stuckCycles + 1 : 0,
+      undecomposedParentStreak: updatedStreak,
+      droppedParents: updatedDropped,
     });
 
     const slice = output.slices[0]!;
@@ -797,6 +968,8 @@ export const grandWizardStage: Stage<StageInputComposition, GrandWizardOutput> =
       tasksWithoutFiles: output.diagnostics.tasksWithoutFiles.length,
       source: output.source,
       upstreamFingerprint,
+      newlyDroppedParents: newlyDropped.length,
+      totalDroppedParents: Object.keys(updatedDropped).length,
     });
 
     return output;

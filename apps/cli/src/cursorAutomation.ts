@@ -234,6 +234,8 @@ export type PipelineIndependentQa = {
   score?: number;
   testsRan?: boolean;
   testsPassed?: boolean;
+  /** Truncated combined stdout/stderr from the test runner — surfaced in iteration focus so Cursor sees actual failure traces. */
+  testSummary?: string;
   checks?: Array<{ name: string; passed?: boolean; details: string }>;
 };
 
@@ -431,6 +433,23 @@ export async function readStageJson<T = unknown>(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * True iff the named stage executed in this manifest (status `ok` / `warn`),
+ * vs being skipped by a gate (e.g. investor_panel deferred behind QA). Caller
+ * uses this to distinguish "investor_panel ran and produced grades" from
+ * "investor_panel was deferred" without re-reading the manifest itself.
+ */
+export function manifestStageRan(manifest: RunManifest | undefined, stageName: string): boolean {
+  if (!manifest) return false;
+  const stage = manifest.stages.find((s) => s.stage === stageName);
+  if (!stage) return false;
+  // "Ran" = produced an output (not skipped by a gate). `passed` is the
+  // expected success state; we deliberately exclude `failed` because failed
+  // stages don't produce a usable output.json (the loop tracks "investor
+  // panel actually generated grades", not "investor panel was attempted").
+  return stage.status === "passed";
 }
 
 /** Console summary: pipeline `independent_qa` + `release_agent` (single QA/ship picture). */
@@ -994,6 +1013,23 @@ export function formatIterationFocusMarkdown(params: {
     for (const b of params.pipelineQa.blockers) lines.push(`- ${b}`);
     lines.push("");
   }
+  // When tests failed, paste the *tail* of the test runner output (where most
+  // assertion text lives) so Cursor has the actual stack traces to grep/fix
+  // without re-running the suite. Tail (not head) because compilers/runners
+  // tend to emit progress lines first and the actual error context last.
+  if (
+    params.pipelineQa?.testsRan &&
+    params.pipelineQa?.testsPassed === false &&
+    params.pipelineQa?.testSummary?.trim()
+  ) {
+    const summary = params.pipelineQa.testSummary;
+    const TAIL_BYTES = 2400;
+    const tail = summary.length > TAIL_BYTES ? summary.slice(summary.length - TAIL_BYTES) : summary;
+    lines.push("### Failing-test output (tail of test runner stdout/stderr)", "");
+    lines.push("```");
+    lines.push(tail);
+    lines.push("```", "");
+  }
   if (params.pipelineQa?.warnings?.length) {
     lines.push("### Warnings", "");
     for (const w of params.pipelineQa.warnings) lines.push(`- ${w}`);
@@ -1065,6 +1101,8 @@ const GENERATED_FOUNDRY_PREFIXES = [
   ".foundry/approvals/",
   /** Agent/typo variant of `approvals/` — never treat as product code. */
   ".foundry/approval/",
+  /** Pre-Cursor snapshots of BUILD_SPEC / BUILD_SPEC_LEDGER (loop-internal). */
+  ".foundry/.pre-cursor-snapshots/",
   /**
    * Maestro `--debug-output` artifacts (logs, commands JSON, screenshots). `--flatten-debug-output`
    * can emit odd path segments; git may list entries that are not on disk. Never auto-commit as product code.
@@ -1522,9 +1560,9 @@ function buildBuilderPrompt(
     "",
     "Read these files first:",
     `- ${join(repoPath, ".foundry", "project.yaml")}`,
-    `- ${join(repoPath, ".foundry", "BUILD_SPEC.md")} (canonical slice spec — read before CURSOR_BRIEF when present)`,
-    `- ${join(repoPath, ".foundry", "BUILD_SPEC.json")} (machine-readable spec with task IDs + files[])`,
-    `- ${join(repoPath, ".foundry", "BUILD_SPEC_LEDGER.json")} (already-completed task IDs — do NOT redo unless QA breaks)`,
+    `- ${join(repoPath, ".foundry", "BUILD_SPEC.md")} (canonical slice spec — read ONLY; never write/edit this file)`,
+    `- ${join(repoPath, ".foundry", "BUILD_SPEC.json")} (machine-readable spec — read ONLY; never write/edit this file)`,
+    `- ${join(repoPath, ".foundry", "BUILD_SPEC_LEDGER.json")} (already-completed task IDs — READ ONLY; do NOT modify, do NOT delete, do NOT 'clean up'. Foundry restores it from snapshot after every pass if you touch it, but you waste a cycle.)`,
     `- ${join(repoPath, ".foundry", "WORK_PACKET.md")} (frozen scope for this cycle; highest priority)`,
     ...(iterationFocusPath
       ? [
@@ -1883,6 +1921,11 @@ export async function preflightCursorCommand(command: string, cwd: string): Prom
     cwd,
   );
   const combined = `${authResult.stdout}\n${authResult.stderr}`;
+  // Strip ANSI escape sequences from the output before pattern matching.
+  // Some older cursor-agent versions emit clear-line/cursor-move codes around
+  // the status banner (e.g. "\x1b[2K\x1b[G Starting login process...") which
+  // can break negative regex checks even when the binary is authenticated.
+  const stripped = combined.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").trim();
   if (/Cannot find module '@anysphere\/file-service/i.test(combined)) {
     return {
       ok: false,
@@ -1892,16 +1935,48 @@ export async function preflightCursorCommand(command: string, cwd: string): Prom
         `Reinstall/update the Cursor desktop app (which bundles the CLI), or point 'cursor_automation.command' / FOUNDRY_CURSOR_AGENT_CMD to a working \`agent\` binary.`,
     };
   }
-  if (
-    authResult.exitCode !== 0 ||
-    /authentication required|not logged in|login required|sign in/i.test(combined)
-  ) {
-    return {
-      ok: false,
-      detail:
-        `Cursor command '${command}' is available, but not authenticated. ` +
-        `Run '${command} login' in your shell first, or set CURSOR_API_KEY in the environment used by Foundry.`,
-    };
+
+  // POSITIVE signal takes priority. If the binary clearly says "✓ Logged in",
+  // "Logged in as", or "authenticated as" and exited cleanly, trust it — even
+  // if other parts of the output mention "login" or "Sign in" as a banner.
+  const positiveAuth =
+    authResult.exitCode === 0 &&
+    /(?:^|\s)(?:✓\s*)?Logged in(?: as |[!.\s])/i.test(stripped);
+  if (positiveAuth) {
+    return { ok: true, detail: `Cursor command '${command}' is available and authenticated.` };
+  }
+
+  // Otherwise: explicit unauthenticated phrases or non-zero exit ⇒ not authed.
+  const explicitlyUnauthed =
+    /authentication required|not logged in|login required|please (?:log ?in|sign ?in)|run [`'"]?cursor-agent login/i.test(
+      stripped,
+    );
+  if (authResult.exitCode !== 0 || explicitlyUnauthed) {
+    const lines: string[] = [
+      `Cursor command '${command}' is available, but not authenticated.`,
+      `Run '${command} login' in your shell first, or set CURSOR_API_KEY in the environment used by Foundry.`,
+    ];
+    // Most common failure mode: FOUNDRY_CURSOR_AGENT_CMD env var pins Foundry
+    // to a stale `cursor-agent` versioned path while the user ran `cursor-agent
+    // login` against a different (PATH-resolved) version. Surface this hint
+    // up front so they don't waste time re-running `login`.
+    const envCmd = process.env.FOUNDRY_CURSOR_AGENT_CMD?.trim();
+    if (envCmd && envCmd === command && /\/cursor-agent\/versions\//.test(envCmd)) {
+      lines.push("");
+      lines.push("HINT: Foundry is using FOUNDRY_CURSOR_AGENT_CMD pinned to a versioned cursor-agent binary:");
+      lines.push(`  ${envCmd}`);
+      lines.push("If you logged in via `cursor-agent` (PATH-resolved), it likely authenticated a DIFFERENT version.");
+      lines.push("Fix by either:");
+      lines.push("  (a) `unset FOUNDRY_CURSOR_AGENT_CMD` so Foundry uses your PATH cursor-agent (recommended), OR");
+      lines.push("  (b) explicitly authenticate the pinned binary: `\"$FOUNDRY_CURSOR_AGENT_CMD\" login`");
+    }
+    // Short raw-output trace helps debug binaries that print unexpected text.
+    const trace = stripped.slice(0, 240).replace(/\s+/g, " ");
+    if (trace.length > 0) {
+      lines.push("");
+      lines.push(`(raw status output: "${trace}${stripped.length > 240 ? "…" : ""}", exit=${authResult.exitCode})`);
+    }
+    return { ok: false, detail: lines.join("\n") };
   }
 
   return { ok: true, detail: `Cursor command '${command}' is available and authenticated.` };
@@ -1946,13 +2021,35 @@ export async function preflightCursorModels(
     };
   }
 
-  const missing = toVerify.filter((model) => !combined.includes(model));
+  // Parse the model list into the exact set of identifiers cursor-agent
+  // accepts. Each line is `<model-id> - <Display Name>`; everything before
+  // the first " - " is the id. Substring matching (the prior behavior) was
+  // too loose — e.g. a configured `claude-opus-4-7-high` could "match" a
+  // listed `claude-opus-4-7-high-fast` and still get rejected at runtime.
+  const validIds = new Set<string>();
+  for (const line of combined.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || /^Available models/i.test(trimmed)) continue;
+    const idMatch = trimmed.match(/^([A-Za-z0-9._-]+)\b/);
+    if (idMatch) validIds.add(idMatch[1]);
+  }
+
+  const missing = toVerify.filter((model) => !validIds.has(model));
   if (missing.length > 0) {
+    // Suggest the closest valid alternatives (same prefix, then any with the
+    // model's "family" stem). Helps the operator pick the right rename fast.
+    const suggestions = missing.map((m) => {
+      const stem = m.replace(/-(?:low|medium|high|xhigh|max|fast|thinking)(?:-|$).*$/g, "");
+      const candidates = [...validIds]
+        .filter((v) => v.startsWith(stem) || v.includes(stem.split("-")[0] ?? stem))
+        .slice(0, 6);
+      return `${m}${candidates.length > 0 ? ` (try: ${candidates.join(", ")})` : ""}`;
+    });
     return {
       ok: false,
       detail:
-        `Configured Cursor model(s) not available: ${missing.join(", ")}. ` +
-        `Run '${command} models' and update '.foundry/project.yaml' cursor_automation settings.`,
+        `Configured Cursor model(s) not in '${command} models' list:\n  - ${suggestions.join("\n  - ")}\n` +
+        `Edit .foundry/project.yaml \`cursor_automation\` settings (or set builder_model: "auto" to use Cursor's default).`,
     };
   }
 

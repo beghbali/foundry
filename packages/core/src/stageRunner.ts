@@ -57,6 +57,17 @@ export interface RunPipelineOptions {
    * When omitted, the full pipeline YAML stage list is used.
    */
   stagesOverride?: string[];
+  /**
+   * Force `investor_panel` to run even if QA is not currently `ship`. Used by the
+   * outer loop to capture an end-of-cycle pitch when QA was previously ship but
+   * a later inner pass regressed it — without this, autonomous runs can complete
+   * many cycles without ever producing investor grades.
+   *
+   * Honors all *other* gates (builder, convergence, release_readiness,
+   * directives_unaddressed) so investors still never re-grade unaddressed
+   * directives.
+   */
+  forceInvestorPanelBypassQaGate?: boolean;
 }
 
 function defaultLogger(): Logger {
@@ -352,6 +363,7 @@ async function shouldSkipInvestorPanelStage(
         autonomous_investor_convergence?: unknown;
       }
     | undefined,
+  options?: { bypassQaGate?: boolean },
 ): Promise<InvestorPanelGate> {
   const relaxInvestorGates = parseAutonomousInvestorConvergence(projectFoundry).relaxedInvestorGates;
   const builderRaw = priorOutputs["builder"];
@@ -379,21 +391,23 @@ async function shouldSkipInvestorPanelStage(
   }
   // `builder` omitted (e.g. post-Cursor pipeline slice: QA → release → growth → investor) — gate on QA only.
 
-  if (!qa.success || qa.data.recommendation !== "ship") {
-    return {
-      skip: true,
-      cause: "qa",
-      reason: "Pipeline QA is not yet ship-certified. Investor pitch deferred until QA passes.",
-    };
-  }
+  if (!options?.bypassQaGate) {
+    if (!qa.success || qa.data.recommendation !== "ship") {
+      return {
+        skip: true,
+        cause: "qa",
+        reason: "Pipeline QA is not yet ship-certified. Investor pitch deferred until QA passes.",
+      };
+    }
 
-  const blockers = qa.data.blockers ?? [];
-  if (blockers.length > 0) {
-    return {
-      skip: true,
-      cause: "qa",
-      reason: `Pipeline QA still lists ${blockers.length} blocker(s); investor_panel deferred until smoke/tests are clean.`,
-    };
+    const blockers = qa.data.blockers ?? [];
+    if (blockers.length > 0) {
+      return {
+        skip: true,
+        cause: "qa",
+        reason: `Pipeline QA still lists ${blockers.length} blocker(s); investor_panel deferred until smoke/tests are clean.`,
+      };
+    }
   }
 
   // DIRECTIVES-ADDRESSED GATE — investors must never re-grade the same critique
@@ -594,7 +608,12 @@ export async function runPipeline(opts: RunPipelineOptions): Promise<RunManifest
 
     try {
       if (stageName === "investor_panel") {
-        const investorGate = await shouldSkipInvestorPanelStage(repoPath, priorOutputs, config.project.foundry);
+        const investorGate = await shouldSkipInvestorPanelStage(
+          repoPath,
+          priorOutputs,
+          config.project.foundry,
+          { bypassQaGate: Boolean(opts.forceInvestorPanelBypassQaGate) },
+        );
         if (investorGate.skip) {
           const finishedAt = new Date().toISOString();
           manifest.stages[i] = {

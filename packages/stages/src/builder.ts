@@ -13,6 +13,8 @@ import {
 import {
   GrandWizardOutputSchema,
   primaryBuildSpecSlice,
+  readBuildSpecLedger,
+  type BuildSpecLedger,
   type GrandWizardOutput,
 } from "@foundry/core/buildSpec";
 import {
@@ -988,6 +990,7 @@ function generateCursorBriefFromBuildSpec(
   feedback: z.infer<typeof FeedbackHint> | undefined,
   investorRefinement?: InvestorRefinementContext,
   previousChecklist?: BriefChecklistState,
+  ledger?: BuildSpecLedger,
 ): string {
   const checkbox = (section: BriefChecklistSection, text: string, defaultChecked = false): string => {
     const cleanText = stripBriefIdComment(text);
@@ -995,6 +998,13 @@ function generateCursorBriefFromBuildSpec(
     const checked = defaultChecked || (previousChecklist?.checkedIds.has(id) ?? false);
     return annotateBriefLineWithId(`- [${checked ? "x" : " "}] ${cleanText}`, id);
   };
+
+  // Tasks marked complete in BUILD_SPEC_LEDGER render as `[x]` regardless of
+  // brief checkbox state. The previous brief markdown's checkbox state never
+  // survives the next wizard regen, so the ledger is the only durable source
+  // of truth for "this task is done".
+  const ledgerClosed = (taskId: string): boolean =>
+    Boolean(ledger?.tasks && taskId in ledger.tasks);
 
   const primary = primaryBuildSpecSlice(buildSpec);
   const lines: string[] = [
@@ -1040,10 +1050,16 @@ function generateCursorBriefFromBuildSpec(
     lines.push("### Concrete tasks (decomposed)", "");
     for (const task of primary.tasks) {
       const filesNote = task.files.length > 0 ? ` — files: ${task.files.map((f) => `\`${f}\``).join(", ")}` : "";
-      lines.push(checkbox("must", `${task.task}${filesNote}`));
+      // Force `[x]` when the ledger has this task ID — survives wizard regens
+      // and prevents the work packet from re-listing already-closed tasks.
+      const defaultChecked = ledgerClosed(task.id);
+      lines.push(checkbox("must", `${task.task}${filesNote}`, defaultChecked));
       lines.push(`  - verify: ${task.verification}`);
       if (task.decomposedFrom.length > 0) {
         lines.push(`  - addresses: ${task.decomposedFrom.join(", ")}`);
+      }
+      if (defaultChecked) {
+        lines.push(`  - ✓ closed in BUILD_SPEC_LEDGER (do not redo)`);
       }
     }
     lines.push("");
@@ -1667,6 +1683,7 @@ export const builderStage: Stage<StageInputComposition, BuilderOutput> = {
     const planMd = generateImplementationPlan(plan, allFileActions, projectName, gitStatus.branch, gitStatus.headSha);
     await writeStageMarkdown(ctx, "builder", "IMPLEMENTATION_PLAN.md", planMd);
 
+    const buildSpecLedger = await readBuildSpecLedger(repoPath);
     const cursorBrief = gwParsed.success
       ? generateCursorBriefFromBuildSpec(
           projectName,
@@ -1675,6 +1692,7 @@ export const builderStage: Stage<StageInputComposition, BuilderOutput> = {
           feedback,
           input.investorRefinement,
           previousChecklist,
+          buildSpecLedger,
         )
       : generateCursorBrief(
           projectName,

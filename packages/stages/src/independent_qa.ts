@@ -354,6 +354,55 @@ function truncate(s: string, max: number): string {
   return `${s.slice(0, max)}\n… [truncated]`;
 }
 
+/**
+ * Best-effort parser that pulls concrete failing test signal out of a test
+ * runner's combined stdout/stderr. Recognizes Jest (`FAIL path/to/x.test.ts`,
+ * `at Object.<anonymous> (path/to/file.ts:42:7)`), Vitest (`❯ path/to/x.test.ts`,
+ * `FAIL  path/to/x.test.ts > Suite > Test`), and Mocha (`AssertionError`).
+ *
+ * Returns the unique set of relative test file paths plus the first error
+ * message line — enough context for Cursor to grep/open and fix without
+ * needing to re-run the suite to discover the failure surface.
+ */
+function extractFailingTestDetails(summary: string): {
+  failingFiles: string[];
+  firstErrorLine: string;
+} {
+  const lines = summary.split(/\r?\n/);
+  const filesSet = new Set<string>();
+  // Jest/Vitest: `FAIL <path>` or `FAIL  <path> > Suite > Test`
+  for (const line of lines) {
+    const failMatch = line.match(/^\s*(?:FAIL|❯|✖)\s+([^\s>]+\.(?:t|j)sx?|[^\s>]+\.test\.[a-z]+)\b/);
+    if (failMatch) {
+      filesSet.add(failMatch[1]);
+      continue;
+    }
+    // Vitest stack trace: `❯ packages/foo/tests/bar.test.ts:23`
+    const stackMatch = line.match(/[\s(]((?:[a-zA-Z0-9._/-]+\/)?[a-zA-Z0-9._-]+\.(?:t|j)sx?):(\d+)/);
+    if (stackMatch && /(test|spec|__tests__|\.test\.)/i.test(stackMatch[1])) {
+      filesSet.add(stackMatch[1]);
+    }
+  }
+  let firstErrorLine = "";
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (/^(Error|AssertionError|TypeError|ReferenceError|SyntaxError):/.test(trimmed)) {
+      firstErrorLine = trimmed.slice(0, 200);
+      break;
+    }
+    if (/expected\s+.+\s+to\s+(?:be|equal|match)/i.test(trimmed)) {
+      firstErrorLine = trimmed.slice(0, 200);
+      break;
+    }
+    if (/^✖\s/.test(trimmed) || /^●\s/.test(trimmed)) {
+      firstErrorLine = trimmed.slice(0, 200);
+      break;
+    }
+  }
+  return { failingFiles: [...filesSet], firstErrorLine };
+}
+
 function estimateLintErrors(stdout: string, stderr: string): number {
   const blob = `${stdout}\n${stderr}`;
   if (!blob.trim()) return 0;
@@ -554,7 +603,24 @@ export const independentQaStage: Stage<StageInputComposition, IndependentQaOutpu
         passed: testsPassed,
         details: testsPassed ? `Exit 0 (${cmd})` : `Exit ${r.exitCode} (${cmd}). See testSummary.`,
       });
-      if (!testsPassed) blockers.push("Test suite failed after builder changes.");
+      if (!testsPassed) {
+        // Expand the blocker with concrete failing test paths + the first
+        // assertion/error line. Without this, the work packet only carries
+        // the generic "Test suite failed" string and Cursor has no anchor
+        // (file path, test name) to actually fix anything — the loop spins
+        // for cycles repeating the same vague target.
+        const failingDetails = extractFailingTestDetails(testSummary);
+        if (failingDetails.failingFiles.length > 0 || failingDetails.firstErrorLine) {
+          const fileList = failingDetails.failingFiles.slice(0, 4).join(", ");
+          const moreFiles = failingDetails.failingFiles.length > 4 ? ` (+${failingDetails.failingFiles.length - 4} more)` : "";
+          const errLine = failingDetails.firstErrorLine ? ` First error: ${failingDetails.firstErrorLine}` : "";
+          blockers.push(
+            `Test suite failed after builder changes.${fileList ? ` Failing files: ${fileList}${moreFiles}.` : ""}${errLine}`,
+          );
+        } else {
+          blockers.push("Test suite failed after builder changes.");
+        }
+      }
     } else {
       checks.push({
         name: "test_suite",
