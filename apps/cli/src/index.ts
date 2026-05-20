@@ -3867,6 +3867,24 @@ program
           });
           activePacketCounts = packetBriefCounts(workPacket);
 
+          // Stop after a green QA pass when there is no builder work left — extra
+          // inner passes often regress tests (e.g. foundry-root-artifacts) with no
+          // packet items to close.
+          if (
+            loopProfile === "investor" &&
+            activePacketCounts.total === 0 &&
+            implementNowFeedbackCount === 0 &&
+            pipelineQa?.recommendation === "ship" &&
+            (pipelineQa?.blockers?.length ?? 0) === 0
+          ) {
+            console.log(
+              chalk.cyan(
+                "\n  QA ship with zero open packet items — stopping inner loop to avoid no-op Cursor passes.",
+              ),
+            );
+            break;
+          }
+
           const postQaBlockers = pipelineQa?.blockers?.length ?? 0;
           await logPipelineSnapshot(repoPath, manifest, "After pipeline (post-Cursor)", briefCounts.total, {
             pipelineQa,
