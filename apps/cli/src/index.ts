@@ -3143,6 +3143,7 @@ program
       // No retrying inside the loop will help — the operator must edit
       // project.yaml or set builder_model: "auto" before another run.
       let modelLookupRejected = false;
+      let cursorUsageLimitHit = false;
       // Tracks whether *any* inner pass in this outer cycle reached QA-ship.
       // We use this to force `investor_panel` at end-of-cycle (with QA gate
       // bypassed) when a later inner pass regressed QA — otherwise convergence
@@ -3756,6 +3757,28 @@ program
               // accepts. Exit the OUTER loop, not just the inner.
               modelLookupRejected = true;
             }
+            // Cursor Ultra / plan quota: Opus (or other premium) monthly cap.
+            // Retrying with the same model will fail until the billing cycle
+            // resets. Point at `auto` so the operator can keep the loop moving.
+            if (/hit your usage limit|usage limits will reset/i.test(agentBlob)) {
+              const limitModelMatch = agentBlob.match(/usage limit for (\w+)/i);
+              const limitModel = limitModelMatch?.[1] ?? "premium";
+              cursorUsageLimitHit = true;
+              console.log(
+                chalk.red.bold(
+                  `\n  CURSOR USAGE LIMIT: ${limitModel} quota exhausted for this billing cycle.`,
+                ),
+              );
+              console.log(
+                chalk.yellow(
+                  "  If API / on-demand usage is exhausted but Auto+Composer still has headroom (see Cursor Usage),\n" +
+                    "  set `.foundry/project.yaml` → `cursor_automation.builder_model: \"auto\"` (and fast/economy: \"auto\").\n" +
+                    "  Foundry omits `--model` so cursor-agent bills against Auto+Composer instead of named opus/gpt-5.4-* models.\n" +
+                    "  Or one run: FOUNDRY_BUILDER_MODEL=auto FOUNDRY_BUILDER_FAST_MODEL=auto foundry loop ...\n" +
+                    "  Avoid opus-* and gpt-5.4-* ids until the billing cycle resets (~check Usage page).",
+                ),
+              );
+            }
             // Cross-cycle transport-stall watchdog: if Cursor died because of
             // network / reconnect-only output, the next outer cycle is unlikely
             // to fare better in the short term and just burns credits. We tag
@@ -4000,6 +4023,14 @@ program
       // cycling can recover — the operator must edit `cursor_automation.builder_model`
       // in project.yaml (or set it to "auto"). Exit immediately so we don't
       // burn another full pipeline run that will fail the same way.
+      if (cursorUsageLimitHit) {
+        console.log(
+          chalk.red.bold(
+            "\n  Aborting foundry loop: Cursor usage limit hit (see guidance above).",
+          ),
+        );
+        break;
+      }
       if (modelLookupRejected) {
         console.log(
           chalk.red.bold(
