@@ -373,7 +373,24 @@ export async function createWorkPacket(input: WorkPacketSourceInput): Promise<Wo
   }
 
   candidates.sort((a, b) => a.priority - b.priority || a.text.localeCompare(b.text));
-  const items = choosePacketItems(candidates, maxItems);
+  let items = choosePacketItems(candidates, maxItems);
+  const blockerKeys = new Set(input.qaCodeBlockers.map((b) => normalizeKey(b)));
+  try {
+    const priorRaw = await readFile(packetPaths(input.repoPath).json, "utf8");
+    const prior = JSON.parse(priorRaw) as WorkPacket;
+    const priorClosed = new Map(
+      prior.items.filter((i) => i.status === "closed").map((i) => [i.key, i] as const),
+    );
+    items = items.map((item) => {
+      if (blockerKeys.has(item.key)) return item;
+      if (priorClosed.has(item.key)) {
+        return { ...item, status: "closed" as const, reopenCount: priorClosed.get(item.key)!.reopenCount };
+      }
+      return item;
+    });
+  } catch {
+    /* first packet */
+  }
   const selectedKeys = new Set(items.map((item) => item.key));
   const deferredCounts = emptyDeferredCounts();
   for (const candidate of candidates) {
@@ -416,6 +433,8 @@ export async function refreshWorkPacket(
       nextStatus = "manual_only";
     } else if (item.source === "brief") {
       nextStatus = checkedKeys.has(item.key) ? "closed" : "open";
+    } else if (item.source === "qa" || item.source === "builder") {
+      nextStatus = openKeys.has(item.key) ? "open" : "closed";
     } else if (signals.codeChanged && !openKeys.has(item.key)) {
       nextStatus = "closed";
     }

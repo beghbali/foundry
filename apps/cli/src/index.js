@@ -7,7 +7,10 @@ import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { loadFoundryConfig, listRegisteredStageNames, runPipeline } from "@foundry/core";
-import { chooseBuilderModel, qaNeedsPremiumCursorBuilder, qaMaestroSmokeOnlyShipGreen, resolveEffectiveInnerLoopMax, countCriticalBriefItems, formatIterationFocusMarkdown, getPipelineSnapshotForConsole, logShipGateConsole, separateManualAndCodeItems, summarizeCoreQaPlanForConsole, summarizeCursorBuilderReportMd, truncateForDisplay, preflightCursorCommand, preflightCursorModels, readBuilderRemainingBlockers, readStageJson, resolveCursorAutomationSettings, runBuilderAgent, sampleUncheckedBriefLines, shouldRunCursorAutomation, } from "./cursorAutomation.js";
+import { readLatestArtifact } from "@foundry/core/artifacts";
+import { computeInvestorTargetFields, hasAutonomousInvestorConvergenceKey, resolveAutonomousInvestorConvergenceForRun, } from "@foundry/core/investorGrades";
+import { primaryBuildSpecSlice, readBuildSpecFromRepo, readBuildSpecLedger, taskCompletedByEdits, writeBuildSpecLedger, } from "@foundry/core/buildSpec";
+import { chooseBuilderModel, qaNeedsPremiumCursorBuilder, qaMaestroSmokeOnlyShipGreen, resolveEffectiveInnerLoopMax, countCriticalBriefItems, formatIterationFocusMarkdown, getPipelineSnapshotForConsole, logShipGateConsole, separateManualAndCodeItems, summarizeCoreQaPlanForConsole, summarizeCursorBuilderReportMd, truncateForDisplay, preflightCursorCommand, preflightCursorModels, manifestStageRan, readBuilderRemainingBlockers, readStageJson, resolveCursorAutomationSettings, isLikelyCursorTransportFailure, runBuilderAgent, sampleUncheckedBriefLines, shouldRunCursorAutomation, } from "./cursorAutomation.js";
 import { backfillExpoBuildViews, maybeRunApprovedEasBuild, maybeSubmitLatestToTestFlight, promoteApprovedBranch, resolveEasBuildSettings, } from "./releaseAutomation.js";
 import { createWorkPacket, filterBriefItemsForStabilizePhase, readCheckedBriefItems, readOpenBriefItems, refreshWorkPacket, sampleOpenPacketItems, workPacketClosedCount, workPacketOpenCount, workPacketReopenCount, workPacketSummaryLine, } from "./workPacket.js";
 function logEasQueuedToConsole(easBuild, blankLineBeforeTitle) {
@@ -38,6 +41,40 @@ function extractBuilderBlockers(builder) {
         return [];
     const blockerPattern = /(blocked|failed|could not|no resolvable|no files changed|review commands|cannot|error)/i;
     return builder.notes.filter((note) => blockerPattern.test(note)).slice(0, 6);
+}
+function investorPanelMetTarget(panel, foundry, loopProfile) {
+    if (!panel?.investors?.length)
+        return false;
+    const grades = panel.investors
+        .map((i) => (typeof i.grade === "string" ? i.grade.trim() : ""))
+        .filter((g) => g.length > 0);
+    if (grades.length !== 3)
+        return false;
+    const auto = resolveAutonomousInvestorConvergenceForRun(foundry, {
+        investorLoopDefaults: loopProfile === "investor",
+    });
+    return computeInvestorTargetFields(grades, auto).meetsInvestorTarget;
+}
+/** Latest convergence_contract on disk (post-Cursor pipeline slices omit this stage from manifest). */
+async function readContractConvergenceGate(repoPath) {
+    const raw = await readLatestArtifact(repoPath, "convergence_contract/output.json");
+    if (!raw) {
+        return { ok: false, detail: "no convergence_contract artifact (run a full pipeline at least once)" };
+    }
+    try {
+        const j = JSON.parse(raw);
+        const open = (j.openObjections ?? []).filter((o) => o.status === "open" || o.status === "regressed").length;
+        if (j.isConverged !== true) {
+            return { ok: false, detail: "isConverged is not true" };
+        }
+        if (open > 0) {
+            return { ok: false, detail: `${open} open or regressed investor objection(s) on contract` };
+        }
+        return { ok: true, detail: "converged with no blocking objections" };
+    }
+    catch {
+        return { ok: false, detail: "could not parse convergence_contract output.json" };
+    }
 }
 function isNoOpPacketText(text) {
     const t = text.trim().toLowerCase();
@@ -88,17 +125,24 @@ function safeLen(arr) {
 function blockedChecklistCount(release) {
     return safeLen((release?.releaseChecklist ?? []).filter((i) => i.status === "blocked"));
 }
-function postCursorPipelineStages(profile) {
+function postCursorPipelineStages(profile, includeInvestor) {
     if (profile === "investor") {
-        return ["independent_qa", "release_agent", "growth_operator", "investor_panel"];
+        const base = ["independent_qa", "release_agent", "growth_operator"];
+        return includeInvestor ? [...base, "investor_panel"] : base;
     }
     return ["independent_qa", "release_agent"];
 }
-/** Stabilize loops never run growth/investor after Cursor — only QA + release gates. */
-function postCursorStagesForLoop(profile, stabilize) {
+/**
+ * Stabilize loops never run growth/investor after Cursor.
+ * For investor profile, we run investor_panel only ONCE per outer cycle (the final
+ * inner pass) instead of after every inner Cursor pass — investors should grade
+ * the cycle's full delta, not partial in-progress edits. This cuts ~2-3 min/cycle
+ * of LLM panel calls scoring the same product across inner passes.
+ */
+function postCursorStagesForLoop(profile, stabilize, isLastInnerPass) {
     if (stabilize)
         return ["independent_qa", "release_agent"];
-    return postCursorPipelineStages(profile);
+    return postCursorPipelineStages(profile, isLastInnerPass);
 }
 /** Ship-quality release candidate: QA ship + release_agent green + no blocked release checklist rows. */
 function releaseCandidateVerdict(qa, release) {
@@ -144,9 +188,17 @@ function logInvestorScoreLine(investor) {
         return;
     }
     const grades = investor.investors.map((i) => `${i.displayName ?? "investor"}=${i.grade ?? "?"}`).join(" · ");
-    const bar = investor.meetsMinimumGradeA ? chalk.green("meets A- bar: YES") : chalk.yellow("meets A- bar: NO");
+    const bar = investor.meetsMinimumGradeA ? chalk.green("all A- or better: YES") : chalk.yellow("all A- or better: NO");
+    const tgt = investor.meetsInvestorTarget !== undefined
+        ? investor.meetsInvestorTarget
+            ? chalk.green("target met: YES")
+            : chalk.yellow("target met: NO")
+        : null;
+    const avg = typeof investor.averageInvestorRank === "number"
+        ? ` · mean_rank=${investor.averageInvestorRank.toFixed(2)}`
+        : "";
     console.log(chalk.bold(`\n  INVESTOR_SCORES: ${grades}`));
-    console.log(chalk.gray(`  worst=${investor.worstGrade ?? "?"} · ${bar}`));
+    console.log(chalk.gray(`  worst=${investor.worstGrade ?? "?"} · ${bar}${avg}${tgt ? ` · ${tgt}` : ""}`));
     const d = investor.combinedRefinementDirectives?.length ?? 0;
     if (d > 0) {
         console.log(chalk.gray(`  refinement directives queued: ${d} (fed into next product stages when refinement runs)`));
@@ -301,15 +353,16 @@ async function printFoundryStatusDashboard(repoPath) {
     });
     console.log("");
     console.log(chalk.bold.white("  INVESTOR (same run, if stage ran)"));
-    if (!investor?.investors?.length && !(investor?.combinedRefinementDirectives?.length ?? 0)) {
+    if (!investor || (!investor.investors?.length && !(investor.combinedRefinementDirectives?.length ?? 0))) {
         console.log(chalk.gray("    (no investor_panel output in this run — use `foundry loop --profile investor`)\n"));
     }
     else {
-        console.log(chalk.gray(`    meets_A-=${investor.meetsMinimumGradeA ? "yes" : "no"} · worst=${investor.worstGrade ?? "?"} · directives=${investor.combinedRefinementDirectives?.length ?? 0}`));
-        (investor.investors ?? []).slice(0, 4).forEach((inv) => {
+        const inv0 = investor;
+        console.log(chalk.gray(`    meets_A-=${inv0.meetsMinimumGradeA ? "yes" : "no"} · worst=${inv0.worstGrade ?? "?"} · directives=${inv0.combinedRefinementDirectives?.length ?? 0}`));
+        (inv0.investors ?? []).slice(0, 4).forEach((inv) => {
             console.log(chalk.gray(`      ${inv.displayName ?? "?"}: ${inv.grade ?? "?"}`));
         });
-        const dirs = investor.combinedRefinementDirectives ?? [];
+        const dirs = inv0.combinedRefinementDirectives ?? [];
         dirs.slice(0, 5).forEach((d, i) => {
             console.log(chalk.cyan(`      D${i + 1}. ${truncateForDisplay(d, 110)}`));
         });
@@ -328,11 +381,283 @@ async function printFoundryStatusDashboard(repoPath) {
     console.log(chalk.gray("    foundry run --repo . --quiet     ← pipeline without per-stage log spam"));
     console.log(chalk.bold.dim(`${bar}\n`));
 }
+/**
+ * After a Cursor pass commits product code, update BUILD_SPEC_LEDGER:
+ *   - mark tasks whose `files[]` are entirely covered by the diff as complete
+ *   - accumulate LOC totals for those tasks
+ * Logs a one-liner summary so the operator sees which directives actually closed.
+ */
+/**
+ * Snapshot the BUILD_SPEC_LEDGER and BUILD_SPEC before each Cursor pass so
+ * that if Cursor edits the generated files (despite the prompt telling it
+ * not to), we can detect and restore. Returns the absolute path of the
+ * snapshot file (consumed by `updateBuildSpecLedgerFromPass`).
+ *
+ * Without this, the ledger's `tasks` map gets wiped between inner passes
+ * and the same tasks appear as "newly closed" cycle after cycle.
+ */
+/**
+ * Resolve the canonical snapshot directory. We deliberately put this under
+ * `.foundry/automation/` (already covered by GENERATED_FOUNDRY_PREFIXES and
+ * the .gitignore block) so Cursor's autocommit never picks the snapshot
+ * files up as "changed product files". Prior versions used
+ * `.foundry/.pre-cursor-snapshots/`; if that path exists on disk we
+ * one-time-untrack it from git so old commits don't keep re-staging.
+ */
+function ledgerSnapshotDir(repoPath) {
+    return join(repoPath, ".foundry", "automation", ".pre-cursor-snapshots");
+}
+async function untrackLegacySnapshotDirIfPresent(repoPath) {
+    const fs = await import("node:fs/promises");
+    const legacy = join(repoPath, ".foundry", ".pre-cursor-snapshots");
+    try {
+        const st = await fs.stat(legacy);
+        if (!st.isDirectory())
+            return;
+    }
+    catch {
+        return;
+    }
+    try {
+        const cp = await import("node:child_process");
+        await new Promise((res) => {
+            const child = cp.spawn("git", ["rm", "-rf", "--cached", "--ignore-unmatch", ".foundry/.pre-cursor-snapshots"], { cwd: repoPath, stdio: "ignore" });
+            child.on("close", () => res());
+            child.on("error", () => res());
+        });
+    }
+    catch {
+        // best-effort
+    }
+    try {
+        await fs.rm(legacy, { recursive: true, force: true });
+    }
+    catch {
+        // best-effort
+    }
+}
+async function snapshotBuildSpecArtifactsBeforeCursor(repoPath) {
+    await untrackLegacySnapshotDirIfPresent(repoPath);
+    const fs = await import("node:fs/promises");
+    const snapDir = ledgerSnapshotDir(repoPath);
+    await fs.mkdir(snapDir, { recursive: true });
+    for (const rel of ["BUILD_SPEC_LEDGER.json", "BUILD_SPEC.json"]) {
+        const src = join(repoPath, ".foundry", rel);
+        const dst = join(snapDir, rel);
+        try {
+            await fs.copyFile(src, dst);
+        }
+        catch {
+            try {
+                await fs.unlink(dst);
+            }
+            catch { /* ignore */ }
+        }
+    }
+}
+function snapshotPathFor(repoPath, rel) {
+    return join(ledgerSnapshotDir(repoPath), rel);
+}
+/**
+ * Restore the ledger from the pre-Cursor snapshot if Cursor wiped or
+ * truncated it. We trust the snapshot when (a) snapshot has more task
+ * entries than the on-disk file, or (b) snapshot has more addressed
+ * parents. Cursor edits to generated files are silently overwritten.
+ */
+async function restoreLedgerIfCursorWipedIt(repoPath) {
+    const fs = await import("node:fs/promises");
+    const snapPath = snapshotPathFor(repoPath, "BUILD_SPEC_LEDGER.json");
+    const livePath = join(repoPath, ".foundry", "BUILD_SPEC_LEDGER.json");
+    let snapRaw = "";
+    let liveRaw = "";
+    try {
+        snapRaw = await fs.readFile(snapPath, "utf8");
+    }
+    catch {
+        return { restored: false };
+    }
+    try {
+        liveRaw = await fs.readFile(livePath, "utf8");
+    }
+    catch {
+        liveRaw = "";
+    }
+    let snap = {};
+    let live = {};
+    try {
+        snap = JSON.parse(snapRaw);
+    }
+    catch {
+        return { restored: false };
+    }
+    try {
+        live = liveRaw ? JSON.parse(liveRaw) : {};
+    }
+    catch {
+        live = {};
+    }
+    const snapTasks = Object.keys(snap.tasks ?? {}).length;
+    const liveTasks = Object.keys(live.tasks ?? {}).length;
+    const snapParents = Object.keys(snap.addressedParents ?? {}).length;
+    const liveParents = Object.keys(live.addressedParents ?? {}).length;
+    if (liveTasks < snapTasks || liveParents < snapParents) {
+        await fs.copyFile(snapPath, livePath);
+        return {
+            restored: true,
+            reason: `tasks ${liveTasks}→${snapTasks}, addressedParents ${liveParents}→${snapParents}`,
+        };
+    }
+    return { restored: false };
+}
+/**
+ * Also restore the BUILD_SPEC if Cursor truncated/wiped it. The wizard's
+ * generated spec must persist between passes so the same task IDs continue
+ * to anchor `taskCompletedByEdits` lookups.
+ */
+async function restoreBuildSpecIfCursorWipedIt(repoPath) {
+    const fs = await import("node:fs/promises");
+    const snapPath = snapshotPathFor(repoPath, "BUILD_SPEC.json");
+    const livePath = join(repoPath, ".foundry", "BUILD_SPEC.json");
+    let snapRaw = "";
+    let liveRaw = "";
+    try {
+        snapRaw = await fs.readFile(snapPath, "utf8");
+    }
+    catch {
+        return { restored: false };
+    }
+    try {
+        liveRaw = await fs.readFile(livePath, "utf8");
+    }
+    catch {
+        liveRaw = "";
+    }
+    let snap = {};
+    let live = {};
+    try {
+        snap = JSON.parse(snapRaw);
+    }
+    catch {
+        return { restored: false };
+    }
+    try {
+        live = liveRaw ? JSON.parse(liveRaw) : {};
+    }
+    catch {
+        live = {};
+    }
+    const snapTasks = (snap.slices?.[0]?.tasks ?? []).length;
+    const liveTasks = (live.slices?.[0]?.tasks ?? []).length;
+    if (liveTasks < snapTasks) {
+        await fs.copyFile(snapPath, livePath);
+        return { restored: true, reason: `slice tasks ${liveTasks}→${snapTasks}` };
+    }
+    return { restored: false };
+}
+async function updateBuildSpecLedgerFromPass(repoPath, runId, builderRun) {
+    const restoredSpec = await restoreBuildSpecIfCursorWipedIt(repoPath);
+    if (restoredSpec.restored) {
+        console.log(chalk.yellow(`  BUILD_SPEC was truncated by Cursor — restored from pre-Cursor snapshot (${restoredSpec.reason}).`));
+    }
+    const restoredLedger = await restoreLedgerIfCursorWipedIt(repoPath);
+    if (restoredLedger.restored) {
+        console.log(chalk.yellow(`  BUILD_SPEC_LEDGER was wiped by Cursor — restored from pre-Cursor snapshot (${restoredLedger.reason}).`));
+    }
+    const spec = await readBuildSpecFromRepo(repoPath);
+    if (!spec)
+        return;
+    const ledger = await readBuildSpecLedger(repoPath);
+    const touched = new Set(builderRun.changedFiles);
+    const newlyCompleted = [];
+    const slice = spec.slices[0];
+    if (!slice)
+        return;
+    for (const task of slice.tasks) {
+        if (task.id in ledger.tasks)
+            continue;
+        if (!taskCompletedByEdits(task, builderRun.changedFiles))
+            continue;
+        const taskStats = (builderRun.diffStats ?? []).filter((s) => task.files.includes(s.file));
+        ledger.tasks[task.id] = {
+            completedAt: new Date().toISOString(),
+            runId,
+            filesTouched: task.files.filter((f) => touched.has(f)),
+            locAdded: taskStats.reduce((s, x) => s + x.added, 0),
+            locRemoved: taskStats.reduce((s, x) => s + x.removed, 0),
+        };
+        newlyCompleted.push(task.id);
+    }
+    let newlyAddressedParents = [];
+    if (Array.isArray(spec.parentDirectives) && spec.parentDirectives.length > 0) {
+        const addressedMap = { ...(ledger.addressedParents ?? {}) };
+        for (const parent of spec.parentDirectives) {
+            if (parent.id in addressedMap)
+                continue;
+            if (parent.childTaskIds.length === 0)
+                continue;
+            const allClosed = parent.childTaskIds.every((cid) => cid in ledger.tasks);
+            if (allClosed) {
+                addressedMap[parent.id] = {
+                    text: parent.text,
+                    source: parent.source,
+                    addressedAt: new Date().toISOString(),
+                };
+                newlyAddressedParents.push(parent.id);
+            }
+        }
+        ledger.addressedParents = addressedMap;
+    }
+    if (newlyCompleted.length > 0) {
+        ledger.updatedAt = new Date().toISOString();
+        ledger.stuckCycles = 0;
+        await writeBuildSpecLedger(repoPath, ledger);
+        // Count only tasks from the CURRENT spec — ledger.tasks contains entries
+        // from prior specs whose task IDs are different from the current set.
+        // (Previously this read Object.keys(ledger.tasks).length which produced
+        // nonsense like "14/5 cumulative".)
+        const totalDone = slice.tasks.filter((t) => t.id in ledger.tasks).length;
+        const totalTasks = slice.tasks.length;
+        const totalAddressed = Object.keys(ledger.addressedParents ?? {}).length;
+        console.log(chalk.green(`  BUILD_SPEC_LEDGER: closed ${newlyCompleted.length} task(s) this pass (${totalDone}/${totalTasks} cumulative). Closed: ${newlyCompleted.join(", ")}`));
+        if (newlyAddressedParents.length > 0) {
+            console.log(chalk.green(`  BUILD_SPEC_LEDGER: ${newlyAddressedParents.length} parent directive(s) now ADDRESSED (won't re-emit). Cumulative: ${totalAddressed}.`));
+        }
+    }
+    else if (newlyAddressedParents.length > 0) {
+        ledger.updatedAt = new Date().toISOString();
+        await writeBuildSpecLedger(repoPath, ledger);
+        console.log(chalk.green(`  BUILD_SPEC_LEDGER: ${newlyAddressedParents.length} parent directive(s) now ADDRESSED (won't re-emit).`));
+    }
+    else if (slice.tasks.some((t) => !(t.id in ledger.tasks))) {
+        const remaining = slice.tasks.filter((t) => !(t.id in ledger.tasks)).map((t) => t.id);
+        console.log(chalk.yellow(`  BUILD_SPEC_LEDGER: 0 task(s) fully closed by this pass (edits did not cover all files for any open task). Open: ${remaining.slice(0, 4).join(", ")}${remaining.length > 4 ? ` … +${remaining.length - 4}` : ""}`));
+    }
+}
 async function buildWorkPacketForRun(params) {
     const briefPath = join(params.foundryDir, "CURSOR_BRIEF.md");
     let briefOpenItems = await readOpenBriefItems(briefPath);
     if (params.stabilize) {
         briefOpenItems = filterBriefItemsForStabilizePhase(briefOpenItems, params.pipelineQa);
+    }
+    const buildSpec = await readBuildSpecFromRepo(params.repoPath);
+    const ledger = await readBuildSpecLedger(params.repoPath);
+    const primarySliceRaw = buildSpec ? primaryBuildSpecSlice(buildSpec) : undefined;
+    // Only forward the slice to the work packet when (a) it has unclosed tasks
+    // OR (b) the original spec had no tasks at all (heuristic-only acceptance).
+    // When the original had tasks but ledger closed them all, we drop the slice
+    // entirely so createWorkPacket does NOT replay acceptance criteria as new
+    // "must ship" items.
+    let primarySlice = undefined;
+    if (primarySliceRaw) {
+        const filteredTasks = primarySliceRaw.tasks.filter((t) => !(t.id in ledger.tasks));
+        const originalHadTasks = primarySliceRaw.tasks.length > 0;
+        if (filteredTasks.length > 0) {
+            primarySlice = { ...primarySliceRaw, tasks: filteredTasks };
+        }
+        else if (!originalHadTasks) {
+            primarySlice = primarySliceRaw;
+        }
+        // else: every task is in the ledger -> no `must ship` from this spec.
     }
     const qaSeparated = separateManualAndCodeItems([
         ...(params.pipelineQa?.blockers ?? []),
@@ -351,6 +676,8 @@ async function buildWorkPacketForRun(params) {
         builderCodeBlockers: builderSeparated.code,
         manualOnly: [...qaSeparated.manual, ...builderSeparated.manual],
         codeChanged: false,
+        buildSpecPrimarySlice: primarySlice,
+        freezeBriefToBuildSpec: !!buildSpec,
     });
 }
 function parseCommittedChangesFromBuilder(builder) {
@@ -744,6 +1071,7 @@ const STRICT_RESET_CONSOLIDATE_STAGES = [
     "product_definition",
     "monetization_architect",
     "feedback_agent",
+    "grand_wizard",
     "builder",
 ];
 /** `foundry loop --stabilize`: skip upstream scope stages; converge on tests + ship gates. */
@@ -767,6 +1095,13 @@ const FOUNDRY_GITIGNORE_ENTRIES = [
     ".foundry/feedback-ledger.json",
     ".foundry/LATEST_INSTALL.md",
     ".foundry/CURSOR_BRIEF.md",
+    ".foundry/BUILD_SPEC.json",
+    ".foundry/BUILD_SPEC.md",
+    ".foundry/BUILD_SPEC_LEDGER.json",
+    ".foundry/INVESTOR_PANEL_STATE.json",
+    // Legacy snapshot dir kept here so existing .gitignore files continue to
+    // ignore it after we relocate snapshots under .foundry/automation/.
+    ".foundry/.pre-cursor-snapshots/",
     ".foundry/CURSOR_BUILDER_REPORT.md",
     ".foundry/CURSOR_QA_REPORT.md",
     ".foundry/automation/",
@@ -1088,7 +1423,38 @@ program
             '  - "replace me"',
             "core_differentiators:",
             '  - "replace me"',
-            "foundry: {}",
+            "# Domain block (optional but strongly recommended) — first-class fields for what",
+            "# this app actually does. Drives concrete Must Ship lines, brief items, investor pitch,",
+            "# and growth experiments. Without it, downstream stages fall back to generic SaaS phrasing.",
+            "# domain:",
+            "#   name: \"e.g. ingredient-safety scanner\"",
+            "#   primary_user_action: \"e.g. Point camera at a packaged food → see stomach-safe verdict in <2s\"",
+            "#   key_user_actions:",
+            "#     - \"e.g. Scan a barcode/package and get a verdict (safe / caution / avoid)\"",
+            "#     - \"e.g. Save personal triggers (lactose, FODMAPs, etc.)\"",
+            "#     - \"e.g. Browse history of past verdicts\"",
+            "#   vocabulary:",
+            "#     noun: \"scan\"        # subject (\"a scan\")",
+            "#     verb: \"scan\"        # action (\"to scan a package\")",
+            "#     outcome: \"verdict\"  # result (\"safe verdict\")",
+            "#     actor: \"shopper\"    # who's using it",
+            "#   personas:",
+            "#     - \"IBS sufferer figuring out trigger foods on the go\"",
+            "#     - \"Lactose-intolerant traveler scanning unfamiliar packages\"",
+            "#   success_examples:",
+            "#     - \"Greek yogurt → 'Caution: high FODMAP for IBS' in 1.4s\"",
+            "#     - \"Almond crackers → 'Safe — no listed triggers' in <2s\"",
+            "#   non_goals:",
+            "#     - \"Restaurant menu OCR\"",
+            "#     - \"Calorie/macro tracking\"",
+            "#   primary_metric: \"scan-to-verdict latency p95 < 2s\"",
+            "foundry:",
+            "  # Unattended loop: optional — relax investor_panel gates and defer ship/EAS prompts until grades hit target.",
+            "  # autonomous_investor_convergence:",
+            "  #   enabled: true",
+            "  #   min_average_grade: \"B+\"",
+            "  #   relaxed_investor_gates: true",
+            "  #   defer_release_prompt_until_investor_target: true",
             "  # Optional: one git branch for all builder cycles until you merge the release to main.",
             "  # builder_branch: foundry/release",
             "  # Optional: skip investor_panel until QA ships, no blockers, brief complete, work packet closed.",
@@ -1350,15 +1716,21 @@ feedbackProgram
 });
 feedbackProgram
     .command("add")
+    .description("Add a feedback item to the durable ledger")
     .option("--repo <path>", "Path to target repo (defaults to current directory)")
-    .requiredOption("--summary <text>", "Feedback summary")
+    .option("--summary <text>", "Optional short summary (defaults to the positional feedback text)")
     .option("--type <type>", "Feedback type", "feature_request")
     .option("--priority <priority>", "Priority", "medium")
     .option("--implement", "Mark this new item shouldImplement=true")
     .option("--note <text>", "Optional implementation note")
-    .description("Add a feedback item to the durable ledger")
-    .action(async (opts) => {
+    .argument("[text]", "Feedback text (stored as summary when --summary is omitted)")
+    .action(async (text, opts) => {
     const repoPath = resolveRepoPath(opts.repo);
+    const summary = (opts.summary?.trim() || text?.trim() || "").trim();
+    if (!summary) {
+        console.error(chalk.red("Missing feedback text: pass a quoted message (e.g. `foundry feedback add \"…\"`) or use --summary."));
+        process.exit(1);
+    }
     const type = opts.type;
     const priority = opts.priority;
     if (!["bug", "feature_request", "complaint", "praise", "crash"].includes(type)) {
@@ -1372,9 +1744,9 @@ feedbackProgram
     const ledger = await readFeedbackLedger(repoPath);
     const now = new Date().toISOString();
     const item = {
-        id: feedbackIdFromSummary(opts.summary),
+        id: feedbackIdFromSummary(summary),
         type,
-        summary: opts.summary.trim(),
+        summary,
         priority,
         source: "manual:cli",
         timestamp: now,
@@ -1881,6 +2253,7 @@ program
     .option("--no-wait", "Skip sleeps: no delay between outer cycles, no delay on failed phase-1 retry; release approval is interactive in a TTY (no touch-file polling), otherwise skipped without a TTY")
     .option("--quick-phase1", "Legacy: phase 1 only runs consolidate-through-builder (no QA/release/investor until after Cursor). Default is a full pipeline phase 1.")
     .option("--stabilize", "Freeze scope: each outer cycle runs only builder → independent_qa → release_agent (no market/gap/product/monetization/feedback regen). Cursor focuses on QA green (tests/lint/typecheck/Maestro) first; brief backlog in the packet is narrowed until ship+0 blockers. Ignores feedback-queue churn for loop continuation.")
+    .option("--reset-spec", "Delete .foundry/BUILD_SPEC.{json,md} and .foundry/CURSOR_BRIEF.md before this cycle so Grand Wizard regenerates from scratch with the latest investor directives.")
     .description("Autonomous loop: full pipeline (default) → optional Cursor inner iterations → post-Cursor QA/release (and investor stages in investor profile). Prints RELEASE_CANDIDATE: YES/NO each cycle.")
     .action(async (opts) => {
     const repoPath = resolveRepoPath(opts.repo);
@@ -1903,8 +2276,44 @@ program
         console.error(chalk.red("Missing .foundry/ in target repo. Run `foundry init --repo <path>` first."));
         process.exit(1);
     }
+    if (opts.resetSpec) {
+        const wiped = [];
+        for (const rel of [
+            "BUILD_SPEC.json",
+            "BUILD_SPEC.md",
+            "BUILD_SPEC_LEDGER.json",
+            "CURSOR_BRIEF.md",
+            "INVESTOR_PANEL_STATE.json",
+        ]) {
+            const abs = join(foundryDir, rel);
+            try {
+                await access(abs);
+                await import("node:fs/promises").then((m) => m.unlink(abs));
+                wiped.push(rel);
+            }
+            catch {
+                /* ignore missing file */
+            }
+        }
+        if (wiped.length > 0) {
+            console.log(chalk.yellow(`  Reset spec: removed ${wiped.join(", ")} — Grand Wizard will regenerate from scratch.`));
+        }
+        else {
+            console.log(chalk.gray("  Reset spec: nothing to remove."));
+        }
+    }
     const foundryRoot = FOUNDRY_ROOT;
     const foundryConfig = await loadFoundryConfig(repoPath);
+    const foundryBlock = foundryConfig.project.foundry;
+    const autonomousInv = resolveAutonomousInvestorConvergenceForRun(foundryBlock, {
+        investorLoopDefaults: loopProfile === "investor",
+    });
+    if (autonomousInv.enabled) {
+        console.log(chalk.gray(`  Autonomous investor convergence: on — mean grade ≥ ${autonomousInv.minAverageGrade}; relaxed investor gates=${String(autonomousInv.relaxedInvestorGates)}; defer release/EAS until investor target AND convergence_contract are clear (${String(autonomousInv.deferReleaseUntilInvestorTarget)})`));
+    }
+    if (loopProfile === "investor" && !hasAutonomousInvestorConvergenceKey(foundryBlock) && autonomousInv.enabled) {
+        console.log(chalk.gray("  No `foundry.autonomous_investor_convergence` in project.yaml — investor profile applies overnight defaults (add the block to customize, or `enabled: false` to disable)."));
+    }
     const easSettings = resolveEasBuildSettings(foundryConfig);
     const cursorSettings = resolveCursorAutomationSettings(foundryConfig, {
         enabled: opts.cursorAuto ? true : undefined,
@@ -1928,6 +2337,40 @@ program
     console.log(chalk.gray(`  Feedback interval: ${opts.feedbackInterval}m (ignored when --no-wait)`));
     console.log(chalk.gray(`  Max cycles: ${maxCycles || "unlimited"}\n`));
     if (cursorSettings.enabled) {
+        // Warn early about a known footgun: FOUNDRY_CURSOR_AGENT_CMD pinned to
+        // a versioned `cursor-agent` binary that does NOT match the PATH one.
+        // The user typically runs `cursor-agent login` (PATH-resolved); a stale
+        // env var silently makes Foundry use a different version that may need
+        // its own login and produces confusing "not authenticated" errors.
+        const envPinnedCursor = process.env.FOUNDRY_CURSOR_AGENT_CMD?.trim();
+        if (envPinnedCursor && /\/cursor-agent\/versions\//.test(envPinnedCursor)) {
+            try {
+                const fs = await import("node:fs/promises");
+                await fs.access(envPinnedCursor);
+                const cp = await import("node:child_process");
+                const which = await new Promise((res) => {
+                    const child = cp.spawn("bash", ["-lc", "command -v cursor-agent || true"], {
+                        env: process.env,
+                        stdio: ["ignore", "pipe", "ignore"],
+                    });
+                    let out = "";
+                    child.stdout.on("data", (b) => { out += b.toString(); });
+                    child.on("close", () => res(out.trim()));
+                    child.on("error", () => res(""));
+                });
+                if (which && which !== envPinnedCursor) {
+                    console.log(chalk.yellow(`  WARNING: FOUNDRY_CURSOR_AGENT_CMD is pinned to a versioned binary:\n` +
+                        `    ${envPinnedCursor}\n` +
+                        `  but \`cursor-agent\` on PATH resolves to a different binary:\n` +
+                        `    ${which}\n` +
+                        `  If you ran \`cursor-agent login\`, it authenticated the PATH binary, not the pinned one.\n` +
+                        `  Recommend: \`unset FOUNDRY_CURSOR_AGENT_CMD\` so Foundry uses the same cursor-agent you logged in to.`));
+                }
+            }
+            catch {
+                /* env points to a non-existent path; the preflight will report it. */
+            }
+        }
         const preflight = await preflightCursorCommand(cursorSettings.command, repoPath);
         if (!preflight.ok) {
             console.error(chalk.red(preflight.detail));
@@ -1956,9 +2399,41 @@ program
     }
     let lastReleaseFailureKey = "";
     let repeatedReleaseFailureCount = 0;
+    /**
+     * Counts outer cycles in a row whose Cursor builder agent failed with what
+     * looks like a network/transport stall (`Connection lost, reconnecting…`).
+     * The per-pass watchdog inside `runCursorAgent` already SIGTERMs the agent
+     * after `FOUNDRY_CURSOR_TRANSPORT_GRACE_MS` of reconnect-only output, but a
+     * single cycle's worth of retries can still burn meaningful quota. After
+     * `MAX_CONSECUTIVE_TRANSPORT_FAILURES` cycles in a row die that way, abort
+     * the entire `foundry loop` so the user can address connectivity instead
+     * of bleeding more credits.
+     */
+    let consecutiveTransportFailures = 0;
+    const MAX_CONSECUTIVE_TRANSPORT_FAILURES = 2;
+    /**
+     * Count of consecutive outer cycles whose inner loop aborted (no real
+     * code changes, only metadata, monetization-only, etc.). Used to break
+     * the outer loop after persistent no-progress; previously a single
+     * abort would kill autonomous runs even though the user explicitly
+     * passed `--no-wait` expecting continued convergence.
+     */
+    let consecutiveAbortCycles = 0;
     while (true) {
         cycle++;
         let abortLoop = false;
+        let outerCycleHadTransportFailure = false;
+        // Set when cursor-agent rejected the configured model at runtime.
+        // No retrying inside the loop will help — the operator must edit
+        // project.yaml or set builder_model: "auto" before another run.
+        let modelLookupRejected = false;
+        // Tracks whether *any* inner pass in this outer cycle reached QA-ship.
+        // We use this to force `investor_panel` at end-of-cycle (with QA gate
+        // bypassed) when a later inner pass regressed QA — otherwise convergence
+        // runs go several outer cycles without ever generating investor grades.
+        let cycleHadShipState = false;
+        // Tracks whether an investor_panel actually ran (not skipped) this cycle.
+        let cycleProducedInvestorPanel = false;
         if (maxCycles > 0 && cycle > maxCycles) {
             console.log(chalk.yellow(`\nReached max cycles (${maxCycles}). Stopping.`));
             break;
@@ -1983,6 +2458,7 @@ program
                 foundryRoot,
                 quiet: true,
                 allowInvestorRefinement: stabilize ? false : loopProfile === "investor",
+                investorLoopAutonomousDefaults: loopProfile === "investor",
                 stagesOverride: stabilize
                     ? [...STABILIZE_PHASE1_STAGES]
                     : opts.quickPhase1
@@ -2055,6 +2531,35 @@ program
             }
         }
         printUnblockGuidance(buildUnblockGuidance(repoPath, foundryDir, pipelineQa, releaseOutput, builderOutput, builderRemainingBlockers));
+        const buildSpec = await readBuildSpecFromRepo(repoPath);
+        if (buildSpec) {
+            const slice = buildSpec.slices[0];
+            const ledger = await readBuildSpecLedger(repoPath);
+            const totalTasks = slice?.tasks.length ?? 0;
+            const doneTasks = (slice?.tasks ?? []).filter((t) => t.id in ledger.tasks).length;
+            const tasksWithFiles = (slice?.tasks ?? []).filter((t) => t.files.length > 0).length;
+            const parents = buildSpec.parentDirectives.length;
+            const parentsCovered = buildSpec.parentDirectives.filter((p) => p.childTaskIds.length > 0).length;
+            const undecomposed = buildSpec.diagnostics.directivesWithoutTasks.length;
+            const stuckCycles = ledger.stuckCycles;
+            const droppedParentsCount = Object.keys(ledger.droppedParents ?? {}).length;
+            const tone = undecomposed > 0 || tasksWithFiles < totalTasks || stuckCycles > 1 ? chalk.yellow : chalk.gray;
+            console.log(tone(`  Grand Wizard: ${doneTasks}/${totalTasks} task(s) done · ${tasksWithFiles}/${totalTasks} have file refs · parents ${parentsCovered}/${parents} decomposed · stuck=${stuckCycles} · dropped=${droppedParentsCount} · source=${buildSpec.source}`));
+            if (droppedParentsCount > 0) {
+                const sampleDropped = Object.values(ledger.droppedParents ?? {})
+                    .slice(0, 2)
+                    .map((d) => `"${d.text.slice(0, 60)}${d.text.length > 60 ? "…" : ""}"`)
+                    .join("; ");
+                console.log(chalk.gray(`  ↳ Parents dropped after ${2}+ undecomposed cycles (use --reset-spec to revive): ${sampleDropped}${droppedParentsCount > 2 ? ` (+${droppedParentsCount - 2} more)` : ""}`));
+            }
+            if (undecomposed > 0) {
+                console.log(chalk.yellow(`  ↳ Undecomposed: ${buildSpec.diagnostics.directivesWithoutTasks.slice(0, 3).map((d) => `"${d.slice(0, 70)}"`).join("; ")}`));
+                console.log(chalk.gray("    Tip: rerun with `--reset-spec` after refining upstream stages, or add `builder.directives` in project.yaml to anchor."));
+            }
+            if (stuckCycles >= 2 && totalTasks > 0 && doneTasks < totalTasks) {
+                console.log(chalk.red(`  ↳ WIZARD STUCK: same upstream fingerprint for ${stuckCycles} cycle(s) with open tasks. Edits aren't covering task.files — Cursor may be editing adjacent files.`));
+            }
+        }
         console.log(chalk.gray(`  Work packet: ${workPacketSummaryLine(workPacket)}`));
         const initialProgress = buildIterationProgress(briefMetrics, builderOutput, pipelineQa, releaseOutput, investorOutput, workPacket);
         logIterationProgress(initialProgress, previousProgress, builderOutput, pipelineQa, releaseOutput, investorOutput, stagnantStreak);
@@ -2081,12 +2586,30 @@ program
             let inner = 0;
             let previousSignature = "";
             let repeatedNoProgressCount = 0;
-            while (shouldRunCursorAutomation(releaseOutput?.status, activePacketCounts, pipelineQa?.recommendation, implementNowFeedbackCount, { stabilize })) {
-                if (releaseOutput?.status === "awaiting_approval" &&
-                    pipelineQa?.recommendation === "ship" &&
-                    (pipelineQa?.blockers?.length ?? 0) === 0) {
-                    console.log(chalk.cyan("\n  Release is awaiting_approval with QA ship + 0 blockers — skipping further Cursor passes and going to the approval prompt."));
-                    break;
+            const contractGate = await readContractConvergenceGate(repoPath);
+            while (shouldRunCursorAutomation(releaseOutput?.status, activePacketCounts, pipelineQa?.recommendation, implementNowFeedbackCount, {
+                stabilize,
+                autonomousDeferRelease: autonomousInv.deferReleaseUntilInvestorTarget,
+                investorTargetMet: investorPanelMetTarget(investorOutput, foundryConfig.project.foundry, loopProfile),
+                contractConvergenceMet: contractGate.ok,
+            })) {
+                if (releaseOutput?.status === "awaiting_approval" && pipelineQa?.recommendation === "ship" && (pipelineQa?.blockers?.length ?? 0) === 0) {
+                    const invMet = investorPanelMetTarget(investorOutput, foundryConfig.project.foundry, loopProfile);
+                    const feedbackQueued = implementNowFeedbackCount > 0;
+                    const stayForConvergence = autonomousInv.deferReleaseUntilInvestorTarget &&
+                        (!invMet || feedbackQueued || !contractGate.ok);
+                    if (stayForConvergence) {
+                        const why = feedbackQueued
+                            ? "feedback queued for implementation"
+                            : !invMet
+                                ? "investor mean grade below configured target"
+                                : `contract not ready (${contractGate.detail})`;
+                        console.log(chalk.cyan(`\n  Release is awaiting_approval with QA ship + 0 blockers — continuing Cursor (${why}).`));
+                    }
+                    else {
+                        console.log(chalk.cyan("\n  Release is awaiting_approval with QA ship + 0 blockers — skipping further Cursor passes and going to the approval prompt."));
+                        break;
+                    }
                 }
                 const effectiveMaxInner = resolveEffectiveInnerLoopMax(cursorSettings.maxInnerLoops, pipelineQa);
                 if (inner >= effectiveMaxInner) {
@@ -2095,6 +2618,76 @@ program
                             ? "QA/tests still need work; next outer cycle re-runs builder → independent_qa → release_agent."
                             : "QA/tests still need work; next outer cycle will re-run the full pipeline."
                         : "continuing outer loop on next cycle."}`));
+                    break;
+                }
+                // Re-derive activePacketCounts from disk before deciding whether to
+                // invoke another Cursor pass. Without this, the value carries over
+                // from before the previous pipeline rerun and can lie about open
+                // items (e.g. a prior iteration closed all real tasks but we still
+                // see counts.total > 0 from stale memory), letting Cursor get
+                // dispatched to do "filler" work that breaks QA.
+                {
+                    const freshOpen = stabilize
+                        ? filterBriefItemsForStabilizePhase(await readOpenBriefItems(briefPath), pipelineQa)
+                        : await readOpenBriefItems(briefPath);
+                    const freshChecked = await readCheckedBriefItems(briefPath);
+                    workPacket = await refreshWorkPacket(repoPath, workPacket, {
+                        briefOpenItems: freshOpen,
+                        checkedBriefItems: freshChecked,
+                        qaCodeBlockers: separateManualAndCodeItems([
+                            ...(pipelineQa?.blockers ?? []),
+                            ...(pipelineQa?.manualTasks ?? []),
+                        ]).code,
+                        builderCodeBlockers: separateManualAndCodeItems([
+                            ...extractBuilderBlockers(builderOutput),
+                            ...builderRemainingBlockers,
+                        ]).code,
+                        manualOnly: [
+                            ...separateManualAndCodeItems([
+                                ...(pipelineQa?.blockers ?? []),
+                                ...(pipelineQa?.manualTasks ?? []),
+                                ...extractBuilderBlockers(builderOutput),
+                                ...builderRemainingBlockers,
+                            ]).manual,
+                        ],
+                        codeChanged: false,
+                    });
+                    activePacketCounts = packetBriefCounts(workPacket);
+                }
+                // Guard: don't invoke Cursor when there is literally nothing to do.
+                // Without this, the inner loop fires off a Cursor pass with
+                // "Build targets (0): (none ...)", and Cursor either invents
+                // make-work that breaks QA, crashes with exit 1, or trips the
+                // abort-on-no-product-changes guard and kills the outer loop.
+                // Instead, force a one-off investor_panel run from the current
+                // (good) QA-ship state and break out.
+                if (loopProfile === "investor" &&
+                    activePacketCounts.total === 0 &&
+                    implementNowFeedbackCount === 0 &&
+                    pipelineQa?.recommendation === "ship" &&
+                    (pipelineQa?.blockers?.length ?? 0) === 0) {
+                    console.log(chalk.cyan("\n  No open work-packet items, no queued feedback, QA is ship — skipping further Cursor passes this cycle and running investor_panel from this state."));
+                    const ipSpinner = ora("Running investor_panel (no Cursor pass needed)...").start();
+                    try {
+                        manifest = await runPipeline({
+                            repoPath,
+                            pipelineName: opts.pipeline,
+                            foundryRoot,
+                            quiet: true,
+                            allowInvestorRefinement: false,
+                            investorLoopAutonomousDefaults: true,
+                            stagesOverride: ["investor_panel"],
+                        });
+                        ipSpinner.succeed("investor_panel completed.");
+                        investorOutput = await readStageJson(repoPath, manifest, "investor_panel");
+                        if (investorOutput && manifestStageRan(manifest, "investor_panel")) {
+                            cycleProducedInvestorPanel = true;
+                        }
+                        logInvestorScoreLine(investorOutput);
+                    }
+                    catch (err) {
+                        ipSpinner.fail(err instanceof Error ? err.message : String(err));
+                    }
                     break;
                 }
                 inner++;
@@ -2117,10 +2710,11 @@ program
                 }), "utf8");
                 console.log(chalk.gray(`  Longer context: ${focusAbs}`));
                 const qaCodeBlockerCount = separateManualAndCodeItems(pipelineQa?.blockers ?? []).code.length;
-                const builderChoice = chooseBuilderModel(cursorSettings, activePacketCounts, pipelineQa, repeatedNoProgressCount, inner, stabilize ? 0 : implementNowFeedbackCount, releaseOutput?.status);
+                const builderChoice = chooseBuilderModel(cursorSettings, activePacketCounts, pipelineQa, repeatedNoProgressCount, inner, stabilize ? 0 : implementNowFeedbackCount, releaseOutput?.status, !investorPanelMetTarget(investorOutput, foundryConfig.project.foundry, loopProfile));
                 const builderSpinner = ora(`Cursor builder agent (${builderChoice.model})`).start();
                 console.log(chalk.gray(`  Builder model reason: ${builderChoice.reason}`));
                 console.log(chalk.gray(`  Live builder log: ${join(repoPath, ".foundry", "automation", manifest.runId, "builder.log")}`));
+                await snapshotBuildSpecArtifactsBeforeCursor(repoPath);
                 const builderRun = await runBuilderAgent(repoPath, manifest, cursorSettings, builderChoice.model, {
                     innerLoopIndex: inner,
                 });
@@ -2203,8 +2797,21 @@ program
                             break;
                         }
                     }
-                    const changedForLog = builderRun.changedFiles.filter((p) => !p.startsWith(".maestro-debug/"));
+                    const changedForLog = builderRun.changedFiles.filter((p) => !p.startsWith(".maestro-debug/") &&
+                        !p.startsWith(".foundry/.pre-cursor-snapshots/"));
                     console.log(chalk.gray(`  Code files changed: ${changedForLog.length ? changedForLog.slice(0, 8).join(", ") : "(none)"}`));
+                    if (builderRun.diffStats && builderRun.diffStats.length > 0) {
+                        const productStats = builderRun.diffStats.filter((s) => !s.file.startsWith(".foundry/") && !s.file.startsWith(".maestro-debug/"));
+                        const totalAdded = productStats.reduce((s, x) => s + x.added, 0);
+                        const totalRemoved = productStats.reduce((s, x) => s + x.removed, 0);
+                        const top = [...productStats]
+                            .sort((a, b) => b.added + b.removed - (a.added + a.removed))
+                            .slice(0, 4)
+                            .map((s) => `${s.file} (+${s.added}/-${s.removed})`)
+                            .join(", ");
+                        console.log(chalk.gray(`  Diff: ${productStats.length} product file(s), +${totalAdded}/-${totalRemoved} LOC${top ? ` · Top: ${top}` : ""}`));
+                        await updateBuildSpecLedgerFromPass(repoPath, manifest.runId, builderRun);
+                    }
                     if (builderRun.pushWarning) {
                         console.log(chalk.yellow(`  Push: committed locally but could not push to origin — ${builderRun.pushWarning.replace(/\n/g, "\n  ")}`));
                     }
@@ -2219,11 +2826,45 @@ program
                     if (/Cannot find module '@anysphere\/file-service/i.test(agentBlob)) {
                         console.log(chalk.yellow("\n  Cursor `agent` failed to load a native dependency. Reinstall/update Cursor (CLI bundled with the app), verify CPU arch matches the binary, or set `cursor_automation.command` / FOUNDRY_CURSOR_AGENT_CMD to a working agent path."));
                     }
+                    // Model-not-found: the runtime API call rejected the configured
+                    // model even though `agent models` may still list it. Two common
+                    // causes: (1) cursor-agent stripped a verbosity suffix and looked
+                    // for a base name that doesn't exist (e.g. `claude-opus-4-7-high`
+                    // → `claude-opus-4-7`), or (2) the model was deprecated server-
+                    // side. Print actionable guidance with the actual valid model
+                    // list and abort cleanly — retrying in another cycle won't help.
+                    const modelNotFoundMatch = agentBlob.match(/Model name is not valid: "?([^"\n]+)"?/i)
+                        ?? agentBlob.match(/AI Model Not Found[^\n]*"([^"\n]+)"/i);
+                    if (modelNotFoundMatch) {
+                        const rejectedModel = modelNotFoundMatch[1].trim();
+                        const configuredModel = builderChoice.model;
+                        console.log(chalk.red.bold(`\n  CURSOR REJECTED MODEL: '${rejectedModel}'${rejectedModel !== configuredModel ? ` (resolved from configured '${configuredModel}')` : ""}.`));
+                        console.log(chalk.yellow(`  Edit .foundry/project.yaml \`cursor_automation\` and set \`builder_model\` / \`builder_fast_model\` to a currently valid model name.\n` +
+                            `  Get the live list with:  ${cursorSettings.command} models\n` +
+                            `  Common Claude Opus 4.7 aliases: claude-opus-4-7-thinking-high, claude-opus-4-7-thinking-xhigh, claude-opus-4-7-high.\n` +
+                            `  Common GPT-5.5 aliases:        gpt-5.5-medium, gpt-5.5-medium-fast, gpt-5.5-high, gpt-5.5-high-fast.\n` +
+                            `  Or set builder_model: "auto" to let Cursor pick its current default (recommended fallback).`));
+                        // Mark the whole foundry loop as needing operator action — no
+                        // amount of retrying will change which models cursor-agent
+                        // accepts. Exit the OUTER loop, not just the inner.
+                        modelLookupRejected = true;
+                    }
+                    // Cross-cycle transport-stall watchdog: if Cursor died because of
+                    // network / reconnect-only output, the next outer cycle is unlikely
+                    // to fare better in the short term and just burns credits. We tag
+                    // the cycle as a transport failure so the outer driver can break
+                    // the loop after a couple in a row.
+                    if (isLikelyCursorTransportFailure(agentBlob)) {
+                        outerCycleHadTransportFailure = true;
+                        console.log(chalk.yellow("\n  Cursor agent died from transport/network errors (\"Connection lost, reconnecting…\"). " +
+                            "If this happens again next cycle, Foundry will exit so you can check Cursor connectivity instead of burning more agent quota."));
+                    }
                     abortLoop = true;
                     break;
                 }
-                const postStages = postCursorStagesForLoop(loopProfile, stabilize);
-                const rerunSpinner = ora(`Re-running after Cursor: ${postStages.join(" → ")}...`).start();
+                const isLastInnerPass = inner >= effectiveMaxInner;
+                const postStages = postCursorStagesForLoop(loopProfile, stabilize, isLastInnerPass);
+                const rerunSpinner = ora(`Re-running after Cursor: ${postStages.join(" → ")}${loopProfile === "investor" && !isLastInnerPass ? " (investor_panel batched to last inner pass)" : ""}...`).start();
                 try {
                     manifest = await runPipeline({
                         repoPath,
@@ -2231,6 +2872,7 @@ program
                         foundryRoot,
                         quiet: true,
                         allowInvestorRefinement: false,
+                        investorLoopAutonomousDefaults: loopProfile === "investor",
                         stagesOverride: postStages,
                     });
                     rerunSpinner.succeed("Post-Cursor pipeline re-run complete.");
@@ -2249,6 +2891,15 @@ program
                 briefCounts = await countCriticalBriefItems(briefPath);
                 briefMetrics = await readBriefMetrics(briefPath);
                 pipelineQa = await readStageJson(repoPath, manifest, "independent_qa");
+                // Track cycle-level "ever ship" and "investor panel ran" signals
+                // so we can backfill an investor pitch at end-of-cycle even if a
+                // later inner pass regressed QA.
+                if (pipelineQa?.recommendation === "ship" && (pipelineQa?.blockers?.length ?? 0) === 0) {
+                    cycleHadShipState = true;
+                }
+                if (investorOutput && manifestStageRan(manifest, "investor_panel")) {
+                    cycleProducedInvestorPanel = true;
+                }
                 feedbackOutput = await readStageJson(repoPath, manifest, "feedback_agent");
                 implementNowFeedbackCount = feedbackOutput?.ledgerSummary?.implementNowItems ?? 0;
                 builderRemainingBlockers = await readBuilderRemainingBlockers(repoPath);
@@ -2371,20 +3022,119 @@ program
                 }
             }
         }
+        // Cross-cycle transport-stall guard: track whether this outer cycle was
+        // killed by Cursor network errors. After two such cycles in a row we
+        // exit the entire loop (regardless of release status) since further
+        // attempts only burn quota until connectivity recovers.
+        if (outerCycleHadTransportFailure) {
+            consecutiveTransportFailures += 1;
+            if (consecutiveTransportFailures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES) {
+                console.log(chalk.red.bold(`\n  Aborting foundry loop: ${consecutiveTransportFailures} consecutive cycles ended in Cursor transport failures.`));
+                console.log(chalk.yellow("  Check Cursor app/network status, then re-run `foundry loop`. " +
+                    "Set FOUNDRY_CURSOR_TRANSPORT_GRACE_MS=0 to disable the per-pass watchdog if you'd rather wait it out."));
+                break;
+            }
+        }
+        else {
+            consecutiveTransportFailures = 0;
+        }
+        // If cursor-agent rejected the configured model, no amount of further
+        // cycling can recover — the operator must edit `cursor_automation.builder_model`
+        // in project.yaml (or set it to "auto"). Exit immediately so we don't
+        // burn another full pipeline run that will fail the same way.
+        if (modelLookupRejected) {
+            console.log(chalk.red.bold("\n  Aborting foundry loop: cursor-agent rejected the configured builder model."));
+            console.log(chalk.yellow("  Update .foundry/project.yaml \`cursor_automation.builder_model\` (and \`builder_fast_model\`) — see model error above."));
+            break;
+        }
+        // Inner loop abort tracking: the inner loop sets `abortLoop = true` when
+        // Cursor commits no real code, only metadata, monetization-only changes,
+        // or trips test-change rules. Previously this would break the OUTER
+        // loop whenever the release wasn't approved, killing autonomous runs
+        // (the user got "Loop finished." after cycle 3 even though they wanted
+        // continued investor convergence). Now we only break the outer loop
+        // after 3 consecutive abort cycles — that's the real "Cursor is
+        // hopelessly stuck" signal. Otherwise we move on to the next cycle so
+        // a fresh pipeline run can produce different work.
+        if (abortLoop) {
+            consecutiveAbortCycles += 1;
+        }
+        else {
+            consecutiveAbortCycles = 0;
+        }
         if (abortLoop &&
+            consecutiveAbortCycles >= 3 &&
             releaseOutput?.status !== "awaiting_approval" &&
             releaseOutput?.status !== "approved" &&
             releaseOutput?.status !== "auto_approved") {
+            console.log(chalk.red.bold(`\n  Aborting foundry loop: ${consecutiveAbortCycles} consecutive cycles ended without product code changes.`));
+            console.log(chalk.yellow("  Inspect .foundry/CURSOR_BUILDER_REPORT.md and project.yaml — Cursor is repeatedly making no useful changes."));
             break;
         }
         if (abortLoop) {
-            console.log(chalk.yellow("\n  Inner loop aborted, but release is ready — continuing to approval prompt.\n"));
+            if (releaseOutput?.status === "awaiting_approval" ||
+                releaseOutput?.status === "approved" ||
+                releaseOutput?.status === "auto_approved") {
+                console.log(chalk.yellow("\n  Inner loop aborted, but release is ready — continuing to approval prompt.\n"));
+            }
+            else {
+                console.log(chalk.yellow(`\n  Inner loop aborted (consecutive=${consecutiveAbortCycles}/3) — continuing to next outer cycle so a fresh pipeline run can produce new work.\n`));
+            }
+        }
+        // End-of-cycle investor backfill: when QA reached `ship` somewhere
+        // inside this outer cycle but the LAST inner pass left QA red (Cursor
+        // tends to invent low-value follow-ons that regress tests), we'd
+        // normally never produce investor grades — the panel gate refuses to
+        // pitch with red QA. Force a one-off investor_panel that bypasses the
+        // QA gate so convergence runs actually move. All other gates (builder
+        // status, convergence, directives-unaddressed) still apply, so this
+        // never re-pitches stale feedback.
+        if (loopProfile === "investor" &&
+            cycleHadShipState &&
+            !cycleProducedInvestorPanel) {
+            const ipSpinner = ora("Backfilling investor_panel (QA regressed after cycle reached ship — bypassing QA gate)...").start();
+            try {
+                manifest = await runPipeline({
+                    repoPath,
+                    pipelineName: opts.pipeline,
+                    foundryRoot,
+                    quiet: true,
+                    allowInvestorRefinement: false,
+                    investorLoopAutonomousDefaults: true,
+                    stagesOverride: ["investor_panel"],
+                    forceInvestorPanelBypassQaGate: true,
+                });
+                if (manifestStageRan(manifest, "investor_panel")) {
+                    ipSpinner.succeed("investor_panel completed (QA-gate-bypassed backfill).");
+                    cycleProducedInvestorPanel = true;
+                }
+                else {
+                    ipSpinner.warn("investor_panel still skipped by another gate (builder/convergence/directives).");
+                }
+                investorOutput = await readStageJson(repoPath, manifest, "investor_panel");
+            }
+            catch (err) {
+                ipSpinner.fail(err instanceof Error ? err.message : String(err));
+            }
         }
         logReleaseCandidateLine(pipelineQa, releaseOutput);
         if (loopProfile === "investor") {
             logInvestorScoreLine(investorOutput);
         }
+        investorOutput = await readStageJson(repoPath, manifest, "investor_panel");
+        const contractAtRelease = await readContractConvergenceGate(repoPath);
         if (releaseOutput?.status === "awaiting_approval") {
+            const invMetPost = investorPanelMetTarget(investorOutput, foundryConfig.project.foundry, loopProfile);
+            if (autonomousInv.deferReleaseUntilInvestorTarget && (!invMetPost || !contractAtRelease.ok)) {
+                const reasons = [];
+                if (!invMetPost)
+                    reasons.push(`investor mean < ${autonomousInv.minAverageGrade} (or panel missing/skipped)`);
+                if (!contractAtRelease.ok)
+                    reasons.push(contractAtRelease.detail);
+                console.log(chalk.cyan(`\n  Autonomous investor convergence: skipping release approval and EAS prompts (${reasons.join("; ")}).`));
+                console.log(chalk.gray("  Continuing the outer loop: next cycle runs the full pipeline (including feedback_agent) so Supabase + ledger feedback stay merged before Cursor.\n"));
+                continue;
+            }
             console.log(chalk.yellow.bold("\n  RELEASE READY — APPROVAL REQUIRED"));
             console.log(chalk.yellow(`  Review: ${repoPath}/.foundry/APPROVAL_REQUIRED.md`));
             console.log(chalk.yellow(`  Pipeline QA certified (independent_qa recommends ship, score=${pipelineQa?.score ?? "?"}).\n`));

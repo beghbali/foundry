@@ -4,6 +4,7 @@ import YAML from "yaml";
 import { z } from "zod";
 import { writeStageJson, writeStageMarkdown } from "./artifacts.js";
 import { loadFoundryConfig } from "./config.js";
+import { parseAutonomousInvestorConvergence, withInvestorLoopAutonomousDefaultsIfNeeded, } from "./investorGrades.js";
 import { STAGES_ELIGIBLE_FOR_REUSE, computeRepoFingerprint, fingerprintStageInput, isStageReuseEnabled, rememberStageOutput, tryGetReusableStageOutput, } from "./pipelineStageCache.js";
 import { getStageInput, } from "./stageInputs.js";
 import { getStageRegistry } from "./registry.js";
@@ -57,6 +58,7 @@ export async function loadPipelineYaml(foundryRoot, pipelineName) {
 /** Shape must stay aligned with `investor_panel` stage `output.json` (avoid core→stages import cycle). */
 const InvestorPanelRunnerShape = z.object({
     meetsMinimumGradeA: z.boolean(),
+    meetsInvestorTarget: z.boolean().optional(),
     combinedRefinementDirectives: z.array(z.string()),
     investors: z.array(z.object({
         displayName: z.string(),
@@ -101,11 +103,48 @@ const ConvergenceContractRunnerShape = z.object({
     })
         .default({ mustShip: [], mustNotShipYet: [] }),
 });
-function investorPanelMeetsBar(out) {
+function investorPanelMeetsBar(out, projectFoundry) {
     const p = InvestorPanelRunnerShape.safeParse(out);
-    return p.success && p.data.meetsMinimumGradeA;
+    if (!p.success)
+        return false;
+    const auto = parseAutonomousInvestorConvergence(projectFoundry);
+    if (auto.enabled) {
+        if (p.data.meetsInvestorTarget !== undefined)
+            return p.data.meetsInvestorTarget;
+        return p.data.meetsMinimumGradeA;
+    }
+    return p.data.meetsMinimumGradeA;
 }
+/**
+ * Returns the count of "open" tracked items the runner uses for release/investor
+ * gating.
+ *
+ * Source of truth: **BUILD_SPEC + BUILD_SPEC_LEDGER**. The CURSOR_BRIEF.md
+ * checkbox state was historically the signal here, but the brief is regenerated
+ * every cycle from the wizard's spec, so its checkbox `[x]` state never
+ * survives cycle boundaries (operators saw brief_checked 5 → 0 → 5 → 0 forever).
+ * We now read the primary slice's tasks and subtract whatever the ledger has
+ * recorded as closed; falls back to the legacy markdown scan when no spec
+ * exists (e.g. release-only profile without a wizard).
+ */
 async function countOpenTrackedBriefItems(repoPath) {
+    try {
+        const [specRaw, ledgerRaw] = await Promise.all([
+            readFile(join(repoPath, ".foundry", "BUILD_SPEC.json"), "utf8").catch(() => ""),
+            readFile(join(repoPath, ".foundry", "BUILD_SPEC_LEDGER.json"), "utf8").catch(() => ""),
+        ]);
+        if (specRaw) {
+            const spec = JSON.parse(specRaw);
+            const ledger = ledgerRaw ? JSON.parse(ledgerRaw) : { tasks: {} };
+            const tasks = spec.slices?.[0]?.tasks ?? [];
+            const closed = ledger.tasks ?? {};
+            const openTaskCount = tasks.filter((t) => !t.id || !(t.id in closed)).length;
+            return openTaskCount;
+        }
+    }
+    catch {
+        /* fall through to legacy markdown scan */
+    }
     const briefPath = join(repoPath, ".foundry", "CURSOR_BRIEF.md");
     let raw = "";
     try {
@@ -179,7 +218,56 @@ function isNonActionablePacketText(text) {
         /playwright chromium was not installed/.test(t) ||
         /\benospc\b/.test(t));
 }
-async function shouldSkipInvestorPanelStage(repoPath, priorOutputs, projectFoundry) {
+/**
+ * Returns the directives from the last investor pitch that have NOT been
+ * matched against an addressed parent in `BUILD_SPEC_LEDGER`. When this list
+ * is non-empty the runner refuses to re-pitch — investors must only see new
+ * pitches when the last critique was actually addressed in code.
+ *
+ * Implemented inline here (rather than imported from `@foundry/stages`) to
+ * avoid a `core → stages` import cycle.
+ */
+async function unaddressedInvestorDirectivesSinceLastPitch(repoPath) {
+    let state;
+    try {
+        const raw = await readFile(join(repoPath, ".foundry", "INVESTOR_PANEL_STATE.json"), "utf8");
+        state = JSON.parse(raw);
+    }
+    catch {
+        return [];
+    }
+    const dirs = state?.lastDirectives ?? [];
+    if (dirs.length === 0)
+        return [];
+    let ledger;
+    try {
+        const raw = await readFile(join(repoPath, ".foundry", "BUILD_SPEC_LEDGER.json"), "utf8");
+        ledger = JSON.parse(raw);
+    }
+    catch {
+        return [...dirs];
+    }
+    const addressed = Object.values(ledger.addressedParents ?? {}).map((p) => p.text);
+    const norm = (s) => s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+    const matches = (a, b) => {
+        const na = norm(a);
+        const nb = norm(b);
+        if (!na || !nb)
+            return false;
+        if (nb.includes(na.slice(0, 40)) || na.includes(nb.slice(0, 40)))
+            return true;
+        const aw = new Set(na.split(" ").filter((w) => w.length > 4));
+        const bw = new Set(nb.split(" ").filter((w) => w.length > 4));
+        let overlap = 0;
+        for (const w of aw)
+            if (bw.has(w))
+                overlap++;
+        return overlap >= 3 && overlap / Math.max(1, aw.size) >= 0.4;
+    };
+    return dirs.filter((d) => !addressed.some((p) => matches(d, p)));
+}
+async function shouldSkipInvestorPanelStage(repoPath, priorOutputs, projectFoundry, options) {
+    const relaxInvestorGates = parseAutonomousInvestorConvergence(projectFoundry).relaxedInvestorGates;
     const builderRaw = priorOutputs["builder"];
     const builder = BuilderRunnerShape.safeParse(builderRaw);
     const qa = IndependentQaRunnerShape.safeParse(priorOutputs["independent_qa"]);
@@ -203,26 +291,46 @@ async function shouldSkipInvestorPanelStage(repoPath, priorOutputs, projectFound
         }
     }
     // `builder` omitted (e.g. post-Cursor pipeline slice: QA → release → growth → investor) — gate on QA only.
-    if (!qa.success || qa.data.recommendation !== "ship") {
-        return {
-            skip: true,
-            cause: "qa",
-            reason: "Pipeline QA is not yet ship-certified. Investor pitch deferred until QA passes.",
-        };
+    if (!options?.bypassQaGate) {
+        if (!qa.success || qa.data.recommendation !== "ship") {
+            return {
+                skip: true,
+                cause: "qa",
+                reason: "Pipeline QA is not yet ship-certified. Investor pitch deferred until QA passes.",
+            };
+        }
+        const blockers = qa.data.blockers ?? [];
+        if (blockers.length > 0) {
+            return {
+                skip: true,
+                cause: "qa",
+                reason: `Pipeline QA still lists ${blockers.length} blocker(s); investor_panel deferred until smoke/tests are clean.`,
+            };
+        }
     }
-    const blockers = qa.data.blockers ?? [];
-    if (blockers.length > 0) {
+    // DIRECTIVES-ADDRESSED GATE — investors must never re-grade the same critique
+    // without engineering work behind it. Applies even when `relaxInvestorGates`
+    // is on, because the explicit user intent is "do not pitch until previous
+    // feedback is addressed". The check matches each prior directive against
+    // BUILD_SPEC_LEDGER.addressedParents (which the wizard/loop populate as
+    // child tasks close).
+    const unaddressed = await unaddressedInvestorDirectivesSinceLastPitch(repoPath);
+    if (unaddressed.length > 0) {
+        const sample = unaddressed
+            .slice(0, 2)
+            .map((d) => `"${d.slice(0, 90)}${d.length > 90 ? "…" : ""}"`)
+            .join("; ");
         return {
             skip: true,
-            cause: "qa",
-            reason: `Pipeline QA still lists ${blockers.length} blocker(s); investor_panel deferred until smoke/tests are clean.`,
+            cause: "directives_unaddressed",
+            reason: `${unaddressed.length} prior investor directive(s) still unaddressed in BUILD_SPEC_LEDGER (sample: ${sample}). Close child tasks for those parent directives before re-pitching.`,
         };
     }
     // CONVERGENCE GATE — applies by default whenever `convergence_contract` is in the pipeline.
     // Investors must only see the panel when the pitch reflects what is actually built and when
     // every objection raised by a previous round has been resolved or reduced. Anything weaker
     // would let the panel grade aspirational scope instead of the current product+repo state.
-    if (convergenceInPipeline) {
+    if (convergenceInPipeline && !relaxInvestorGates) {
         if (!convergence.success) {
             return {
                 skip: true,
@@ -252,7 +360,8 @@ async function shouldSkipInvestorPanelStage(repoPath, priorOutputs, projectFound
     // contract derived from prior investor input) hasn't actually been built yet. With
     // `convergence_contract` in the pipeline this is enforced by default; without it, opt in
     // via project.yaml `foundry.investor_panel_when_release_ready: true`.
-    const enforceReleaseReadiness = convergenceInPipeline || projectFoundry?.investor_panel_when_release_ready === true;
+    const enforceReleaseReadiness = !relaxInvestorGates &&
+        (convergenceInPipeline || projectFoundry?.investor_panel_when_release_ready === true);
     if (enforceReleaseReadiness) {
         const briefOpen = await countOpenTrackedBriefItems(repoPath);
         if (briefOpen > 0) {
@@ -296,7 +405,8 @@ export async function runPipeline(opts) {
     const { repoPath, pipelineName } = opts;
     const foundryRoot = opts.foundryRoot ?? process.cwd();
     const log = opts.quiet ? quietPipelineLogger() : opts.logger ?? defaultLogger();
-    const config = await loadFoundryConfig(repoPath);
+    let config = await loadFoundryConfig(repoPath);
+    config = withInvestorLoopAutonomousDefaultsIfNeeded(config, Boolean(opts.investorLoopAutonomousDefaults));
     const pipelineDoc = await loadPipelineYaml(foundryRoot, pipelineName);
     const stageNames = opts.stagesOverride?.length ? opts.stagesOverride : pipelineDoc.stages;
     const registry = getStageRegistry();
@@ -372,7 +482,7 @@ export async function runPipeline(opts) {
         const t0 = performance.now();
         try {
             if (stageName === "investor_panel") {
-                const investorGate = await shouldSkipInvestorPanelStage(repoPath, priorOutputs, config.project.foundry);
+                const investorGate = await shouldSkipInvestorPanelStage(repoPath, priorOutputs, config.project.foundry, { bypassQaGate: Boolean(opts.forceInvestorPanelBypassQaGate) });
                 if (investorGate.skip) {
                     const finishedAt = new Date().toISOString();
                     manifest.stages[i] = {
@@ -551,7 +661,7 @@ export async function runPipeline(opts) {
                         // Stop conditions BEFORE starting another round:
                         //   - panel ran AND meets bar → done
                         //   - panel was skipped for a non-retryable reason → don't waste rounds
-                        if (panelHasOutput() && investorPanelMeetsBar(panelOut))
+                        if (panelHasOutput() && investorPanelMeetsBar(panelOut, config.project.foundry))
                             break;
                         const currentSkipCause = manifest.stages[investorIdx]?.status === "skipped"
                             ? manifest.stages[investorIdx]?.skipCause
@@ -604,16 +714,20 @@ export async function runPipeline(opts) {
                         !investorRefinementDeferred &&
                         !refinementGavenUpDueToReleaseReadiness &&
                         panelHasOutput() &&
-                        !investorPanelMeetsBar(panelOut)) {
+                        !investorPanelMeetsBar(panelOut, config.project.foundry)) {
                         const finishedAt = new Date().toISOString();
                         const last = manifest.stages[investorIdx];
+                        const auto = parseAutonomousInvestorConvergence(config.project.foundry);
+                        const barMsg = auto.enabled
+                            ? `configured investor target (mean grade ≥ ${auto.minAverageGrade})`
+                            : "A-band (minimum A-)";
                         manifest.stages[investorIdx] = {
                             stage: "investor_panel",
                             status: "failed",
                             startedAt: last?.startedAt ?? finishedAt,
                             finishedAt,
                             durationMs: last?.durationMs ?? 0,
-                            error: `Investor panel: after ${ir.max_rounds} refinement round(s), grades remain below A-band (minimum A-). See investor_panel/README.md.`,
+                            error: `Investor panel: after ${ir.max_rounds} refinement round(s), grades remain below ${barMsg}. See investor_panel/README.md.`,
                         };
                         await writeRunManifest(outDir, manifest);
                         pipelineFailedEarly = true;

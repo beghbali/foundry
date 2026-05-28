@@ -51,6 +51,14 @@ import {
   type ReleaseAgentBrief,
 } from "./cursorAutomation.js";
 import {
+  evaluateAutoPromoteToMain,
+  isDurableLoopShip,
+  isQaShipClean,
+  logFoundryLoopDiagram,
+  releaseCandidateVerdictForCycle,
+  type DurableShipContext,
+} from "./loopPolicy.js";
+import {
   backfillExpoBuildViews,
   maybeRunApprovedEasBuild,
   maybeSubmitLatestToTestFlight,
@@ -272,48 +280,69 @@ function postCursorStagesForLoop(
   return postCursorPipelineStages(profile, isLastInnerPass);
 }
 
-/** Ship-quality release candidate: QA ship + release_agent green + no blocked release checklist rows. */
-function releaseCandidateVerdict(
-  qa: PipelineIndependentQa | undefined,
-  release: ReleaseAgentBrief | undefined,
-): { yes: boolean; reason: string } {
-  if (!qa || qa.recommendation !== "ship") {
-    return { yes: false, reason: `independent_qa not ship (${qa?.recommendation ?? "missing"})` };
-  }
-  if (Array.isArray(qa.blockers) && qa.blockers.length > 0) {
-    return {
-      yes: false,
-      reason: `independent_qa still lists ${qa.blockers.length} blocker(s) (e.g. Maestro) — not a clean QA gate yet`,
-    };
-  }
-  if (!release) {
-    return { yes: false, reason: "release_agent output missing" };
-  }
-  if (release.status === "blocked_by_qa") {
-    return { yes: false, reason: "release_agent blocked_by_qa" };
-  }
-  if (release.status === "blocked_pre_release") {
-    return { yes: false, reason: "release_agent blocked_pre_release (QA ship; brief/builder/checklist)" };
-  }
-  const blocked = blockedChecklistCount(release);
-  if (blocked > 0) {
-    return { yes: false, reason: `${blocked} blocked row(s) on release checklist` };
-  }
-  if (release.status === "approved" || release.status === "auto_approved" || release.status === "awaiting_approval") {
-    return { yes: true, reason: `release status=${release.status}` };
-  }
-  return { yes: false, reason: `release status=${release.status ?? "?"}` };
-}
-
 function logReleaseCandidateLine(
   qa: PipelineIndependentQa | undefined,
   release: ReleaseAgentBrief | undefined,
+  opts?: { durableShip?: boolean; qaReused?: boolean },
 ): void {
-  const v = releaseCandidateVerdict(qa, release);
+  const v = releaseCandidateVerdictForCycle(qa, release, opts?.durableShip === true);
   if (v.yes) {
     console.log(chalk.green.bold(`\n  RELEASE_CANDIDATE: YES  (${v.reason})`));
   } else {
     console.log(chalk.red.bold(`\n  RELEASE_CANDIDATE: NO  (${v.reason})`));
+  }
+  if (opts?.qaReused) {
+    console.log(
+      chalk.yellow(
+        "  Note: independent_qa output was reused from cache this pass — verify with a fresh `foundry run` if this looks wrong.",
+      ),
+    );
+  }
+}
+
+function formatQaLine(qa: PipelineIndependentQa | undefined): string {
+  if (!qa) return "missing";
+  const blockers = qa.blockers?.length ?? 0;
+  const first =
+    blockers > 0 && qa.blockers?.[0]
+      ? ` · ${truncateForDisplay(qa.blockers[0], 72)}`
+      : "";
+  return `${qa.recommendation ?? "?"} · score=${qa.score ?? "?"} · blockers=${blockers}${first}`;
+}
+
+function logCycleQaSummary(args: {
+  outerQa: PipelineIndependentQa | undefined;
+  endQa: PipelineIndependentQa | undefined;
+  endQaReused: boolean;
+  innerPasses: number;
+  cursorProductFileCount: number;
+  cursorQaArtifactFileCount: number;
+  durableShip: boolean;
+  promoted: boolean;
+  promoteReason?: string;
+  builderBranch?: string;
+}): void {
+  console.log(chalk.bold("\n  Cycle QA summary"));
+  console.log(chalk.gray(`  Outer pipeline:  ${formatQaLine(args.outerQa)}`));
+  console.log(
+    chalk.gray(
+      `  End of cycle:    ${formatQaLine(args.endQa)}${args.endQaReused ? " · independent_qa reused" : ""}`,
+    ),
+  );
+  console.log(
+    chalk.gray(
+      `  Cursor: ${args.innerPasses} inner pass(es) · ${args.cursorProductFileCount} product file(s) · ${args.cursorQaArtifactFileCount} QA-artifact file(s) committed`,
+    ),
+  );
+  console.log(
+    args.durableShip
+      ? chalk.green("  Durable ship:  yes (safe to merge — changes should survive the next outer pipeline)")
+      : chalk.yellow("  Durable ship:  no (post-Cursor green only — will not merge to main)"),
+  );
+  if (args.promoted && args.builderBranch) {
+    console.log(chalk.gray(`  Promoted: ${args.builderBranch} → main → origin (${args.promoteReason ?? "ok"})`));
+  } else if (args.builderBranch?.startsWith("foundry/")) {
+    console.log(chalk.gray(`  Promoted: skipped (${args.promoteReason ?? "QA gate"})`));
   }
 }
 
@@ -3038,6 +3067,9 @@ program
     console.log(chalk.gray(`  No-wait mode: ${noWait ? "on (no sleeps / no approval polling)" : "off"}`));
     console.log(chalk.gray(`  Feedback interval: ${opts.feedbackInterval}m (ignored when --no-wait)`));
     console.log(chalk.gray(`  Max cycles: ${maxCycles || "unlimited"}\n`));
+    const alwaysPromoteToMainBanner =
+      foundryConfig.project.foundry?.always_promote_to_main !== false;
+    logFoundryLoopDiagram(alwaysPromoteToMainBanner);
     if (cursorSettings.enabled) {
       // Warn early about a known footgun: FOUNDRY_CURSOR_AGENT_CMD pinned to
       // a versioned `cursor-agent` binary that does NOT match the PATH one.
@@ -3154,6 +3186,11 @@ program
       let cycleHadShipState = false;
       // Tracks whether an investor_panel actually ran (not skipped) this cycle.
       let cycleProducedInvestorPanel = false;
+      let outerPipelineQa: PipelineIndependentQa | undefined;
+      let cycleInnerPasses = 0;
+      let cycleCursorProductFileCount = 0;
+      let cycleCursorQaArtifactFileCount = 0;
+      let endQaReused = false;
       if (maxCycles > 0 && cycle > maxCycles) {
         console.log(chalk.yellow(`\nReached max cycles (${maxCycles}). Stopping.`));
         break;
@@ -3231,6 +3268,7 @@ program
       let briefCounts = await countCriticalBriefItems(briefPath);
       let briefMetrics = await readBriefMetrics(briefPath);
       let pipelineQa = await readStageJson<PipelineIndependentQa>(repoPath, manifest, "independent_qa");
+      outerPipelineQa = pipelineQa;
       let feedbackOutput = await readStageJson<PipelineFeedbackBrief>(repoPath, manifest, "feedback_agent");
       let builderRemainingBlockers = await readBuilderRemainingBlockers(repoPath);
       let workPacket = await buildWorkPacketForRun({
@@ -3339,9 +3377,10 @@ program
           ];
           console.log(chalk.cyan(`  ${parts.join(" ")}`));
         } else if (implementNowFeedbackCount > 0 && !stabilize) {
+          const qaLabel = isQaShipClean(pipelineQa) ? "QA is ship-clean" : `QA is ${pipelineQa?.recommendation ?? "?"}`;
           console.log(
             chalk.cyan(
-              `  ${implementNowFeedbackCount} feedback item(s) are queued for implementation; continuing Cursor builder even though QA is green.`,
+              `  ${implementNowFeedbackCount} feedback item(s) queued for implementation; continuing Cursor builder (${qaLabel}).`,
             ),
           );
         } else if (pipelineQa?.recommendation === "ship" && activePacketCounts.total > 0) {
@@ -3494,6 +3533,7 @@ program
             break;
           }
           inner++;
+          cycleInnerPasses = inner;
           const prePacketOpen = workPacketOpenCount(workPacket);
           const preQaBlockers = pipelineQa?.blockers?.length ?? 0;
           const briefSamples = sampleOpenPacketItems(workPacket, 14);
@@ -3574,6 +3614,8 @@ program
               (pipelineQa?.manualTasks ?? []).some((t) => /\bmaestro\b/i.test(t));
             const qaRepairRelaxFileRules = stabilize || qaNeedsPremiumCursorBuilder(pipelineQa) || qaHasMaestroBlocker;
             const changedProductFiles = builderRun.changedFiles.filter(isProductFeaturePath);
+            cycleCursorProductFileCount += changedProductFiles.length;
+            cycleCursorQaArtifactFileCount += builderRun.qaArtifactFiles?.length ?? 0;
             if (changedProductFiles.length === 0) {
               const hasTestTouch = builderRun.changedFiles.some(isTestLikePath);
               if (inner >= 2 && hasTestTouch) {
@@ -3816,9 +3858,12 @@ program
               allowInvestorRefinement: false,
               investorLoopAutonomousDefaults: loopProfile === "investor",
               stagesOverride: postStages,
+              disableStageReuse: true,
             });
             rerunSpinner.succeed("Post-Cursor pipeline re-run complete.");
             printManifest(manifest);
+            endQaReused =
+              manifest.stages.find((s) => s.stage === "independent_qa")?.reused === true;
           } catch (err) {
             rerunSpinner.fail(err instanceof Error ? err.message : String(err));
             break;
@@ -3836,7 +3881,14 @@ program
           // Track cycle-level "ever ship" and "investor panel ran" signals
           // so we can backfill an investor pitch at end-of-cycle even if a
           // later inner pass regressed QA.
-          if (pipelineQa?.recommendation === "ship" && (pipelineQa?.blockers?.length ?? 0) === 0) {
+          const durableCtx: DurableShipContext = {
+            outerQa: outerPipelineQa,
+            endQa: pipelineQa,
+            endQaReused,
+            cursorProductFileCount: cycleCursorProductFileCount,
+            cursorQaArtifactFileCount: cycleCursorQaArtifactFileCount,
+          };
+          if (isDurableLoopShip(durableCtx)) {
             cycleHadShipState = true;
           }
           if (investorOutput && manifestStageRan(manifest, "investor_panel")) {
@@ -3870,21 +3922,30 @@ program
           });
           activePacketCounts = packetBriefCounts(workPacket);
 
-          // Stop after a green QA pass when there is no actionable builder work left —
-          // extra inner passes often regress tests with no packet items Cursor can close.
+          // Stop only on durable ship — post-Cursor green without commits does not count.
           if (
             loopProfile === "investor" &&
             actionableWorkPacketOpenCount(workPacket) === 0 &&
             implementNowFeedbackCount === 0 &&
-            pipelineQa?.recommendation === "ship" &&
-            (pipelineQa?.blockers?.length ?? 0) === 0
+            isDurableLoopShip(durableCtx)
           ) {
             console.log(
               chalk.cyan(
-                "\n  QA ship with no actionable work-packet items — stopping inner loop to avoid no-op Cursor passes.",
+                "\n  Durable QA ship with no actionable work-packet items — stopping inner loop.",
               ),
             );
             break;
+          }
+          if (
+            isQaShipClean(pipelineQa) &&
+            !endQaReused &&
+            !isDurableLoopShip(durableCtx)
+          ) {
+            console.log(
+              chalk.yellow(
+                "\n  Post-Cursor QA is ship but not durable (outer pipeline was red and nothing committed) — continuing inner loop if passes remain.",
+              ),
+            );
           }
 
           const postQaBlockers = pipelineQa?.blockers?.length ?? 0;
@@ -4124,11 +4185,16 @@ program
       // QA gate so convergence runs actually move. All other gates (builder
       // status, convergence, directives-unaddressed) still apply, so this
       // never re-pitches stale feedback.
-      if (
-        loopProfile === "investor" &&
-        cycleHadShipState &&
-        !cycleProducedInvestorPanel
-      ) {
+      const endCycleCtx: DurableShipContext = {
+        outerQa: outerPipelineQa,
+        endQa: pipelineQa,
+        endQaReused,
+        cursorProductFileCount: cycleCursorProductFileCount,
+        cursorQaArtifactFileCount: cycleCursorQaArtifactFileCount,
+      };
+      const cycleDurableShip = isDurableLoopShip(endCycleCtx);
+
+      if (loopProfile === "investor" && cycleHadShipState && !cycleProducedInvestorPanel && cycleDurableShip) {
         const ipSpinner = ora(
           "Backfilling investor_panel (QA regressed after cycle reached ship — bypassing QA gate)...",
         ).start();
@@ -4155,23 +4221,64 @@ program
         }
       }
 
-      logReleaseCandidateLine(pipelineQa, releaseOutput);
+      logReleaseCandidateLine(pipelineQa, releaseOutput, {
+        durableShip: cycleDurableShip,
+        qaReused: endQaReused,
+      });
       if (loopProfile === "investor") {
         logInvestorScoreLine(investorOutput);
       }
 
       // Auto-promote builder branch → main → origin (default on; disable via foundry.always_promote_to_main: false).
       const alwaysPromoteToMain = foundryConfig.project.foundry?.always_promote_to_main !== false;
-      const qaShipClean =
-        pipelineQa?.recommendation === "ship" && (pipelineQa?.blockers?.length ?? 0) === 0;
+      let promoteDecision = evaluateAutoPromoteToMain(endCycleCtx);
+      let promotedThisCycle = false;
+
       if (
         alwaysPromoteToMain &&
         builderOutput?.branchName?.startsWith("foundry/") &&
-        (qaShipClean || cycleHadShipState)
+        promoteDecision.ok &&
+        !isQaShipClean(outerPipelineQa)
       ) {
+        const verifySpinner = ora("Pre-promote QA verify (fresh independent_qa on branch)...").start();
+        try {
+          const verifyManifest = await runPipeline({
+            repoPath,
+            pipelineName: opts.pipeline,
+            foundryRoot,
+            quiet: true,
+            allowInvestorRefinement: false,
+            stagesOverride: ["independent_qa"],
+            disableStageReuse: true,
+          });
+          const verifyQa = await readStageJson<PipelineIndependentQa>(
+            repoPath,
+            verifyManifest,
+            "independent_qa",
+          );
+          if (!isQaShipClean(verifyQa)) {
+            promoteDecision = {
+              ok: false,
+              reason: "pre-promote independent_qa verify failed on branch HEAD",
+            };
+            verifySpinner.warn("Pre-promote QA verify failed — skipping merge to main.");
+          } else {
+            verifySpinner.succeed("Pre-promote QA verify passed.");
+          }
+        } catch (err) {
+          promoteDecision = {
+            ok: false,
+            reason: err instanceof Error ? err.message : String(err),
+          };
+          verifySpinner.fail("Pre-promote QA verify errored.");
+        }
+      }
+
+      if (alwaysPromoteToMain && builderOutput?.branchName?.startsWith("foundry/") && promoteDecision.ok) {
         const promoSpinner = ora("Promoting builder branch to main...").start();
         const promotion = await promoteApprovedBranch(repoPath, manifest, builderOutput);
         if (promotion.status === "promoted") {
+          promotedThisCycle = true;
           promoSpinner.succeed(`Release branch promotion: ${promotion.detail}`);
         } else if (promotion.status === "skipped") {
           promoSpinner.warn(`Release branch promotion skipped: ${promotion.detail}`);
@@ -4179,18 +4286,22 @@ program
           promoSpinner.fail(`Release branch promotion failed: ${promotion.detail}`);
         }
         if (promotion.logPath) console.log(chalk.gray(`  Promotion log: ${promotion.logPath}`));
-      } else if (
-        alwaysPromoteToMain &&
-        builderOutput?.branchName?.startsWith("foundry/") &&
-        !qaShipClean &&
-        !cycleHadShipState
-      ) {
-        console.log(
-          chalk.gray(
-            "  Skipping auto-promote: QA did not reach ship this cycle (foundry.always_promote_to_main requires a ship state before merging to main).",
-          ),
-        );
+      } else if (alwaysPromoteToMain && builderOutput?.branchName?.startsWith("foundry/")) {
+        console.log(chalk.gray(`  Skipping auto-promote: ${promoteDecision.reason}.`));
       }
+
+      logCycleQaSummary({
+        outerQa: outerPipelineQa,
+        endQa: pipelineQa,
+        endQaReused,
+        innerPasses: cycleInnerPasses,
+        cursorProductFileCount: cycleCursorProductFileCount,
+        cursorQaArtifactFileCount: cycleCursorQaArtifactFileCount,
+        durableShip: cycleDurableShip,
+        promoted: promotedThisCycle,
+        promoteReason: promoteDecision.reason,
+        builderBranch: builderOutput?.branchName,
+      });
 
       investorOutput = await readStageJson<InvestorPanelBrief>(repoPath, manifest, "investor_panel");
       const contractAtRelease = await readContractConvergenceGate(repoPath);

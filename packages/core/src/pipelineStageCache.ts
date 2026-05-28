@@ -13,11 +13,11 @@ const GENERATED_FOUNDRY_PATHS = new Set([
   ".foundry/APPROVAL_REQUIRED.md",
   ".foundry/feedback-ledger.json",
   ".foundry/LATEST_INSTALL.md",
-  ".foundry/CURSOR_BRIEF.md",
+  // CURSOR_BRIEF / WORK_PACKET are regenerated each pipeline run and are
+  // asserted by independent_qa tests — excluding them from the repo fingerprint
+  // caused stale `ship` QA cache hits after brief/packet drift (loop yo-yo).
   ".foundry/CURSOR_BUILDER_REPORT.md",
   ".foundry/CURSOR_QA_REPORT.md",
-  ".foundry/WORK_PACKET.json",
-  ".foundry/WORK_PACKET.md",
 ]);
 const GENERATED_FOUNDRY_PREFIXES = [
   ".foundry/out/",

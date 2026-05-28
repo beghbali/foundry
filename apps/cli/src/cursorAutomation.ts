@@ -39,6 +39,8 @@ export interface CursorAgentRunResult {
   promptPath: string;
   logPath: string;
   changedFiles: string[];
+  /** Committed `.foundry/` paths that gate tests (WORK_PACKET, CURSOR_BRIEF, etc.). */
+  qaArtifactFiles: string[];
   hadCodeChanges: boolean;
   /** LOC + file accounting for the commit Cursor just landed. */
   diffStats?: FileDiffStat[];
@@ -1137,6 +1139,83 @@ function isGeneratedFoundryPath(path: string): boolean {
   return GENERATED_FOUNDRY_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
 
+/** Paths that gate `independent_qa` / repo tests — must be committed when Cursor fixes them. */
+const QA_GATING_FOUNDRY_COMMIT_PATHS = new Set([
+  ".foundry/WORK_PACKET.json",
+  ".foundry/WORK_PACKET.md",
+  ".foundry/CURSOR_BRIEF.md",
+  ".foundry/BUILD_SPEC.json",
+  ".foundry/BUILD_SPEC.md",
+]);
+
+function isQaGatingFoundryPath(path: string): boolean {
+  return QA_GATING_FOUNDRY_COMMIT_PATHS.has(path);
+}
+
+/**
+ * Commit QA-gating Foundry artifacts that are normally excluded from product
+ * auto-commit. Without this, Cursor can close WORK_PACKET on disk, post-Cursor
+ * QA passes, but promotion merges a branch that still fails the next outer run.
+ */
+export async function commitQaGatingFoundryArtifacts(
+  repoPath: string,
+  runId: string,
+): Promise<{ files: string[]; pushWarning?: string }> {
+  const branch = await currentGitBranch(repoPath);
+  if (!branch) return { files: [] };
+
+  const status = await exec("git status --porcelain=1", repoPath, 15_000);
+  if (status.exitCode !== 0) return { files: [] };
+
+  const paths = status.stdout
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .map((line) => extractPorcelainPath(line))
+    .filter((p): p is string => Boolean(p))
+    .filter((path) => isQaGatingFoundryPath(path));
+
+  if (paths.length === 0) return { files: [] };
+
+  const { stage, skipped } = await filterStageableGitPaths(repoPath, paths);
+  if (stage.length === 0) return { files: [] };
+
+  const add = await exec(
+    `git add -A -- ${stage.map((file) => shellQuote(file)).join(" ")}`,
+    repoPath,
+    30_000,
+  );
+  if (add.exitCode !== 0) {
+    throw new Error(`Could not stage QA-gating Foundry artifacts.\n${add.stderr || add.stdout}`.trim());
+  }
+
+  const subject = `foundry(qa-sync): ${stage.length} file(s) — ${runId}`;
+  const body = [
+    "Auto-commit QA-gating Foundry artifacts after Cursor (WORK_PACKET / brief / BUILD_SPEC).",
+    "",
+    ...stage.map((f) => `- ${f}`),
+  ].join("\n");
+  const commit = await exec(
+    `git commit -m ${shellQuote(subject)} -m ${shellQuote(body)}`,
+    repoPath,
+    60_000,
+  );
+  if (commit.exitCode !== 0) {
+    throw new Error(
+      `QA-gating Foundry artifacts were modified but could not be committed.\n${commit.stderr || commit.stdout}`.trim(),
+    );
+  }
+
+  const pushResult = await pushWithUpstreamRecovery(repoPath, branch);
+  const pushWarning = !pushResult.ok
+    ? `Committed QA artifacts on '${branch}' but could not push: ${pushResult.detail}`
+    : skipped.length > 0
+      ? `Ignored unstageable QA paths: ${skipped.join(", ")}`
+      : undefined;
+
+  return { files: stage, pushWarning };
+}
+
 /**
  * `git status --porcelain` can occasionally list paths that are not stageable (race, bad rename parse, or agent junk).
  * Skip paths that are neither on disk nor tracked (so we cannot stage content or a deletion).
@@ -1720,7 +1799,36 @@ async function runCursorAgent(
     promptPath,
     logPath,
     changedFiles: [],
+    qaArtifactFiles: [],
     hadCodeChanges: false,
+  };
+}
+
+async function finalizeBuilderAgentResult(
+  repoPath: string,
+  runId: string,
+  base: CursorAgentRunResult,
+  productFiles: string[],
+  opts?: {
+    statusHint?: string;
+    implementationRetryUsed?: boolean;
+    pushWarning?: string;
+  },
+): Promise<CursorAgentRunResult> {
+  const qaSync = await commitQaGatingFoundryArtifacts(repoPath, runId);
+  const pushWarning = [opts?.pushWarning, qaSync.pushWarning].filter(Boolean).join("\n") || undefined;
+  const diffStats = productFiles.length > 0 ? await readDiffStatsForHead(repoPath) : [];
+  return {
+    ...base,
+    changedFiles: productFiles,
+    qaArtifactFiles: qaSync.files,
+    hadCodeChanges: productFiles.length > 0 || qaSync.files.length > 0,
+    diffStats,
+    totalLocAdded: diffStats.reduce((s, x) => s + x.added, 0),
+    totalLocRemoved: diffStats.reduce((s, x) => s + x.removed, 0),
+    statusHint: opts?.statusHint,
+    implementationRetryUsed: opts?.implementationRetryUsed,
+    pushWarning,
   };
 }
 
@@ -1743,6 +1851,7 @@ export async function runBuilderAgent(
       promptPath: "",
       logPath: join(repoPath, ".foundry", "automation", manifest.runId, "builder.log"),
       changedFiles: [],
+      qaArtifactFiles: [],
       hadCodeChanges: false,
     };
   }
@@ -1767,16 +1876,9 @@ export async function runBuilderAgent(
     let commitOutcome = await autoCommitCursorBuilderChanges(repoPath, manifest.runId);
     let pushWarning = commitOutcome.pushWarning;
     if (commitOutcome.files.length > 0) {
-      const diffStats = await readDiffStatsForHead(repoPath);
-      return {
-        ...result,
-        changedFiles: commitOutcome.files,
-        hadCodeChanges: true,
-        diffStats,
-        totalLocAdded: diffStats.reduce((s, x) => s + x.added, 0),
-        totalLocRemoved: diffStats.reduce((s, x) => s + x.removed, 0),
+      return finalizeBuilderAgentResult(repoPath, manifest.runId, result, commitOutcome.files, {
         pushWarning,
-      };
+      });
     }
 
     const classifiedFirst = await classifyPorcelainPaths(repoPath);
@@ -1796,6 +1898,7 @@ export async function runBuilderAgent(
       return {
         ...result,
         changedFiles: [],
+        qaArtifactFiles: [],
         hadCodeChanges: false,
         statusHint,
         implementationRetryUsed,
@@ -1812,18 +1915,11 @@ export async function runBuilderAgent(
       statusHint = undefined;
     }
 
-    const diffStats = changedFiles.length > 0 ? await readDiffStatsForHead(repoPath) : [];
-    return {
-      ...result,
-      changedFiles,
-      hadCodeChanges: changedFiles.length > 0,
-      diffStats,
-      totalLocAdded: diffStats.reduce((s, x) => s + x.added, 0),
-      totalLocRemoved: diffStats.reduce((s, x) => s + x.removed, 0),
+    return finalizeBuilderAgentResult(repoPath, manifest.runId, result, changedFiles, {
       statusHint,
       implementationRetryUsed,
       pushWarning,
-    };
+    });
   } catch (err) {
     return {
       ...result,
@@ -1831,6 +1927,7 @@ export async function runBuilderAgent(
       exitCode: 1,
       stderr: [result.stderr, err instanceof Error ? err.message : String(err)].filter(Boolean).join("\n\n"),
       changedFiles: [],
+      qaArtifactFiles: [],
       hadCodeChanges: false,
       statusHint,
       implementationRetryUsed,

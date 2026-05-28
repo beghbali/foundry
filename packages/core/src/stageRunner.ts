@@ -69,6 +69,8 @@ export interface RunPipelineOptions {
    * directives.
    */
   forceInvestorPanelBypassQaGate?: boolean;
+  /** When true, never reuse cached builder/independent_qa outputs (loop post-Cursor QA). */
+  disableStageReuse?: boolean;
 }
 
 function defaultLogger(): Logger {
@@ -687,7 +689,10 @@ export async function runPipeline(opts: RunPipelineOptions): Promise<RunManifest
       let durationMs = 0;
       let reused = false;
 
-      if (isStageReuseEnabled() && reuseStageNames.has(stageName)) {
+      const stageReuseAllowed =
+        isStageReuseEnabled() && !opts.disableStageReuse && reuseStageNames.has(stageName);
+
+      if (stageReuseAllowed) {
         repoFingerprintPromise ??= computeRepoFingerprint(repoPath);
         const repoFp = await repoFingerprintPromise;
         const inputFp = fingerprintStageInput(repoFp, input);
@@ -707,7 +712,7 @@ export async function runPipeline(opts: RunPipelineOptions): Promise<RunManifest
         const rawOutput = await stage.run(ctx, input);
         output = stage.outputSchema.parse(rawOutput);
         durationMs = Math.round(performance.now() - t0);
-        if (isStageReuseEnabled() && reuseStageNames.has(stageName)) {
+        if (stageReuseAllowed) {
           repoFingerprintPromise ??= computeRepoFingerprint(repoPath);
           const repoFp = await repoFingerprintPromise;
           const inputFp = fingerprintStageInput(repoFp, input);

@@ -4,6 +4,34 @@ import { access, appendFile, mkdir, readFile, writeFile } from "node:fs/promises
 import { join } from "node:path";
 import chalk from "chalk";
 import { readLatestArtifact } from "@foundry/core";
+import { stripBriefIdComment } from "@foundry/core/briefIntent";
+export async function readDiffStatsForHead(repoPath) {
+    const result = await exec("git show --numstat --pretty=format: HEAD", repoPath, 15_000);
+    if (result.exitCode !== 0)
+        return [];
+    return result.stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && /^[0-9-]+\s+[0-9-]+\s+/.test(line))
+        .map((line) => {
+        const [addedRaw, removedRaw, ...fileParts] = line.split(/\s+/);
+        const added = addedRaw === "-" ? 0 : Number.parseInt(addedRaw ?? "0", 10) || 0;
+        const removed = removedRaw === "-" ? 0 : Number.parseInt(removedRaw ?? "0", 10) || 0;
+        return { file: fileParts.join(" "), added, removed };
+    });
+}
+export function summarizeDiffStats(stats) {
+    if (stats.length === 0)
+        return "no diff";
+    const totalAdded = stats.reduce((s, x) => s + x.added, 0);
+    const totalRemoved = stats.reduce((s, x) => s + x.removed, 0);
+    const top = [...stats]
+        .sort((a, b) => b.added + b.removed - (a.added + a.removed))
+        .slice(0, 4)
+        .map((s) => `${s.file} (+${s.added}/-${s.removed})`)
+        .join(", ");
+    return `${stats.length} file(s), +${totalAdded}/-${totalRemoved} LOC · Top: ${top}`;
+}
 export async function readBuilderRemainingBlockers(repoPath) {
     const path = join(repoPath, ".foundry", "CURSOR_BUILDER_REPORT.md");
     try {
@@ -201,7 +229,7 @@ export function shouldUseNearReleaseEconomyBuilder(releaseStatus, pipelineQaReco
         return false;
     return releaseStatus === "awaiting_approval";
 }
-export function chooseBuilderModel(settings, briefCounts, pipelineQa, stalledIterations, innerLoopIndex, feedbackImplementQueued, releaseStatus) {
+export function chooseBuilderModel(settings, briefCounts, pipelineQa, stalledIterations, innerLoopIndex, feedbackImplementQueued, releaseStatus, investorBelowTarget = false) {
     const primary = settings.builderModel;
     const fast = settings.builderFastModel;
     const economy = settings.builderEconomyModel;
@@ -217,6 +245,7 @@ export function chooseBuilderModel(settings, briefCounts, pipelineQa, stalledIte
         };
     }
     if (settings.useBuilderEconomyNearRelease &&
+        !investorBelowTarget &&
         shouldUseNearReleaseEconomyBuilder(releaseStatus, pipelineQaRecommendation, pipelineQaCodeBlockerCount, feedbackImplementQueued)) {
         return {
             model: economy,
@@ -254,6 +283,24 @@ export async function readStageJson(repoPath, manifest, stageName) {
     catch {
         return undefined;
     }
+}
+/**
+ * True iff the named stage executed in this manifest (status `ok` / `warn`),
+ * vs being skipped by a gate (e.g. investor_panel deferred behind QA). Caller
+ * uses this to distinguish "investor_panel ran and produced grades" from
+ * "investor_panel was deferred" without re-reading the manifest itself.
+ */
+export function manifestStageRan(manifest, stageName) {
+    if (!manifest)
+        return false;
+    const stage = manifest.stages.find((s) => s.stage === stageName);
+    if (!stage)
+        return false;
+    // "Ran" = produced an output (not skipped by a gate). `passed` is the
+    // expected success state; we deliberately exclude `failed` because failed
+    // stages don't produce a usable output.json (the loop tracks "investor
+    // panel actually generated grades", not "investor panel was attempted").
+    return stage.status === "passed";
 }
 /** Console summary: pipeline `independent_qa` + `release_agent` (single QA/ship picture). */
 export async function logShipGateConsole(repoPath, manifest, cached) {
@@ -396,11 +443,17 @@ export async function logShipGateConsole(repoPath, manifest, cached) {
         // The unit that gets presented to investors is a converged + released app.
         // Tell the user the *one* command that loops to that state instead of
         // re-running `foundry run` by hand.
+        if (investorStage.skipCause === "directives_unaddressed") {
+            console.log(chalk.yellow("  │   The pitch is deliberately held until BUILD_SPEC_LEDGER.addressedParents covers each prior directive. " +
+                "Inspect .foundry/INVESTOR_PANEL_STATE.json (`lastDirectives`) and .foundry/BUILD_SPEC_LEDGER.json (`addressedParents`)."));
+        }
         const nextCmd = investorStage.skipCause === "release_readiness"
             ? "foundry loop --cursor-auto --profile investor"
             : investorStage.skipCause === "convergence"
                 ? "foundry loop --cursor-auto --profile investor   # iterates: builds → QA → release → re-pitches"
-                : "foundry loop --cursor-auto --profile investor";
+                : investorStage.skipCause === "directives_unaddressed"
+                    ? "foundry loop --cursor-auto --profile investor   # closes child tasks of unaddressed parent directives"
+                    : "foundry loop --cursor-auto --profile investor";
         console.log(chalk.cyan(`  │   ▶ next: ${nextCmd}`));
     }
     console.log(chalk.bold.dim("  ╯"));
@@ -577,6 +630,25 @@ export async function countCriticalBriefItems(briefPath) {
         runtime: 0,
         total: 0,
     };
+    // Prefer BUILD_SPEC_LEDGER as the source of truth: the brief markdown's
+    // checkbox state never persists across cycles (the wizard regenerates it),
+    // so deriving counts from the ledger keeps "remaining work" stable across
+    // cycles. The brief is still consulted for `runtime`/`should`/legacy
+    // sections that the wizard doesn't cover.
+    const foundryDir = briefPath.replace(/\/[^/]+$/, "");
+    try {
+        const specRaw = await readFile(`${foundryDir}/BUILD_SPEC.json`, "utf8");
+        const ledgerRaw = await readFile(`${foundryDir}/BUILD_SPEC_LEDGER.json`, "utf8").catch(() => "");
+        const spec = JSON.parse(specRaw);
+        const ledger = ledgerRaw ? JSON.parse(ledgerRaw) : { tasks: {} };
+        const tasks = spec.slices?.[0]?.tasks ?? [];
+        const closed = ledger.tasks ?? {};
+        counts.mustShip = tasks.filter((t) => !t.id || !(t.id in closed)).length;
+        counts.total = counts.mustShip;
+    }
+    catch {
+        /* fall through to legacy markdown scan when no spec exists */
+    }
     let raw = "";
     try {
         raw = await readFile(briefPath, "utf8");
@@ -585,6 +657,11 @@ export async function countCriticalBriefItems(briefPath) {
         return counts;
     }
     let section = "other";
+    // Markdown scan: skip "must" when we already derived it from BUILD_SPEC_LEDGER
+    // (counts.mustShip > 0 means the ledger sourced it). Always count
+    // should/gaps/monetization/edge/runtime from the brief — these sections aren't
+    // owned by the wizard.
+    const wizardSourcedMust = counts.mustShip > 0 || counts.total > 0;
     for (const line of raw.split("\n")) {
         const trimmed = line.trim();
         if (trimmed === "### Must Ship (Phase 1)")
@@ -603,7 +680,7 @@ export async function countCriticalBriefItems(briefPath) {
             section = "other";
         if (!trimmed.startsWith("- [ ]"))
             continue;
-        if (section === "must")
+        if (section === "must" && !wizardSourcedMust)
             counts.mustShip++;
         if (section === "should")
             counts.shouldShip++;
@@ -685,7 +762,7 @@ export async function sampleUncheckedBriefLines(briefPath, maxTotal, maxLineLen 
             continue;
         if (section === "other")
             continue;
-        const item = trimmed.slice("- [ ]".length).trim();
+        const item = stripBriefIdComment(trimmed.slice("- [ ]".length).trim());
         if (!item)
             continue;
         const label = briefSectionLabel(section);
@@ -713,6 +790,21 @@ export function formatIterationFocusMarkdown(params) {
         for (const b of params.pipelineQa.blockers)
             lines.push(`- ${b}`);
         lines.push("");
+    }
+    // When tests failed, paste the *tail* of the test runner output (where most
+    // assertion text lives) so Cursor has the actual stack traces to grep/fix
+    // without re-running the suite. Tail (not head) because compilers/runners
+    // tend to emit progress lines first and the actual error context last.
+    if (params.pipelineQa?.testsRan &&
+        params.pipelineQa?.testsPassed === false &&
+        params.pipelineQa?.testSummary?.trim()) {
+        const summary = params.pipelineQa.testSummary;
+        const TAIL_BYTES = 2400;
+        const tail = summary.length > TAIL_BYTES ? summary.slice(summary.length - TAIL_BYTES) : summary;
+        lines.push("### Failing-test output (tail of test runner stdout/stderr)", "");
+        lines.push("```");
+        lines.push(tail);
+        lines.push("```", "");
     }
     if (params.pipelineQa?.warnings?.length) {
         lines.push("### Warnings", "");
@@ -767,6 +859,10 @@ const GENERATED_FOUNDRY_PATHS = new Set([
     ".foundry/WORK_PACKET.json",
     ".foundry/WORK_PACKET.md",
     ".foundry/OPEN_TRACKED_BRIEF.md",
+    ".foundry/BUILD_SPEC.json",
+    ".foundry/BUILD_SPEC.md",
+    ".foundry/BUILD_SPEC_LEDGER.json",
+    ".foundry/INVESTOR_PANEL_STATE.json",
 ]);
 const GENERATED_FOUNDRY_PREFIXES = [
     ".foundry/out/",
@@ -775,6 +871,8 @@ const GENERATED_FOUNDRY_PREFIXES = [
     ".foundry/approvals/",
     /** Agent/typo variant of `approvals/` — never treat as product code. */
     ".foundry/approval/",
+    /** Pre-Cursor snapshots of BUILD_SPEC / BUILD_SPEC_LEDGER (loop-internal). */
+    ".foundry/.pre-cursor-snapshots/",
     /**
      * Maestro `--debug-output` artifacts (logs, commands JSON, screenshots). `--flatten-debug-output`
      * can emit odd path segments; git may list entries that are not on disk. Never auto-commit as product code.
@@ -1048,7 +1146,13 @@ function transportWatchdogGraceMs() {
     }
     return 120_000;
 }
-function isLikelyCursorTransportFailure(text) {
+/**
+ * Heuristic: did the Cursor agent die because of transport/network issues
+ * (rather than producing a real error response)? Used by the inner-loop driver
+ * to short-circuit additional outer cycles when consecutive runs hit network
+ * stalls — those subsequent cycles burn quota for no productive output.
+ */
+export function isLikelyCursorTransportFailure(text) {
     if (!text)
         return false;
     return /reconnect-only output|\[transport-watchdog\]|Connection lost,?\s*reconnecting|network error.*reconnect/i.test(text);
@@ -1146,10 +1250,13 @@ function buildBuilderPrompt(repoPath, manifest, options) {
     const base = [
         "You are the dedicated Cursor builder agent for this repository.",
         "",
-        "Scope: the **unit of work** is the entire **active work packet** (`.foundry/WORK_PACKET.md`) plus the full **product brief** (`.foundry/CURSOR_BRIEF.md`) and pipeline artifacts below. You are expected to drive **all open packet items** toward done in this pass when feasible — not a single subsection in isolation.",
+        "Scope: implement the **primary slice** from `.foundry/BUILD_SPEC.md` (if present) via the active work packet (`.foundry/WORK_PACKET.md`). When BUILD_SPEC exists, do **not** widen beyond that slice or deferred items.",
         "",
         "Read these files first:",
         `- ${join(repoPath, ".foundry", "project.yaml")}`,
+        `- ${join(repoPath, ".foundry", "BUILD_SPEC.md")} (canonical slice spec — read ONLY; never write/edit this file)`,
+        `- ${join(repoPath, ".foundry", "BUILD_SPEC.json")} (machine-readable spec — read ONLY; never write/edit this file)`,
+        `- ${join(repoPath, ".foundry", "BUILD_SPEC_LEDGER.json")} (already-completed task IDs — READ ONLY; do NOT modify, do NOT delete, do NOT 'clean up'. Foundry restores it from snapshot after every pass if you touch it, but you waste a cycle.)`,
         `- ${join(repoPath, ".foundry", "WORK_PACKET.md")} (frozen scope for this cycle; highest priority)`,
         ...(iterationFocusPath
             ? [
@@ -1167,18 +1274,22 @@ function buildBuilderPrompt(repoPath, manifest, options) {
         `- ${stagePath(repoPath, manifest, "feedback_agent")}`,
         "",
         "Then do all of the following autonomously:",
-        "1. Read the latest `feedback_agent` output and `.foundry/feedback-ledger.json`; only act on feedback items that are still open and marked `shouldImplement: true`.",
-        "2. For each active work-packet item, write or update a focused test first when the repo has a natural place for that test.",
-        "3. Then implement the feature code needed to make that test pass.",
-        "4. Close every still-open item in `.foundry/WORK_PACKET.md` before touching deferred backlog work.",
-        "5. Address **pipeline QA blockers** from `independent_qa/output.json` when they map to active work-packet items or current release blockers.",
-        "6. Use `.foundry/CURSOR_BRIEF.md` as supporting context, but do not widen scope beyond the active work packet while packet items remain open.",
-        "7. Prefer modifying existing files over creating new ones.",
-        "8. Run the relevant validation commands for the repo after your changes.",
-        "9. Only mark an item complete if product code and tests changed or you verified the implementation already exists in code and documented that evidence.",
-        "10. Update `.foundry/CURSOR_BRIEF.md` by changing completed checklist items from `- [ ]` to `- [x]` only when fully implemented in product code (not before).",
-        "11. For feedback items you fixed, update `.foundry/feedback-ledger.json` to set `status: \"resolved\"` and add concise verification to `implementationNote`; leave unrelated/open items untouched.",
-        "12. Write `.foundry/CURSOR_BUILDER_REPORT.md` with these sections:",
+        "1. If `.foundry/BUILD_SPEC.md` exists, treat its **primary slice** as the only feature scope for this pass.",
+        "   - For each concrete task, you MUST edit EVERY file listed in `task.files[]` (otherwise the task ledger will not close).",
+        "   - Cover the full task list (3-4 tasks); do not stop after one. The ledger marks a task done only when its full `files[]` set is touched.",
+        "   - When `BUILD_SPEC_LEDGER.json` lists a task as completed, skip re-editing those files unless QA requires it.",
+        "2. Read the latest `feedback_agent` output and `.foundry/feedback-ledger.json`; only act on feedback items that are still open and marked `shouldImplement: true`.",
+        "3. For each active work-packet item, write or update a focused test first when the repo has a natural place for that test.",
+        "4. Then implement the feature code needed to make that test pass.",
+        "5. Close every still-open item in `.foundry/WORK_PACKET.md` before touching deferred backlog work.",
+        "6. Address **pipeline QA blockers** from `independent_qa/output.json` when they map to active work-packet items or the current primary slice.",
+        "7. Use `.foundry/CURSOR_BRIEF.md` as supporting context aligned with BUILD_SPEC; do not widen scope beyond the primary slice while packet items remain open.",
+        "8. Prefer modifying existing files over creating new ones.",
+        "9. Run the relevant validation commands for the repo after your changes.",
+        "10. Only mark an item complete if product code and tests changed or you verified the implementation already exists in code and documented that evidence.",
+        "11. Update `.foundry/CURSOR_BRIEF.md` by changing completed checklist items from `- [ ]` to `- [x]` only when fully implemented in product code (not before).",
+        "12. For feedback items you fixed, update `.foundry/feedback-ledger.json` to set `status: \"resolved\"` and add concise verification to `implementationNote`; leave unrelated/open items untouched.",
+        "13. Write `.foundry/CURSOR_BUILDER_REPORT.md` with these sections:",
         "   - `## Implemented`",
         "   - `## QA Blockers Fixed`",
         "   - `## Files Changed`",
@@ -1191,9 +1302,9 @@ function buildBuilderPrompt(repoPath, manifest, options) {
         "Important constraints:",
         "- Do not ask for human input.",
         "- Do not stop at planning; write code.",
+        "- When BUILD_SPEC exists, implement **one primary slice** only — ignore deferred items and template must-ship churn.",
         "- Do not widen scope beyond `.foundry/WORK_PACKET.md` while it has open items.",
-        "- This loop is in one-shot delivery mode: implement a broad slice in one pass (not tiny edits). Aim to close most/all open packet items in this pass.",
-        "- Prefer substantial product surface changes (multiple screens/hooks/services plus tests), not isolated single-file tweaks.",
+        "- Deliver a focused vertical slice (screens/hooks/services + tests) for the primary BUILD_SPEC acceptance criteria.",
         "- You MUST change at least one file outside `.foundry/` (e.g. under `apps/`, `packages/`, `supabase/`, or the repo's primary app source). Updating only `.foundry/CURSOR_BRIEF.md`, `CURSOR_BUILDER_REPORT.md`, or other generated Foundry metadata is NOT sufficient implementation.",
         "- If you make no non-generated code changes for the active packet, treat the pass as failed and explain why.",
         "- If something is impossible, document it in `CURSOR_BUILDER_REPORT.md` under `Remaining Blockers`.",
@@ -1308,10 +1419,14 @@ export async function runBuilderAgent(repoPath, manifest, settings, modelOverrid
         let commitOutcome = await autoCommitCursorBuilderChanges(repoPath, manifest.runId);
         let pushWarning = commitOutcome.pushWarning;
         if (commitOutcome.files.length > 0) {
+            const diffStats = await readDiffStatsForHead(repoPath);
             return {
                 ...result,
                 changedFiles: commitOutcome.files,
                 hadCodeChanges: true,
+                diffStats,
+                totalLocAdded: diffStats.reduce((s, x) => s + x.added, 0),
+                totalLocRemoved: diffStats.reduce((s, x) => s + x.removed, 0),
                 pushWarning,
             };
         }
@@ -1338,10 +1453,14 @@ export async function runBuilderAgent(repoPath, manifest, settings, modelOverrid
         else {
             statusHint = undefined;
         }
+        const diffStats = changedFiles.length > 0 ? await readDiffStatsForHead(repoPath) : [];
         return {
             ...result,
             changedFiles,
             hadCodeChanges: changedFiles.length > 0,
+            diffStats,
+            totalLocAdded: diffStats.reduce((s, x) => s + x.added, 0),
+            totalLocRemoved: diffStats.reduce((s, x) => s + x.removed, 0),
             statusHint,
             implementationRetryUsed,
             pushWarning,
@@ -1373,13 +1492,24 @@ export function shouldRunCursorAutomation(releaseStatus, briefCounts, pipelineQa
     const hasActionableBriefWork = briefCounts.total > 0;
     const feedbackCount = opts?.stabilize ? 0 : implementNowFeedbackCount;
     const hasQueuedImplementationWork = feedbackCount > 0;
+    const deferAutonomousRelease = Boolean(opts?.autonomousDeferRelease &&
+        (opts?.investorTargetMet === false || opts?.contractConvergenceMet === false));
     if (releaseStatus === "approved" || releaseStatus === "auto_approved")
         return false;
-    if (releaseStatus === "awaiting_approval" && !hasActionableBriefWork && !hasQueuedImplementationWork)
+    if (releaseStatus === "awaiting_approval" &&
+        !hasActionableBriefWork &&
+        !hasQueuedImplementationWork &&
+        !deferAutonomousRelease) {
         return false;
-    // Pipeline QA already green — skip Cursor only when there is no remaining implementation work.
-    if (pipelineQaRecommendation === "ship" && !hasActionableBriefWork && !hasQueuedImplementationWork)
+    }
+    // Pipeline QA already green — skip Cursor only when there is no remaining implementation work
+    // (unless we are deferring release until investor convergence).
+    if (pipelineQaRecommendation === "ship" &&
+        !hasActionableBriefWork &&
+        !hasQueuedImplementationWork &&
+        !deferAutonomousRelease) {
         return false;
+    }
     return (hasActionableBriefWork ||
         hasQueuedImplementationWork ||
         pipelineQaRecommendation !== "ship" ||
@@ -1400,6 +1530,11 @@ export async function preflightCursorCommand(command, cwd) {
     }
     const authResult = await execFilePreflight(shell, ["-lc", shellBootstrapCommand(`${command} status`)], cwd);
     const combined = `${authResult.stdout}\n${authResult.stderr}`;
+    // Strip ANSI escape sequences from the output before pattern matching.
+    // Some older cursor-agent versions emit clear-line/cursor-move codes around
+    // the status banner (e.g. "\x1b[2K\x1b[G Starting login process...") which
+    // can break negative regex checks even when the binary is authenticated.
+    const stripped = combined.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").trim();
     if (/Cannot find module '@anysphere\/file-service/i.test(combined)) {
         return {
             ok: false,
@@ -1408,13 +1543,42 @@ export async function preflightCursorCommand(command, cwd) {
                 `Reinstall/update the Cursor desktop app (which bundles the CLI), or point 'cursor_automation.command' / FOUNDRY_CURSOR_AGENT_CMD to a working \`agent\` binary.`,
         };
     }
-    if (authResult.exitCode !== 0 ||
-        /authentication required|not logged in|login required|sign in/i.test(combined)) {
-        return {
-            ok: false,
-            detail: `Cursor command '${command}' is available, but not authenticated. ` +
-                `Run '${command} login' in your shell first, or set CURSOR_API_KEY in the environment used by Foundry.`,
-        };
+    // POSITIVE signal takes priority. If the binary clearly says "✓ Logged in",
+    // "Logged in as", or "authenticated as" and exited cleanly, trust it — even
+    // if other parts of the output mention "login" or "Sign in" as a banner.
+    const positiveAuth = authResult.exitCode === 0 &&
+        /(?:^|\s)(?:✓\s*)?Logged in(?: as |[!.\s])/i.test(stripped);
+    if (positiveAuth) {
+        return { ok: true, detail: `Cursor command '${command}' is available and authenticated.` };
+    }
+    // Otherwise: explicit unauthenticated phrases or non-zero exit ⇒ not authed.
+    const explicitlyUnauthed = /authentication required|not logged in|login required|please (?:log ?in|sign ?in)|run [`'"]?cursor-agent login/i.test(stripped);
+    if (authResult.exitCode !== 0 || explicitlyUnauthed) {
+        const lines = [
+            `Cursor command '${command}' is available, but not authenticated.`,
+            `Run '${command} login' in your shell first, or set CURSOR_API_KEY in the environment used by Foundry.`,
+        ];
+        // Most common failure mode: FOUNDRY_CURSOR_AGENT_CMD env var pins Foundry
+        // to a stale `cursor-agent` versioned path while the user ran `cursor-agent
+        // login` against a different (PATH-resolved) version. Surface this hint
+        // up front so they don't waste time re-running `login`.
+        const envCmd = process.env.FOUNDRY_CURSOR_AGENT_CMD?.trim();
+        if (envCmd && envCmd === command && /\/cursor-agent\/versions\//.test(envCmd)) {
+            lines.push("");
+            lines.push("HINT: Foundry is using FOUNDRY_CURSOR_AGENT_CMD pinned to a versioned cursor-agent binary:");
+            lines.push(`  ${envCmd}`);
+            lines.push("If you logged in via `cursor-agent` (PATH-resolved), it likely authenticated a DIFFERENT version.");
+            lines.push("Fix by either:");
+            lines.push("  (a) `unset FOUNDRY_CURSOR_AGENT_CMD` so Foundry uses your PATH cursor-agent (recommended), OR");
+            lines.push("  (b) explicitly authenticate the pinned binary: `\"$FOUNDRY_CURSOR_AGENT_CMD\" login`");
+        }
+        // Short raw-output trace helps debug binaries that print unexpected text.
+        const trace = stripped.slice(0, 240).replace(/\s+/g, " ");
+        if (trace.length > 0) {
+            lines.push("");
+            lines.push(`(raw status output: "${trace}${stripped.length > 240 ? "…" : ""}", exit=${authResult.exitCode})`);
+        }
+        return { ok: false, detail: lines.join("\n") };
     }
     return { ok: true, detail: `Cursor command '${command}' is available and authenticated.` };
 }
@@ -1443,12 +1607,35 @@ export async function preflightCursorModels(command, cwd, models) {
             detail: "Cursor builder uses `auto` / `default` — Foundry omits `--model` (use Cursor's default) and skips `agent models` substring check.",
         };
     }
-    const missing = toVerify.filter((model) => !combined.includes(model));
+    // Parse the model list into the exact set of identifiers cursor-agent
+    // accepts. Each line is `<model-id> - <Display Name>`; everything before
+    // the first " - " is the id. Substring matching (the prior behavior) was
+    // too loose — e.g. a configured `claude-opus-4-7-high` could "match" a
+    // listed `claude-opus-4-7-high-fast` and still get rejected at runtime.
+    const validIds = new Set();
+    for (const line of combined.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || /^Available models/i.test(trimmed))
+            continue;
+        const idMatch = trimmed.match(/^([A-Za-z0-9._-]+)\b/);
+        if (idMatch)
+            validIds.add(idMatch[1]);
+    }
+    const missing = toVerify.filter((model) => !validIds.has(model));
     if (missing.length > 0) {
+        // Suggest the closest valid alternatives (same prefix, then any with the
+        // model's "family" stem). Helps the operator pick the right rename fast.
+        const suggestions = missing.map((m) => {
+            const stem = m.replace(/-(?:low|medium|high|xhigh|max|fast|thinking)(?:-|$).*$/g, "");
+            const candidates = [...validIds]
+                .filter((v) => v.startsWith(stem) || v.includes(stem.split("-")[0] ?? stem))
+                .slice(0, 6);
+            return `${m}${candidates.length > 0 ? ` (try: ${candidates.join(", ")})` : ""}`;
+        });
         return {
             ok: false,
-            detail: `Configured Cursor model(s) not available: ${missing.join(", ")}. ` +
-                `Run '${command} models' and update '.foundry/project.yaml' cursor_automation settings.`,
+            detail: `Configured Cursor model(s) not in '${command} models' list:\n  - ${suggestions.join("\n  - ")}\n` +
+                `Edit .foundry/project.yaml \`cursor_automation\` settings (or set builder_model: "auto" to use Cursor's default).`,
         };
     }
     return {
