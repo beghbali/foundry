@@ -1865,35 +1865,31 @@ export function shouldRunCursorAutomation(
   const hasActionableBriefWork = briefCounts.total > 0;
   const feedbackCount = opts?.stabilize ? 0 : implementNowFeedbackCount;
   const hasQueuedImplementationWork = feedbackCount > 0;
-  const deferAutonomousRelease = Boolean(
-    opts?.autonomousDeferRelease &&
-      (opts?.investorTargetMet === false || opts?.contractConvergenceMet === false),
-  );
 
   if (releaseStatus === "approved" || releaseStatus === "auto_approved") return false;
-  if (
-    releaseStatus === "awaiting_approval" &&
-    !hasActionableBriefWork &&
-    !hasQueuedImplementationWork &&
-    !deferAutonomousRelease
-  ) {
-    return false;
-  }
-  // Pipeline QA already green — skip Cursor only when there is no remaining implementation work
-  // (unless we are deferring release until investor convergence).
+
+  // QA is green and nothing actionable remains — never burn Cursor quota, even when
+  // investor convergence still wants a higher grade (run investor_panel instead).
   if (
     pipelineQaRecommendation === "ship" &&
     !hasActionableBriefWork &&
-    !hasQueuedImplementationWork &&
-    !deferAutonomousRelease
+    !hasQueuedImplementationWork
   ) {
     return false;
   }
+
+  if (
+    releaseStatus === "awaiting_approval" &&
+    !hasActionableBriefWork &&
+    !hasQueuedImplementationWork
+  ) {
+    return false;
+  }
+
   return (
     hasActionableBriefWork ||
     hasQueuedImplementationWork ||
     pipelineQaRecommendation !== "ship" ||
-    releaseStatus === "awaiting_approval" ||
     releaseStatus === "blocked_by_qa" ||
     releaseStatus === "blocked_pre_release"
   );

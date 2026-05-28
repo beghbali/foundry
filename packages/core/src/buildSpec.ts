@@ -359,6 +359,14 @@ export function taskIsConcrete(task: ConcreteTask): boolean {
 export function isEnvironmentalWorkItem(text: string): boolean {
   const t = text.toLowerCase();
   return (
+    /^automation_log:/.test(t.trim()) ||
+    /\bbuilder\.log\b/.test(t) ||
+    /\[process-error\]/.test(t) ||
+    /connection lost.*reconnecting/.test(t) ||
+    /physical hardware capture/.test(t) ||
+    /\bcold scans? on target hardware\b/.test(t) ||
+    /device benchmark json from account after/.test(t) ||
+    /investors must (still )?run \d+\+ cold scans/.test(t) ||
     /\bmaestro\b/.test(t) ||
     /\bsimctl\b/.test(t) ||
     /coresimulator/.test(t) ||

@@ -60,8 +60,10 @@ import {
   type TestFlightSubmitResult,
 } from "./releaseAutomation.js";
 import {
+  actionableWorkPacketOpenCount,
   createWorkPacket,
   filterBriefItemsForStabilizePhase,
+  isNonActionableWorkPacketItem,
   readCheckedBriefItems,
   readOpenBriefItems,
   refreshWorkPacket,
@@ -218,6 +220,7 @@ function packetBriefCounts(packet: WorkPacket | undefined): BriefCriticalCounts 
   for (const item of packet?.items ?? []) {
     if (item.status !== "open") continue;
     if (isNoOpPacketText(item.text)) continue;
+    if (isNonActionableWorkPacketItem(item.text)) continue;
     if (item.section === "runtime") counts.runtime++;
     else if (item.section === "must" || item.section === "qa") counts.mustShip++;
     else if (item.section === "should") counts.shouldShip++;
@@ -3867,19 +3870,18 @@ program
           });
           activePacketCounts = packetBriefCounts(workPacket);
 
-          // Stop after a green QA pass when there is no builder work left — extra
-          // inner passes often regress tests (e.g. foundry-root-artifacts) with no
-          // packet items to close.
+          // Stop after a green QA pass when there is no actionable builder work left —
+          // extra inner passes often regress tests with no packet items Cursor can close.
           if (
             loopProfile === "investor" &&
-            activePacketCounts.total === 0 &&
+            actionableWorkPacketOpenCount(workPacket) === 0 &&
             implementNowFeedbackCount === 0 &&
             pipelineQa?.recommendation === "ship" &&
             (pipelineQa?.blockers?.length ?? 0) === 0
           ) {
             console.log(
               chalk.cyan(
-                "\n  QA ship with zero open packet items — stopping inner loop to avoid no-op Cursor passes.",
+                "\n  QA ship with no actionable work-packet items — stopping inner loop to avoid no-op Cursor passes.",
               ),
             );
             break;
@@ -4156,6 +4158,24 @@ program
       logReleaseCandidateLine(pipelineQa, releaseOutput);
       if (loopProfile === "investor") {
         logInvestorScoreLine(investorOutput);
+      }
+
+      // Auto-promote builder branch to main when QA is ship-clean (user policy: always land on main).
+      if (
+        pipelineQa?.recommendation === "ship" &&
+        (pipelineQa?.blockers?.length ?? 0) === 0 &&
+        builderOutput?.branchName?.startsWith("foundry/")
+      ) {
+        const promoSpinner = ora("Promoting builder branch to main...").start();
+        const promotion = await promoteApprovedBranch(repoPath, manifest, builderOutput);
+        if (promotion.status === "promoted") {
+          promoSpinner.succeed(`Release branch promotion: ${promotion.detail}`);
+        } else if (promotion.status === "skipped") {
+          promoSpinner.warn(`Release branch promotion skipped: ${promotion.detail}`);
+        } else {
+          promoSpinner.fail(`Release branch promotion failed: ${promotion.detail}`);
+        }
+        if (promotion.logPath) console.log(chalk.gray(`  Promotion log: ${promotion.logPath}`));
       }
 
       investorOutput = await readStageJson<InvestorPanelBrief>(repoPath, manifest, "investor_panel");

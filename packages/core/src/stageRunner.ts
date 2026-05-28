@@ -6,6 +6,7 @@ import { z } from "zod";
 
 import { writeStageJson, writeStageMarkdown } from "./artifacts.js";
 import { loadFoundryConfig } from "./config.js";
+import { isEnvironmentalWorkItem } from "./buildSpec.js";
 import {
   parseAutonomousInvestorConvergence,
   withInvestorLoopAutonomousDefaultsIfNeeded,
@@ -288,6 +289,7 @@ async function countOpenWorkPacketItems(repoPath: string): Promise<{ open: numbe
 }
 
 function isNonActionablePacketText(text: string): boolean {
+  if (isEnvironmentalWorkItem(text)) return true;
   const t = text.trim().toLowerCase();
   return (
     /external to the repository/.test(t) ||
@@ -298,6 +300,15 @@ function isNonActionablePacketText(text: string): boolean {
     /playwright chromium was not installed/.test(t) ||
     /\benospc\b/.test(t)
   );
+}
+
+/** Investor asks that require device lab / Maestro runtime — not re-pitch blockers when optional or impossible in CI. */
+function isManualInvestorDirective(text: string): boolean {
+  const t = text.toLowerCase();
+  if (/cold scans on target hardware|device benchmark json from account after/.test(t)) return true;
+  if (/fix maestro smoke|maestro smoke until|gc_intro_brand_title is visible on device/.test(t)) return true;
+  if (/record a .*first.session (demo|screencast)|30.?second first.session demo/.test(t)) return true;
+  return false;
 }
 
 type InvestorPanelGate =
@@ -337,6 +348,14 @@ async function unaddressedInvestorDirectivesSinceLastPitch(repoPath: string): Pr
   }
   const addressed = Object.values(ledger.addressedParents ?? {}).map((p) => p.text);
 
+  let maestroRequired = false;
+  try {
+    const cfg = await loadFoundryConfig(repoPath);
+    maestroRequired = cfg.project.qa_automation?.maestro?.required ?? false;
+  } catch {
+    /* optional */
+  }
+
   const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
   const matches = (a: string, b: string): boolean => {
     const na = norm(a);
@@ -350,7 +369,13 @@ async function unaddressedInvestorDirectivesSinceLastPitch(repoPath: string): Pr
     return overlap >= 3 && overlap / Math.max(1, aw.size) >= 0.4;
   };
 
-  return dirs.filter((d) => !addressed.some((p) => matches(d, p)));
+  return dirs.filter((d) => {
+    if (isManualInvestorDirective(d)) {
+      if (/maestro|gc_intro_brand|first.session (demo|screencast)/i.test(d) && !maestroRequired) return false;
+      if (/cold scans|device benchmark json from account/i.test(d)) return false;
+    }
+    return !addressed.some((p) => matches(d, p));
+  });
 }
 
 async function shouldSkipInvestorPanelStage(

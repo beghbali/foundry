@@ -864,6 +864,22 @@ async function collectFoundryLogs(repoPath: string, ctx: RunContext): Promise<Ra
           .join("\n") || text.slice(0, 1500);
     }
 
+    if (/builder\.log$/i.test(base)) {
+      if (
+        /\[process-error\]|connection lost|reconnecting|retry attempt|shell_session_update|cursor agent produced reconnect-only/i.test(
+          snippet,
+        )
+      ) {
+        continue;
+      }
+      if (
+        /^(## )?pass complete|primary slice complete|automation-log process/i.test(snippet.trim()) &&
+        !/\b(apps|packages|supabase)\//.test(snippet)
+      ) {
+        continue;
+      }
+    }
+
     const kind = /release/i.test(abs) ? "release_log" : "automation_log";
     const isHighPriority =
       isExpoBuildView ||

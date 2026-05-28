@@ -93,12 +93,26 @@ function packetItemKey(item: BriefOpenItem | CheckedBriefItem): string {
 
 /** Not addressable by a normal Cursor coding pass — ops, GTM, hosted DB, or device-lab ACs. */
 export function isStructuralNonCodeBriefItem(text: string): boolean {
+  if (isEnvironmentalWorkItem(text)) return true;
   const t = text.toLowerCase();
   if (/repeatable acquisition|acquisition channel|business\/marketing|marketing item/i.test(text)) return true;
   if (/ac-04|ac-05/.test(t) && /device|e2e|performance|sync|cross-device/i.test(t)) return true;
   if (/acceptance tests.*device|device-level e2e/i.test(t)) return true;
   if (/supabase db push|hosted database|apply to the hosted|migration.*apply/i.test(t)) return true;
+  if (/physical hardware capture|cold scans on target hardware|screencast.*first.session/i.test(t)) return true;
   return false;
+}
+
+/** Open packet rows Cursor cannot productively close — manual lab work or builder-log echoes. */
+export function isNonActionableWorkPacketItem(text: string): boolean {
+  return isStructuralNonCodeBriefItem(text) || isNoOpPacketText(text);
+}
+
+export function actionableWorkPacketOpenCount(packet: WorkPacket | undefined): number {
+  if (!packet) return 0;
+  return packet.items.filter(
+    (item) => item.status === "open" && !isNonActionableWorkPacketItem(item.text),
+  ).length;
 }
 
 function priorityForSection(section: WorkPacketSection): number {
@@ -321,6 +335,10 @@ export async function createWorkPacket(input: WorkPacketSourceInput): Promise<Wo
     const slice = input.buildSpecPrimarySlice;
     if (slice.tasks.length > 0) {
       for (const task of slice.tasks) {
+        if (isEnvironmentalWorkItem(task.task)) {
+          extraManual.add(`[buildspec:${task.id}] ${task.task}`);
+          continue;
+        }
         const filesNote = task.files.length > 0 ? ` (files: ${task.files.map((f) => `\`${f}\``).join(", ")})` : "";
         push("brief", "must", `[${task.id}] ${task.task}${filesNote}`);
       }
