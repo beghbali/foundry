@@ -1,0 +1,18 @@
+---
+description: Always commit, merge to main, and push to origin when landing work
+alwaysApply: true
+---
+
+# Land all work on main
+
+When you change code in this repo (or a Foundry-managed product repo like GutCheck):
+
+1. **Commit** all relevant changes on the working branch before ending the task.
+2. **Merge to `main`** — if work was on a `foundry/*` branch, merge it into `main` locally.
+3. **Push** `origin main` (and the feature branch if it still exists) before finishing.
+
+Do not leave product fixes only on `foundry/<runId>` branches. Do not end a session with unpushed commits.
+
+For GutCheck loop runs, `foundry.always_promote_to_main: true` in `.foundry/project.yaml` (default) handles merge/push after QA ship cycles.
+
+When the user asks for fixes without explicitly saying "commit", still land on `main` and push — that is the default delivery for this project.

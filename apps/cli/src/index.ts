@@ -4160,11 +4160,14 @@ program
         logInvestorScoreLine(investorOutput);
       }
 
-      // Auto-promote builder branch to main when QA is ship-clean (user policy: always land on main).
+      // Auto-promote builder branch → main → origin (default on; disable via foundry.always_promote_to_main: false).
+      const alwaysPromoteToMain = foundryConfig.project.foundry?.always_promote_to_main !== false;
+      const qaShipClean =
+        pipelineQa?.recommendation === "ship" && (pipelineQa?.blockers?.length ?? 0) === 0;
       if (
-        pipelineQa?.recommendation === "ship" &&
-        (pipelineQa?.blockers?.length ?? 0) === 0 &&
-        builderOutput?.branchName?.startsWith("foundry/")
+        alwaysPromoteToMain &&
+        builderOutput?.branchName?.startsWith("foundry/") &&
+        (qaShipClean || cycleHadShipState)
       ) {
         const promoSpinner = ora("Promoting builder branch to main...").start();
         const promotion = await promoteApprovedBranch(repoPath, manifest, builderOutput);
@@ -4176,6 +4179,17 @@ program
           promoSpinner.fail(`Release branch promotion failed: ${promotion.detail}`);
         }
         if (promotion.logPath) console.log(chalk.gray(`  Promotion log: ${promotion.logPath}`));
+      } else if (
+        alwaysPromoteToMain &&
+        builderOutput?.branchName?.startsWith("foundry/") &&
+        !qaShipClean &&
+        !cycleHadShipState
+      ) {
+        console.log(
+          chalk.gray(
+            "  Skipping auto-promote: QA did not reach ship this cycle (foundry.always_promote_to_main requires a ship state before merging to main).",
+          ),
+        );
       }
 
       investorOutput = await readStageJson<InvestorPanelBrief>(repoPath, manifest, "investor_panel");

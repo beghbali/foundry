@@ -114,6 +114,11 @@ export const ProjectYamlSchema = z.object({
            */
           investor_panel_when_release_ready: z.boolean().optional(),
           /**
+           * When true (default), each `foundry loop` cycle that reaches QA ship merges the builder
+           * branch into `main` and pushes `origin/main` automatically.
+           */
+          always_promote_to_main: z.boolean().optional(),
+          /**
            * Overnight / hands-off mode: relax investor_panel gates so grading runs on the current repo,
            * use mean persona grade vs `min_average_grade`, and defer release approval + EAS prompts
            * in `foundry loop` until **both** the investor target is met and `convergence_contract` is converged
