@@ -1144,9 +1144,78 @@ const QA_GATING_FOUNDRY_COMMIT_PATHS = new Set([
   ".foundry/WORK_PACKET.json",
   ".foundry/WORK_PACKET.md",
   ".foundry/CURSOR_BRIEF.md",
+  ".foundry/CURSOR_BUILDER_REPORT.md",
   ".foundry/BUILD_SPEC.json",
   ".foundry/BUILD_SPEC.md",
 ]);
+
+const PRODUCT_SOURCE_PREFIXES = ["apps/", "packages/", "supabase/"] as const;
+
+function isProductSourcePath(path: string): boolean {
+  return PRODUCT_SOURCE_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
+
+/**
+ * GutCheck (and similar repos) test `CURSOR_BUILDER_REPORT.md` `## Files Changed` for
+ * product + `.foundry/` paths. The report is excluded from product auto-commit, so sync
+ * it from known paths before QA-gating commit — otherwise post-Cursor QA passes on disk
+ * but pre-promote verify fails on the committed tree.
+ */
+export async function syncCursorBuilderReportFilesChanged(
+  repoPath: string,
+  productPaths: string[],
+  foundryPaths: string[] = [],
+): Promise<void> {
+  const product = [...new Set(productPaths.filter(isProductSourcePath))];
+  const foundry = [
+    ...new Set(
+      foundryPaths.filter((p) => p.startsWith(".foundry/") || p === ".foundry/CURSOR_BUILDER_REPORT.md"),
+    ),
+  ];
+  if (product.length === 0 && foundry.length === 0) return;
+
+  const reportPath = join(repoPath, ".foundry", "CURSOR_BUILDER_REPORT.md");
+  let src = "";
+  try {
+    src = await readFile(reportPath, "utf8");
+  } catch {
+    src = "# Cursor Builder Report\n\n";
+  }
+
+  const lines: string[] = ["## Files Changed", ""];
+  if (product.length > 0) {
+    lines.push("### Modified", "");
+    for (const p of product) lines.push(`- \`${p}\``);
+    lines.push("");
+  }
+  if (foundry.length > 0) {
+    lines.push("### Foundry artifacts", "");
+    for (const p of foundry) lines.push(`- \`${p}\``);
+    lines.push("");
+  }
+
+  const block = lines.join("\n");
+  const sectionRe = /## Files Changed\s*\n[\s\S]*?(?=\n##\s|$)/;
+  const next =
+    sectionRe.test(src) ? src.replace(sectionRe, block.trimEnd()) : `${src.trimEnd()}\n\n${block}`;
+
+  await writeFile(reportPath, `${next.trimEnd()}\n`, "utf8");
+}
+
+/** Collect paths from recent commits on the current branch (Cursor + QA-sync commits). */
+export async function syncCursorBuilderReportFromRecentCommits(repoPath: string): Promise<void> {
+  const log = await exec("git log -8 --name-only --pretty=format:", repoPath, 20_000);
+  if (log.exitCode !== 0) return;
+  const product: string[] = [];
+  const foundry: string[] = [];
+  for (const line of log.stdout.split("\n")) {
+    const p = normalizePorcelainPath(line.trim());
+    if (!p) continue;
+    if (isProductSourcePath(p)) product.push(p);
+    else if (p.startsWith(".foundry/")) foundry.push(p);
+  }
+  await syncCursorBuilderReportFilesChanged(repoPath, product, foundry);
+}
 
 function isQaGatingFoundryPath(path: string): boolean {
   return QA_GATING_FOUNDRY_COMMIT_PATHS.has(path);
@@ -1815,6 +1884,9 @@ async function finalizeBuilderAgentResult(
     pushWarning?: string;
   },
 ): Promise<CursorAgentRunResult> {
+  const pendingQa = await classifyPorcelainPaths(repoPath);
+  const qaFoundryPaths = pendingQa.generated.filter((p) => isQaGatingFoundryPath(p));
+  await syncCursorBuilderReportFilesChanged(repoPath, productFiles, qaFoundryPaths);
   const qaSync = await commitQaGatingFoundryArtifacts(repoPath, runId);
   const pushWarning = [opts?.pushWarning, qaSync.pushWarning].filter(Boolean).join("\n") || undefined;
   const diffStats = productFiles.length > 0 ? await readDiffStatsForHead(repoPath) : [];

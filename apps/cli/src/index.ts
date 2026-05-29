@@ -44,6 +44,8 @@ import {
   resolveCursorAutomationSettings,
   isLikelyCursorTransportFailure,
   runBuilderAgent,
+  commitQaGatingFoundryArtifacts,
+  syncCursorBuilderReportFromRecentCommits,
   sampleUncheckedBriefLines,
   shouldRunCursorAutomation,
   type BriefCriticalCounts,
@@ -3191,6 +3193,8 @@ program
       let cycleCursorProductFileCount = 0;
       let cycleCursorQaArtifactFileCount = 0;
       let endQaReused = false;
+      /** Post-Cursor `independent_qa` ran fresh (no cache) and returned ship this cycle. */
+      let cycleEndQaVerifiedFresh = false;
       if (maxCycles > 0 && cycle > maxCycles) {
         console.log(chalk.yellow(`\nReached max cycles (${maxCycles}). Stopping.`));
         break;
@@ -3869,6 +3873,9 @@ program
             break;
           }
 
+          pipelineQa = await readStageJson<PipelineIndependentQa>(repoPath, manifest, "independent_qa");
+          cycleEndQaVerifiedFresh = isQaShipClean(pipelineQa) && !endQaReused;
+
           releaseOutput = await readStageJson<ReleaseAgentBrief>(repoPath, manifest, "release_agent");
           const rerunBuilderOutput = await readStageJson<BuilderLoopMeta>(repoPath, manifest, "builder");
           if (rerunBuilderOutput) {
@@ -3877,7 +3884,6 @@ program
           investorOutput = await readStageJson<InvestorPanelBrief>(repoPath, manifest, "investor_panel");
           briefCounts = await countCriticalBriefItems(briefPath);
           briefMetrics = await readBriefMetrics(briefPath);
-          pipelineQa = await readStageJson<PipelineIndependentQa>(repoPath, manifest, "independent_qa");
           // Track cycle-level "ever ship" and "investor panel ran" signals
           // so we can backfill an investor pitch at end-of-cycle even if a
           // later inner pass regressed QA.
@@ -4238,10 +4244,13 @@ program
         alwaysPromoteToMain &&
         builderOutput?.branchName?.startsWith("foundry/") &&
         promoteDecision.ok &&
-        !isQaShipClean(outerPipelineQa)
+        !isQaShipClean(outerPipelineQa) &&
+        !(cycleEndQaVerifiedFresh && isQaShipClean(pipelineQa) && !endQaReused)
       ) {
         const verifySpinner = ora("Pre-promote QA verify (fresh independent_qa on branch)...").start();
         try {
+          await syncCursorBuilderReportFromRecentCommits(repoPath);
+          await commitQaGatingFoundryArtifacts(repoPath, manifest.runId);
           const verifyManifest = await runPipeline({
             repoPath,
             pipelineName: opts.pipeline,
@@ -4271,6 +4280,27 @@ program
             reason: err instanceof Error ? err.message : String(err),
           };
           verifySpinner.fail("Pre-promote QA verify errored.");
+        }
+      } else if (
+        alwaysPromoteToMain &&
+        builderOutput?.branchName?.startsWith("foundry/") &&
+        promoteDecision.ok &&
+        !isQaShipClean(outerPipelineQa) &&
+        cycleEndQaVerifiedFresh &&
+        isQaShipClean(pipelineQa) &&
+        !endQaReused
+      ) {
+        const syncSpinner = ora("Pre-promote: syncing CURSOR_BUILDER_REPORT from branch commits...").start();
+        try {
+          await syncCursorBuilderReportFromRecentCommits(repoPath);
+          await commitQaGatingFoundryArtifacts(repoPath, manifest.runId);
+          syncSpinner.succeed("Pre-promote: builder report + QA artifacts synced for merge.");
+        } catch (err) {
+          promoteDecision = {
+            ok: false,
+            reason: err instanceof Error ? err.message : String(err),
+          };
+          syncSpinner.fail("Pre-promote artifact sync failed.");
         }
       }
 
