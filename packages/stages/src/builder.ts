@@ -1,4 +1,6 @@
+import { existsSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
 import { writeStageMarkdown } from "@foundry/core/artifacts";
@@ -1710,6 +1712,7 @@ export const builderStage: Stage<StageInputComposition, BuilderOutput> = {
 
     await mkdir(join(repoPath, ".foundry"), { recursive: true });
     await writeFile(briefPath, cursorBrief, "utf8");
+    healCursorBriefContractFromRepoScript(repoPath, ctx.logger);
     notes.push(
       gwParsed.success
         ? "Wrote .foundry/CURSOR_BRIEF.md from BUILD_SPEC (Grand Wizard) — template must-ship regen skipped."
@@ -1804,3 +1807,21 @@ export const builderStage: Stage<StageInputComposition, BuilderOutput> = {
     return validated;
   },
 };
+
+/** Repos like GutCheck pin brief contract lines in product code — heal after wizard regen. */
+function healCursorBriefContractFromRepoScript(
+  repoPath: string,
+  logger: RunContext["logger"],
+): void {
+  const script = join(repoPath, "scripts", "sync-cursor-brief-contract.js");
+  if (!existsSync(script)) return;
+  const result = spawnSync(process.execPath, [script], { cwd: repoPath, encoding: "utf8" });
+  if (result.status === 0) {
+    logger("[builder] healed CURSOR_BRIEF contract block via scripts/sync-cursor-brief-contract.js");
+  } else {
+    logger("[builder] sync-cursor-brief-contract.js failed", {
+      status: result.status,
+      stderr: (result.stderr || result.stdout || "").slice(0, 400),
+    });
+  }
+}

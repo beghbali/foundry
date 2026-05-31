@@ -444,7 +444,7 @@ async function shouldSkipInvestorPanelStage(
   // BUILD_SPEC_LEDGER.addressedParents (which the wizard/loop populate as
   // child tasks close).
   const unaddressed = await unaddressedInvestorDirectivesSinceLastPitch(repoPath);
-  if (unaddressed.length > 0) {
+  if (unaddressed.length > 0 && !relaxInvestorGates) {
     const sample = unaddressed
       .slice(0, 2)
       .map((d) => `"${d.slice(0, 90)}${d.length > 90 ? "…" : ""}"`)

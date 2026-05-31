@@ -373,6 +373,47 @@ function logInvestorScoreLine(investor: InvestorPanelBrief | undefined): void {
   }
 }
 
+async function runInvestorPanelForLoop(args: {
+  repoPath: string;
+  pipelineName: string;
+  foundryRoot: string;
+  manifest: RunManifest;
+  loopProfile: LoopProfile;
+  forceBypassQa?: boolean;
+  spinnerLabel?: string;
+}): Promise<{ manifest: RunManifest; investorOutput: InvestorPanelBrief | undefined; ran: boolean }> {
+  if (args.loopProfile !== "investor") {
+    return { manifest: args.manifest, investorOutput: undefined, ran: false };
+  }
+  const ipSpinner = ora(
+    args.spinnerLabel ??
+      (args.forceBypassQa
+        ? "Running investor_panel (QA-gate-bypassed backfill)..."
+        : "Running investor_panel..."),
+  ).start();
+  try {
+    const manifest = await runPipeline({
+      repoPath: args.repoPath,
+      pipelineName: args.pipelineName,
+      foundryRoot: args.foundryRoot,
+      quiet: true,
+      allowInvestorRefinement: false,
+      investorLoopAutonomousDefaults: true,
+      stagesOverride: ["investor_panel"],
+      forceInvestorPanelBypassQaGate: args.forceBypassQa,
+    });
+    const ran = manifestStageRan(manifest, "investor_panel");
+    if (ran) ipSpinner.succeed("investor_panel completed.");
+    else ipSpinner.warn("investor_panel still skipped by another gate (builder/convergence/directives).");
+    const investorOutput = await readStageJson<InvestorPanelBrief>(args.repoPath, manifest, "investor_panel");
+    if (ran) logInvestorScoreLine(investorOutput);
+    return { manifest, investorOutput, ran };
+  } catch (err) {
+    ipSpinner.fail(err instanceof Error ? err.message : String(err));
+    return { manifest: args.manifest, investorOutput: undefined, ran: false };
+  }
+}
+
 type BriefMetrics = {
   open: number;
   checked: number;
@@ -888,6 +929,21 @@ async function buildWorkPacketForRun(params: {
     ...extractBuilderBlockers(params.builder),
     ...params.builderRemainingBlockers,
   ]);
+  let projectBuilderDirectives: string[] | undefined;
+  if (!primarySlice || primarySlice.tasks.length === 0) {
+    const cfg = await loadFoundryConfig(params.repoPath);
+    const anchored = (cfg.project.builder?.directives ?? [])
+      .map((d) => {
+        const desc = d.description?.trim();
+        if (!desc) return "";
+        const files = d.files?.length
+          ? ` — files: ${d.files.map((f) => `\`${f}\``).join(", ")}`
+          : "";
+        return `[builder-directive] ${desc}${files}`;
+      })
+      .filter((line) => line.length > 0);
+    if (anchored.length > 0) projectBuilderDirectives = anchored;
+  }
   return createWorkPacket({
     repoPath: params.repoPath,
     runId: params.runId,
@@ -899,6 +955,7 @@ async function buildWorkPacketForRun(params: {
     codeChanged: false,
     buildSpecPrimarySlice: primarySlice,
     freezeBriefToBuildSpec: !!buildSpec,
+    projectBuilderDirectives,
   });
 }
 
@@ -3423,8 +3480,10 @@ program
           if (releaseOutput?.status === "awaiting_approval" && pipelineQa?.recommendation === "ship" && (pipelineQa?.blockers?.length ?? 0) === 0) {
             const invMet = investorPanelMetTarget(investorOutput, foundryConfig.project.foundry, loopProfile);
             const feedbackQueued = implementNowFeedbackCount > 0;
+            const actionableOpen = actionableWorkPacketOpenCount(workPacket);
             const stayForConvergence =
               autonomousInv.deferReleaseUntilInvestorTarget &&
+              actionableOpen > 0 &&
               (!invMet || feedbackQueued || !contractGate.ok);
             if (stayForConvergence) {
               const why = feedbackQueued
@@ -3438,9 +3497,24 @@ program
                 ),
               );
             } else {
+              if (loopProfile === "investor" && !cycleProducedInvestorPanel && isQaShipClean(pipelineQa)) {
+                const ip = await runInvestorPanelForLoop({
+                  repoPath,
+                  pipelineName: opts.pipeline,
+                  foundryRoot,
+                  manifest,
+                  loopProfile,
+                  spinnerLabel: "Running investor_panel (QA ship — product work queue empty)...",
+                });
+                manifest = ip.manifest;
+                investorOutput = ip.investorOutput;
+                if (ip.ran) cycleProducedInvestorPanel = true;
+              }
               console.log(
                 chalk.cyan(
-                  "\n  Release is awaiting_approval with QA ship + 0 blockers — skipping further Cursor passes and going to the approval prompt.",
+                  actionableOpen === 0
+                    ? "\n  QA ship with no actionable product work — skipping Cursor and running investor/convergence steps."
+                    : "\n  Release is awaiting_approval with QA ship + 0 blockers — skipping further Cursor passes and going to the approval prompt.",
                 ),
               );
               break;
@@ -3514,26 +3588,17 @@ program
                 "\n  No open work-packet items, no queued feedback, QA is ship — skipping further Cursor passes this cycle and running investor_panel from this state.",
               ),
             );
-            const ipSpinner = ora("Running investor_panel (no Cursor pass needed)...").start();
-            try {
-              manifest = await runPipeline({
-                repoPath,
-                pipelineName: opts.pipeline,
-                foundryRoot,
-                quiet: true,
-                allowInvestorRefinement: false,
-                investorLoopAutonomousDefaults: true,
-                stagesOverride: ["investor_panel"],
-              });
-              ipSpinner.succeed("investor_panel completed.");
-              investorOutput = await readStageJson<InvestorPanelBrief>(repoPath, manifest, "investor_panel");
-              if (investorOutput && manifestStageRan(manifest, "investor_panel")) {
-                cycleProducedInvestorPanel = true;
-              }
-              logInvestorScoreLine(investorOutput);
-            } catch (err) {
-              ipSpinner.fail(err instanceof Error ? err.message : String(err));
-            }
+            const ip = await runInvestorPanelForLoop({
+              repoPath,
+              pipelineName: opts.pipeline,
+              foundryRoot,
+              manifest,
+              loopProfile,
+              spinnerLabel: "Running investor_panel (no Cursor pass needed)...",
+            });
+            manifest = ip.manifest;
+            investorOutput = ip.investorOutput;
+            if (ip.ran) cycleProducedInvestorPanel = true;
             break;
           }
           inner++;
@@ -3940,6 +4005,19 @@ program
                 "\n  Durable QA ship with no actionable work-packet items — stopping inner loop.",
               ),
             );
+            if (!cycleProducedInvestorPanel) {
+              const ip = await runInvestorPanelForLoop({
+                repoPath,
+                pipelineName: opts.pipeline,
+                foundryRoot,
+                manifest,
+                loopProfile,
+                spinnerLabel: "Running investor_panel (durable QA ship)...",
+              });
+              manifest = ip.manifest;
+              investorOutput = ip.investorOutput;
+              if (ip.ran) cycleProducedInvestorPanel = true;
+            }
             break;
           }
           if (
@@ -4200,31 +4278,26 @@ program
       };
       const cycleDurableShip = isDurableLoopShip(endCycleCtx);
 
-      if (loopProfile === "investor" && cycleHadShipState && !cycleProducedInvestorPanel && cycleDurableShip) {
-        const ipSpinner = ora(
-          "Backfilling investor_panel (QA regressed after cycle reached ship — bypassing QA gate)...",
-        ).start();
-        try {
-          manifest = await runPipeline({
-            repoPath,
-            pipelineName: opts.pipeline,
-            foundryRoot,
-            quiet: true,
-            allowInvestorRefinement: false,
-            investorLoopAutonomousDefaults: true,
-            stagesOverride: ["investor_panel"],
-            forceInvestorPanelBypassQaGate: true,
-          });
-          if (manifestStageRan(manifest, "investor_panel")) {
-            ipSpinner.succeed("investor_panel completed (QA-gate-bypassed backfill).");
-            cycleProducedInvestorPanel = true;
-          } else {
-            ipSpinner.warn("investor_panel still skipped by another gate (builder/convergence/directives).");
-          }
-          investorOutput = await readStageJson<InvestorPanelBrief>(repoPath, manifest, "investor_panel");
-        } catch (err) {
-          ipSpinner.fail(err instanceof Error ? err.message : String(err));
-        }
+      if (
+        loopProfile === "investor" &&
+        !cycleProducedInvestorPanel &&
+        cycleDurableShip &&
+        isQaShipClean(pipelineQa)
+      ) {
+        const ip = await runInvestorPanelForLoop({
+          repoPath,
+          pipelineName: opts.pipeline,
+          foundryRoot,
+          manifest,
+          loopProfile,
+          forceBypassQa: !isQaShipClean(outerPipelineQa),
+          spinnerLabel: isQaShipClean(outerPipelineQa)
+            ? "Running investor_panel (durable QA ship at end of cycle)..."
+            : "Backfilling investor_panel (inner QA ship — outer pipeline was red)...",
+        });
+        manifest = ip.manifest;
+        investorOutput = ip.investorOutput;
+        if (ip.ran) cycleProducedInvestorPanel = true;
       }
 
       logReleaseCandidateLine(pipelineQa, releaseOutput, {

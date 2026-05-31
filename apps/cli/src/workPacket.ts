@@ -71,6 +71,8 @@ export type WorkPacketSourceInput = PacketSignals & {
   /** When set, packet scopes to the Grand Wizard primary slice instead of full brief backlog. */
   buildSpecPrimarySlice?: BuildSpecSlice;
   freezeBriefToBuildSpec?: boolean;
+  /** Anchored product work from project.yaml when Grand Wizard emits no tasks. */
+  projectBuilderDirectives?: string[];
 };
 
 /** Builder-stage gaps that are ops/infra noise, not product work for Cursor. */
@@ -330,6 +332,11 @@ export async function createWorkPacket(input: WorkPacketSourceInput): Promise<Wo
   };
 
   for (const blocker of input.qaCodeBlockers) push("qa", "qa", blocker);
+
+  for (const directive of input.projectBuilderDirectives ?? []) {
+    if (isStructuralNonCodeBriefItem(directive) || isNoOpPacketText(directive)) continue;
+    push("brief", "must", directive);
+  }
 
   if (input.buildSpecPrimarySlice) {
     const slice = input.buildSpecPrimarySlice;

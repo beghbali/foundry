@@ -382,7 +382,17 @@ export function isEnvironmentalWorkItem(text: string): boolean {
     /playwright chromium/.test(t) ||
     /repository-wide hygiene/.test(t) ||
     /external to the repository/.test(t) ||
-    /not by product code/.test(t)
+    /not by product code/.test(t) ||
+    /grand wizard upstream/.test(t) ||
+    (/build_spec/.test(t) && /tasks\[\]/.test(t) && /empty/.test(t)) ||
+    /mitigated in product/.test(t) ||
+    /foundry loop --reset-spec/.test(t) ||
+    /upstream llm decomposition/.test(t) ||
+    /empty at source/.test(t) ||
+    /\(informational\)/.test(t) ||
+    /primarysliceanchors.*mitigat/.test(t) ||
+    /convergence-contract-sync/.test(t) && /contract (line|block|sync)/.test(t) ||
+    /foundry-root-artifacts/.test(t) && /regression guard/.test(t)
   );
 }
 
