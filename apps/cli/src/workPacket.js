@@ -6,6 +6,17 @@ import { isEnvironmentalWorkItem } from "@foundry/core/buildSpec";
 export function isEnvironmentalBuilderGap(text) {
     return isEnvironmentalWorkItem(text);
 }
+/**
+ * Builder-stage blockers that describe a runtime / on-device performance gap
+ * (hardware benchmark, cold-start latency) belong in the `runtime` section, not
+ * the generic `builder` bucket. They keep `source: "builder"` but are read as
+ * "Runtime Failures To Fix First" so downstream contracts that pin the packet
+ * shape stay stable across regenerations.
+ */
+export function isRuntimeFailureBuilderBlocker(text) {
+    const t = text.toLowerCase();
+    return /physical hardware|hardware benchmark|on a real (target )?device|cold p\d{2}|cold[- ]start|device benchmark|runtime failure/.test(t);
+}
 function normalizeKey(text) {
     return stripBriefIdComment(text)
         .toLowerCase()
@@ -280,10 +291,28 @@ export async function createWorkPacket(input) {
             extraManual.add(`[builder] ${blocker}`);
             continue;
         }
-        push("builder", "builder", blocker);
+        push("builder", isRuntimeFailureBuilderBlocker(blocker) ? "runtime" : "builder", blocker);
     }
-    candidates.sort((a, b) => a.priority - b.priority || a.text.localeCompare(b.text));
-    const items = choosePacketItems(candidates, maxItems);
+    // Tie-break by push order (the numeric `pkt-N` sequence), NOT alphabetical
+    // text. Equal-priority items (e.g. two `must` builder-directives) must keep
+    // the order they were inserted. Text sorting reshuffled same-priority rows
+    // every cycle (pkt-3 before pkt-2), which repos that pin a canonical
+    // WORK_PACKET order (GutCheck's foundry-root-artifacts test) flag as QA-sync
+    // drift — causing an endless fix→regress loop.
+    const packetSeq = (item) => {
+        const n = Number.parseInt(item.id.replace(/^pkt-/, ""), 10);
+        return Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER;
+    };
+    // Priority drives which items make the cut when there are more candidates
+    // than maxItems...
+    candidates.sort((a, b) => a.priority - b.priority || packetSeq(a) - packetSeq(b));
+    // ...but the stored packet is ordered by stable push sequence (pkt-1, pkt-2,
+    // …) so the on-disk item order never drifts between regenerations. A
+    // priority-ordered store reshuffled rows whenever a section's priority
+    // differed from its push position (e.g. a runtime builder blocker jumping
+    // ahead of must items), which repos pinning a canonical WORK_PACKET order
+    // flagged as drift, causing an endless fix→regress loop.
+    const items = choosePacketItems(candidates, maxItems).sort((a, b) => packetSeq(a) - packetSeq(b));
     const selectedKeys = new Set(items.map((item) => item.key));
     const deferredCounts = emptyDeferredCounts();
     for (const candidate of candidates) {
@@ -322,7 +351,19 @@ export async function refreshWorkPacket(repoPath, packet, signals) {
             nextStatus = "manual_only";
         }
         else if (item.source === "brief") {
-            nextStatus = checkedKeys.has(item.key) ? "closed" : "open";
+            // Config-injected builder-directives are `source: "brief"` but never
+            // appear in the brief's checkbox list. Preserve their prior status
+            // when the brief signals say nothing about them, instead of
+            // re-opening gate-closed directives every refresh.
+            if (checkedKeys.has(item.key)) {
+                nextStatus = "closed";
+            }
+            else if (openKeys.has(item.key)) {
+                nextStatus = "open";
+            }
+            else {
+                nextStatus = item.status;
+            }
         }
         else if (signals.codeChanged && !openKeys.has(item.key)) {
             nextStatus = "closed";

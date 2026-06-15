@@ -1,5 +1,6 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, access } from "node:fs/promises";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { mintBriefItemId, parseBriefIdComment, stripBriefIdComment } from "@foundry/core/briefIntent";
 import { isEnvironmentalWorkItem, type BuildSpecSlice } from "@foundry/core/buildSpec";
@@ -78,6 +79,20 @@ export type WorkPacketSourceInput = PacketSignals & {
 /** Builder-stage gaps that are ops/infra noise, not product work for Cursor. */
 export function isEnvironmentalBuilderGap(text: string): boolean {
   return isEnvironmentalWorkItem(text);
+}
+
+/**
+ * Builder-stage blockers that describe a runtime / on-device performance gap
+ * (hardware benchmark, cold-start latency) belong in the `runtime` section, not
+ * the generic `builder` bucket. They keep `source: "builder"` but are read as
+ * "Runtime Failures To Fix First" so downstream contracts that pin the packet
+ * shape stay stable across regenerations.
+ */
+export function isRuntimeFailureBuilderBlocker(text: string): boolean {
+  const t = text.toLowerCase();
+  return /physical hardware|hardware benchmark|on a real (target )?device|cold p\d{2}|cold[- ]start|device benchmark|runtime failure/.test(
+    t,
+  );
 }
 
 function normalizeKey(text: string): string {
@@ -331,7 +346,31 @@ export async function createWorkPacket(input: WorkPacketSourceInput): Promise<Wo
     });
   };
 
+  // Load the prior packet once: it seeds both the QA guard carry-forward below
+  // and the closed-status merge further down.
+  let priorPacket: WorkPacket | undefined;
+  try {
+    priorPacket = JSON.parse(
+      await readFile(packetPaths(input.repoPath).json, "utf8"),
+    ) as WorkPacket;
+  } catch {
+    /* first packet */
+  }
+
   for (const blocker of input.qaCodeBlockers) push("qa", "qa", blocker);
+
+  // When the pipeline is QA-clean there are no live `qa` blockers, so a naive
+  // rebuild would drop the leading QA row entirely. Because pkt-N ids are
+  // positional, that renumbers every following row (builder-directives slide
+  // from pkt-2/pkt-3 onto pkt-1/pkt-2). Repos that pin a canonical WORK_PACKET
+  // shape then fail QA on the very next cycle — the classic green→red→green
+  // flip-flop. Carry the prior QA guard row(s) forward (the closed-status merge
+  // below keeps them closed) so the packet shape stays stable once it goes green.
+  if (input.qaCodeBlockers.length === 0 && priorPacket) {
+    for (const it of priorPacket.items) {
+      if (it.source === "qa") push("qa", "qa", it.text);
+    }
+  }
 
   for (const directive of input.projectBuilderDirectives ?? []) {
     if (isStructuralNonCodeBriefItem(directive) || isNoOpPacketText(directive)) continue;
@@ -376,15 +415,30 @@ export async function createWorkPacket(input: WorkPacketSourceInput): Promise<Wo
       extraManual.add(`[builder] ${blocker}`);
       continue;
     }
-    push("builder", "builder", blocker);
+    push("builder", isRuntimeFailureBuilderBlocker(blocker) ? "runtime" : "builder", blocker);
   }
 
-  candidates.sort((a, b) => a.priority - b.priority || a.text.localeCompare(b.text));
-  let items = choosePacketItems(candidates, maxItems);
+  // Tie-break by push order (the numeric `pkt-N` sequence), NOT alphabetical
+  // text. Equal-priority items (e.g. two `must` builder-directives) must keep
+  // the order they were inserted — QA blocker, then configured directives in
+  // project.yaml order, then buildspec/brief/builder. Text sorting reshuffled
+  // same-priority rows every cycle (pkt-3 before pkt-2), which repos that pin a
+  // canonical WORK_PACKET order (GutCheck's foundry-root-artifacts test) flag as
+  // QA-sync drift — causing an endless fix→regress loop.
+  const packetSeq = (item: WorkPacketItem): number => {
+    const n = Number.parseInt(item.id.replace(/^pkt-/, ""), 10);
+    return Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER;
+  };
+  // Priority drives which items make the cut when there are more candidates than
+  // maxItems, but the stored packet is ordered by stable push sequence so the
+  // on-disk item order never drifts between regenerations.
+  candidates.sort((a, b) => a.priority - b.priority || packetSeq(a) - packetSeq(b));
+  let items = choosePacketItems(candidates, maxItems).sort(
+    (a, b) => packetSeq(a) - packetSeq(b),
+  );
   const blockerKeys = new Set(input.qaCodeBlockers.map((b) => normalizeKey(b)));
-  try {
-    const priorRaw = await readFile(packetPaths(input.repoPath).json, "utf8");
-    const prior = JSON.parse(priorRaw) as WorkPacket;
+  if (priorPacket) {
+    const prior = priorPacket;
     const priorClosed = new Map(
       prior.items.filter((i) => i.status === "closed").map((i) => [i.key, i] as const),
     );
@@ -395,8 +449,6 @@ export async function createWorkPacket(input: WorkPacketSourceInput): Promise<Wo
       }
       return item;
     });
-  } catch {
-    /* first packet */
   }
   const selectedKeys = new Set(items.map((item) => item.key));
   const deferredCounts = emptyDeferredCounts();
@@ -439,7 +491,19 @@ export async function refreshWorkPacket(
     if (manualKeys.has(item.key)) {
       nextStatus = "manual_only";
     } else if (item.source === "brief") {
-      nextStatus = checkedKeys.has(item.key) ? "closed" : "open";
+      // Config-injected builder-directives are `source: "brief"` but never
+      // appear in the brief's checkbox list, so neither checkedKeys nor openKeys
+      // know about them. Forcing them back to "open" every refresh re-opened
+      // gate-closed directives endlessly (reopenCount climbed into the hundreds)
+      // and made the convergence board read "not progressing". Preserve their
+      // prior status when the brief signals say nothing about them.
+      if (checkedKeys.has(item.key)) {
+        nextStatus = "closed";
+      } else if (openKeys.has(item.key)) {
+        nextStatus = "open";
+      } else {
+        nextStatus = item.status;
+      }
     } else if (item.source === "qa" || item.source === "builder") {
       nextStatus = openKeys.has(item.key) ? "open" : "closed";
     } else if (signals.codeChanged && !openKeys.has(item.key)) {
@@ -457,6 +521,56 @@ export async function refreshWorkPacket(
     updatedAt: new Date().toISOString(),
     briefBacklogOpen: signals.briefOpenItems.length,
     manualOnly: [...new Set(signals.manualOnly)],
+    items,
+  };
+  await writePacketFiles(repoPath, updated);
+  return updated;
+}
+
+async function readBuilderDirectiveGateState(
+  repoPath: string,
+): Promise<{ convergence: boolean; proofLoop: boolean } | null> {
+  const contractJs = join(repoPath, "apps/mobile/foundryContract.js");
+  try {
+    await access(contractJs);
+    const mod = (await import(pathToFileURL(contractJs).href)) as {
+      isBuilderDirectiveConvergenceContractVerified?: () => boolean;
+      isBuilderDirectiveProofLoopVerified?: () => boolean;
+    };
+    if (
+      typeof mod.isBuilderDirectiveConvergenceContractVerified !== "function" ||
+      typeof mod.isBuilderDirectiveProofLoopVerified !== "function"
+    ) {
+      return null;
+    }
+    return {
+      convergence: mod.isBuilderDirectiveConvergenceContractVerified(),
+      proofLoop: mod.isBuilderDirectiveProofLoopVerified(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Close standing `builder.directives` packet rows when repo contract gates pass. */
+export async function syncBuilderDirectivePacketClosure(
+  repoPath: string,
+  packet: WorkPacket,
+): Promise<WorkPacket> {
+  const gates = await readBuilderDirectiveGateState(repoPath);
+  if (!gates?.convergence || !gates?.proofLoop) return packet;
+
+  let changed = false;
+  const items = packet.items.map((item) => {
+    if (item.status !== "open" || !item.text.includes("[builder-directive]")) return item;
+    changed = true;
+    return { ...item, status: "closed" as const };
+  });
+  if (!changed) return packet;
+
+  const updated: WorkPacket = {
+    ...packet,
+    updatedAt: new Date().toISOString(),
     items,
   };
   await writePacketFiles(repoPath, updated);
