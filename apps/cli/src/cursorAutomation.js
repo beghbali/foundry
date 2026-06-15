@@ -136,7 +136,7 @@ export function resolveCursorAutomationSettings(config, overrides) {
     return {
         enabled: overrides?.enabled ?? raw?.enabled ?? false,
         command: overrides?.command ?? raw?.command ?? process.env.FOUNDRY_CURSOR_AGENT_CMD ?? "agent",
-        /** Default `auto` omits `--model` so the Cursor agent uses your workspace default (CLI may reject `--model auto`). Override in project.yaml or FOUNDRY_BUILDER_MODEL. */
+        /** Default `auto` passes `--model auto` explicitly (required on Free plan; omitting `--model` picks a named default and fails). */
         builderModel: overrides?.builderModel ?? raw?.builder_model ?? envPrimary ?? "auto",
         builderFastModel: overrides?.builderFastModel ??
             raw?.builder_fast_model ??
@@ -1346,7 +1346,7 @@ async function runCursorAgent(repoPath, runId, command, model, prompt, timeoutMi
         "--approve-mcps",
         "--workspace",
         repoPath,
-        ...(cursorAgentUsesImplicitModel(model) ? [] : ["--model", model]),
+        ...buildCursorAgentModelArgs(model),
         prompt,
     ];
     const shellCommand = [command, ...args.map(shellQuote)].join(" ");
@@ -1369,6 +1369,27 @@ async function runCursorAgent(repoPath, runId, command, model, prompt, timeoutMi
         const retryable = isLikelyCursorTransportFailure(blob);
         if (!retryable || attempt >= maxAttempts)
             break;
+    }
+    if (result.exitCode !== 0) {
+        const blob = `${result.stdout}\n${result.stderr}`;
+        if (isCursorFreePlanAutoOnlyError(blob)) {
+            await appendFile(logPath, `\n\n=== FOUNDRY AUTO FALLBACK (free plan — retrying with --model auto) ===\nconfigured: ${model}\n\n`, "utf8");
+            const autoArgs = [
+                "-p",
+                "--output-format",
+                "text",
+                "--force",
+                "--trust",
+                "--approve-mcps",
+                "--workspace",
+                repoPath,
+                "--model",
+                "auto",
+                prompt,
+            ];
+            const autoShellCommand = [command, ...autoArgs.map(shellQuote)].join(" ");
+            result = await exec(autoShellCommand, repoPath, timeoutMinutes * 60_000, logPath, true);
+        }
     }
     const finalFooter = [
         "",
@@ -1586,9 +1607,23 @@ function cursorModelSkipsAvailabilityCheck(model) {
     const m = model.trim().toLowerCase();
     return m === "auto" || m === "default";
 }
-/** Cursor `agent` often rejects `--model auto`; use the app/workspace default by omitting the flag. */
-export function cursorAgentUsesImplicitModel(model) {
+/** CLI args for cursor-agent `--model` (Free plan requires explicit `auto`, not omission). */
+export function buildCursorAgentModelArgs(model) {
+    const m = model.trim().toLowerCase();
+    if (m === "auto" || m === "default")
+        return ["--model", "auto"];
+    return ["--model", model.trim()];
+}
+export function cursorAgentUsesAutoModel(model) {
     return cursorModelSkipsAvailabilityCheck(model);
+}
+/** Cursor Free / Hobby plans reject named `--model` ids; only `auto` works. */
+export function isCursorFreePlanAutoOnlyError(blob) {
+    return /Named models unavailable|Free plans can only use Auto/i.test(blob);
+}
+/** @deprecated Use `cursorAgentUsesAutoModel` — kept for callers expecting the old name. */
+export function cursorAgentUsesImplicitModel(model) {
+    return cursorAgentUsesAutoModel(model);
 }
 export async function preflightCursorModels(command, cwd, models) {
     const shell = process.env.SHELL || "/bin/bash";
@@ -1604,7 +1639,7 @@ export async function preflightCursorModels(command, cwd, models) {
     if (toVerify.length === 0) {
         return {
             ok: true,
-            detail: "Cursor builder uses `auto` / `default` — Foundry omits `--model` (use Cursor's default) and skips `agent models` substring check.",
+            detail: "Cursor builder uses `auto` / `default` — passes `--model auto` explicitly (required on Free plan).",
         };
     }
     // Parse the model list into the exact set of identifiers cursor-agent

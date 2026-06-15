@@ -14,13 +14,15 @@ export type DurableShipContext = {
   cursorQaArtifactFileCount: number;
 };
 
-/** True when ship state will survive the next full outer pipeline (not working-tree-only). */
+/** True when ship state will survive the next full outer pipeline (not post-Cursor-only). */
 export function isDurableLoopShip(ctx: DurableShipContext): boolean {
   if (!isQaShipClean(ctx.endQa) || ctx.endQaReused) return false;
-  if (isQaShipClean(ctx.outerQa)) return true;
-  if (ctx.cursorProductFileCount > 0) return true;
-  if (ctx.cursorQaArtifactFileCount > 0) return true;
-  return false;
+  return isQaShipClean(ctx.outerQa);
+}
+
+/** Post-Cursor QA is green but the outer pipeline was red — re-run builder+QA on branch HEAD before merge. */
+export function shouldRunPrePromotePipelineVerify(ctx: DurableShipContext): boolean {
+  return isQaShipClean(ctx.endQa) && !ctx.endQaReused && !isQaShipClean(ctx.outerQa);
 }
 
 export type AutoPromoteDecision = { ok: boolean; reason: string };
@@ -35,22 +37,10 @@ export function evaluateAutoPromoteToMain(ctx: DurableShipContext): AutoPromoteD
   if (isQaShipClean(ctx.outerQa)) {
     return { ok: true, reason: "outer + end-of-cycle QA both ship-clean" };
   }
-  if (ctx.cursorProductFileCount > 0) {
-    return {
-      ok: true,
-      reason: `Cursor committed ${ctx.cursorProductFileCount} product file(s); end QA ship-clean`,
-    };
-  }
-  if (ctx.cursorQaArtifactFileCount > 0) {
-    return {
-      ok: true,
-      reason: `committed ${ctx.cursorQaArtifactFileCount} QA-gating Foundry artifact(s); end QA ship-clean`,
-    };
-  }
   return {
     ok: false,
     reason:
-      "post-Cursor ship only (outer pipeline was red and nothing durable was committed) — skipping merge to main",
+      "outer pipeline was not ship-clean — merge deferred until pre-promote builder+QA verify passes on branch HEAD",
   };
 }
 
@@ -133,8 +123,7 @@ export function logFoundryLoopDiagram(alwaysPromoteToMain: boolean): void {
             │
      ┌──────┴──────────────────────────┐
      │ DURABLE ship?                     │
-     │ (outer ship OR product OR         │
-     │  QA-artifact commits)              │
+     │ (outer ship at cycle start)       │
      └──────┬────────────────────────────┘
             │
      ┌──────┴──────┐
@@ -146,7 +135,7 @@ export function logFoundryLoopDiagram(alwaysPromoteToMain: boolean): void {
             ▼
   ┌─────────────────────┐
   │ Promote to main?    │  ${alwaysPromoteToMain ? "always_promote_to_main: ON" : "always_promote_to_main: OFF"}
-  │                     │  requires durable ship + verify (if outer was red)
+  │                     │  outer ship OR pre-promote builder+QA verify
   └─────────┬───────────┘
             │
      ┌──────┴──────┐

@@ -1,4 +1,4 @@
-import { baselineAppShellStage, builderStage, convergenceContractStage, currentStateAuditStage, feedbackAgentStage, firstPrinciplesStage, flywheelDesignerStage, growthOperatorStage, independentQaStage, investorPanelStage, marketGapAnalysisStage, monetizationArchitectStage, productDefinitionStage, releaseAgentStage, repoInventoryStage } from "@foundry/stages";
+import { baselineAppShellStage, builderStage, convergenceContractStage, currentStateAuditStage, feedbackAgentStage, firstPrinciplesStage, flywheelDesignerStage, grandWizardStage, growthOperatorStage, independentQaStage, investorPanelStage, marketGapAnalysisStage, monetizationArchitectStage, productDefinitionStage, releaseAgentStage, repoInventoryStage } from "@foundry/stages";
 const STAGES = [
     repoInventoryStage,
     currentStateAuditStage,
@@ -9,11 +9,12 @@ const STAGES = [
     convergenceContractStage,
     productDefinitionStage,
     monetizationArchitectStage,
+    feedbackAgentStage,
+    grandWizardStage,
     builderStage,
     independentQaStage,
     releaseAgentStage,
     growthOperatorStage,
-    feedbackAgentStage,
     investorPanelStage,
 ];
 let cached;

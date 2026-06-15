@@ -1,5 +1,180 @@
 import { execFile } from "node:child_process";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { writeStageMarkdown } from "@foundry/core/artifacts";
+import { readBuildSpecFromRepo, readBuildSpecLedger } from "@foundry/core/buildSpec";
+const execFileAsync = promisify(execFile);
+const INVESTOR_PANEL_STATE_REL = ".foundry/INVESTOR_PANEL_STATE.json";
+async function readInvestorPanelState(repoPath) {
+    try {
+        const raw = await readFile(join(repoPath, INVESTOR_PANEL_STATE_REL), "utf8");
+        return JSON.parse(raw);
+    }
+    catch {
+        return undefined;
+    }
+}
+async function writeInvestorPanelState(repoPath, state) {
+    await writeFile(join(repoPath, INVESTOR_PANEL_STATE_REL), JSON.stringify(state, null, 2) + "\n", "utf8");
+}
+async function gitHeadSha(repoPath) {
+    try {
+        const { stdout } = await execFileAsync("git", ["-C", repoPath, "rev-parse", "HEAD"], { encoding: "utf8" });
+        return stdout.trim();
+    }
+    catch {
+        return "";
+    }
+}
+async function gitDiffStatSinceSha(repoPath, sinceSha) {
+    if (!sinceSha)
+        return { filesChanged: 0, insertions: 0, deletions: 0, topFiles: [], commitCount: 0 };
+    try {
+        const [{ stdout: shortstat }, { stdout: numstat }, { stdout: log }] = await Promise.all([
+            execFileAsync("git", ["-C", repoPath, "diff", "--shortstat", `${sinceSha}..HEAD`], { encoding: "utf8" }),
+            execFileAsync("git", ["-C", repoPath, "diff", "--numstat", `${sinceSha}..HEAD`], { encoding: "utf8" }),
+            execFileAsync("git", ["-C", repoPath, "log", "--oneline", `${sinceSha}..HEAD`], { encoding: "utf8" }),
+        ]);
+        const m = /(\d+)\s+files? changed(?:,\s*(\d+)\s+insertions?\(\+\))?(?:,\s*(\d+)\s+deletions?\(-\))?/.exec(shortstat);
+        const filesChanged = m?.[1] ? Number.parseInt(m[1], 10) : 0;
+        const insertions = m?.[2] ? Number.parseInt(m[2], 10) : 0;
+        const deletions = m?.[3] ? Number.parseInt(m[3], 10) : 0;
+        const topFiles = numstat
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => /^[0-9-]+\s+[0-9-]+\s+/.test(line))
+            .map((line) => {
+            const [a, d, ...f] = line.split(/\s+/);
+            return {
+                file: f.join(" "),
+                churn: (Number.parseInt(a ?? "0", 10) || 0) + (Number.parseInt(d ?? "0", 10) || 0),
+            };
+        })
+            .filter((x) => !x.file.startsWith(".foundry/") && !x.file.startsWith(".maestro-debug/"))
+            .sort((a, b) => b.churn - a.churn)
+            .slice(0, 6)
+            .map((x) => x.file);
+        const commitCount = log.split("\n").filter((l) => l.trim().length > 0).length;
+        return { filesChanged, insertions, deletions, topFiles, commitCount };
+    }
+    catch {
+        return { filesChanged: 0, insertions: 0, deletions: 0, topFiles: [], commitCount: 0 };
+    }
+}
+async function buildSinceLastPitchSection(repoPath) {
+    const state = await readInvestorPanelState(repoPath);
+    const head = await gitHeadSha(repoPath);
+    const spec = await readBuildSpecFromRepo(repoPath);
+    const ledger = await readBuildSpecLedger(repoPath);
+    const completedTaskIds = Object.keys(ledger.tasks);
+    const newlyCompleted = state?.lastCompletedTaskIds
+        ? completedTaskIds.filter((id) => !state.lastCompletedTaskIds.includes(id))
+        : completedTaskIds;
+    const lines = ["", "**SHIPPED SINCE LAST PITCH (grade the delta, not just the elevator):**"];
+    if (!state) {
+        lines.push("- First pitch this run — no prior baseline to diff against.");
+    }
+    else {
+        const diff = await gitDiffStatSinceSha(repoPath, state.lastHeadSha);
+        lines.push(`- Commits: ${diff.commitCount}, files: ${diff.filesChanged}, +${diff.insertions}/-${diff.deletions} LOC since previous pitch (last pitched ${state.lastPitchAt}).`);
+        if (diff.topFiles.length > 0) {
+            lines.push(`- Largest product edits: ${diff.topFiles.map((f) => `\`${f}\``).join(", ")}.`);
+        }
+        if (state.lastGrades) {
+            const prev = Object.entries(state.lastGrades).map(([k, v]) => `${k}=${v}`).join(", ");
+            lines.push(`- Previous grades: ${prev}. Grades should move when shipped work addresses prior directives.`);
+        }
+    }
+    if (newlyCompleted.length > 0) {
+        lines.push("- Concrete task IDs completed (from BUILD_SPEC_LEDGER):");
+        for (const id of newlyCompleted.slice(0, 8)) {
+            const task = spec?.slices[0]?.tasks.find((t) => t.id === id);
+            if (task) {
+                lines.push(`  - **${id}**: ${task.task} (verify: ${task.verification})`);
+            }
+            else {
+                const ledgerEntry = ledger.tasks[id];
+                const filesNote = ledgerEntry && ledgerEntry.filesTouched.length > 0 ? ` files: ${ledgerEntry.filesTouched.slice(0, 3).join(", ")}` : "";
+                lines.push(`  - **${id}**${filesNote}`);
+            }
+        }
+    }
+    if (spec) {
+        const slice = spec.slices[0];
+        const openTasks = slice?.tasks.filter((t) => !(t.id in ledger.tasks)) ?? [];
+        if (openTasks.length > 0) {
+            lines.push(`- Still open this cycle (${openTasks.length}): ${openTasks.map((t) => t.id).slice(0, 6).join(", ")}.`);
+        }
+        if (spec.parentDirectives.length > 0) {
+            const addressedParents = spec.parentDirectives.filter((p) => p.childTaskIds.length > 0 && p.childTaskIds.every((cid) => cid in ledger.tasks));
+            if (addressedParents.length > 0) {
+                lines.push(`- Parent directives now ADDRESSED in code (grade these up): ${addressedParents.map((p) => `"${p.text.slice(0, 80)}"`).join("; ")}.`);
+            }
+        }
+    }
+    if (head) {
+        lines.push(`- Current HEAD: \`${head.slice(0, 8)}\`.`);
+    }
+    return lines.join("\n");
+}
+export async function recordInvestorPanelPitched(repoPath, grades, directives, averageRank) {
+    const head = await gitHeadSha(repoPath);
+    const ledger = await readBuildSpecLedger(repoPath);
+    await writeInvestorPanelState(repoPath, {
+        lastPitchAt: new Date().toISOString(),
+        lastHeadSha: head,
+        lastCompletedTaskIds: Object.keys(ledger.tasks),
+        lastGrades: grades,
+        lastDirectives: [...directives],
+        lastAverageRank: averageRank,
+    });
+}
+/**
+ * Fuzzy match: returns true if `directive` text is recognizably represented in
+ * the ledger's addressed parent directives. Uses normalized prefix + a couple
+ * of distinctive content words to avoid the LLM rewording a directive past us.
+ */
+function directiveMatchesAddressedParent(directive, addressedTexts) {
+    const norm = (s) => s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+    const a = norm(directive);
+    if (a.length === 0)
+        return false;
+    const aPrefix = a.slice(0, 40);
+    const aWords = new Set(a.split(" ").filter((w) => w.length > 4));
+    for (const p of addressedTexts) {
+        const b = norm(p);
+        if (b.length === 0)
+            continue;
+        if (b.includes(aPrefix) || a.includes(b.slice(0, 40)))
+            return true;
+        const bWords = new Set(b.split(" ").filter((w) => w.length > 4));
+        let overlap = 0;
+        for (const w of aWords)
+            if (bWords.has(w))
+                overlap++;
+        if (overlap >= 3 && overlap / Math.max(1, aWords.size) >= 0.4)
+            return true;
+    }
+    return false;
+}
+/**
+ * Inspect whether a re-pitch is justified given the previous pitch's
+ * directives and the BUILD_SPEC_LEDGER. Returns an array of directives that
+ * have not yet been addressed in code. Empty array ⇒ safe to re-pitch.
+ *
+ * Exposed for the loop runner's investor-panel gate.
+ */
+export async function unaddressedDirectivesSinceLastPitch(repoPath) {
+    const state = await readInvestorPanelState(repoPath);
+    if (!state || !state.lastDirectives || state.lastDirectives.length === 0)
+        return [];
+    const ledger = await readBuildSpecLedger(repoPath);
+    const addressedTexts = Object.values(ledger.addressedParents ?? {}).map((p) => p.text);
+    return state.lastDirectives.filter((d) => !directiveMatchesAddressedParent(d, addressedTexts));
+}
+import { INVESTOR_GRADE_ORDER, INVESTOR_ALL_A_MINUS_RANK, investorGradeRank, parseAutonomousInvestorConvergence, computeInvestorTargetFields, } from "@foundry/core/investorGrades";
+import { domainSummaryLine, getDomainKeyUserActions, getDomainNonGoals, getDomainPersonas, getDomainPrimaryMetric, getDomainSuccessExamples, getDomainVocabulary, hasDomain, } from "@foundry/core/projectDomain";
 import { StageInputCompositionSchema } from "@foundry/core/stageInputs";
 import { z } from "zod";
 import { ConvergenceContractOutputSchema } from "./convergence_contract.js";
@@ -7,25 +182,9 @@ import { ProductDefinitionOutputSchema } from "./product_definition.js";
 import { MonetizationOutputSchema } from "./monetization_architect.js";
 import { FlywheelOutputSchema } from "./flywheel_designer.js";
 import { MarketGapOutputSchema } from "./market_gap_analysis.js";
-const GRADE_ORDER = [
-    "F",
-    "D",
-    "C",
-    "C-",
-    "C+",
-    "B-",
-    "B",
-    "B+",
-    "A-",
-    "A",
-    "A+",
-];
-const GradeZod = z.enum(GRADE_ORDER);
-function gradeRank(g) {
-    return GRADE_ORDER.indexOf(g);
-}
-/** A- and above satisfy “at least A band” (not B+). */
-export const INVESTOR_MIN_RANK = gradeRank("A-");
+/** @deprecated Use INVESTOR_ALL_A_MINUS_RANK from `@foundry/core/investorGrades`. */
+export const INVESTOR_MIN_RANK = INVESTOR_ALL_A_MINUS_RANK;
+const GradeZod = z.enum([...INVESTOR_GRADE_ORDER]);
 const PersonaSchema = z.object({
     id: z.enum(["elon_musk", "steve_jobs", "andreessen_horowitz"]),
     displayName: z.string(),
@@ -38,6 +197,9 @@ export const InvestorPanelOutputSchema = z.object({
     worstGrade: GradeZod,
     worstRank: z.number().int(),
     meetsMinimumGradeA: z.boolean(),
+    /** When `foundry.autonomous_investor_convergence` is enabled, pipeline/loop use this bar (mean grade). */
+    meetsInvestorTarget: z.boolean(),
+    averageInvestorRank: z.number(),
     combinedRefinementDirectives: z.array(z.string()),
     refinementRound: z.number().int().min(0),
 });
@@ -155,7 +317,11 @@ const QaEvidenceSchema = z
     blockers: z.array(z.string()).optional(),
 })
     .partial();
-function buildPitchBrief(input) {
+async function buildPitchBrief(input, repoPath) {
+    const sinceLastPitch = await buildSinceLastPitchSection(repoPath);
+    return buildPitchBriefSync(input) + sinceLastPitch;
+}
+function buildPitchBriefSync(input) {
     const name = input.config.project.project_name;
     const ns = input.config.project.north_star;
     const pd = ProductDefinitionOutputSchema.safeParse(input.productDefinition);
@@ -165,6 +331,39 @@ function buildPitchBrief(input) {
     const builderEv = BuilderEvidenceSchema.safeParse(input.builder);
     const qaEv = QaEvidenceSchema.safeParse(input.independentQa);
     const lines = [`**${name}** — ${ns}`, ""];
+    // Domain block: surface the configured product vocabulary and concrete user
+    // actions so the investor LLM grades on the real product, not abstract
+    // north-star phrasing. Without this, panels rated GutCheck (an
+    // ingredient-safety scanner) on generic SaaS criteria.
+    if (hasDomain(input.config.project)) {
+        const domainPrimary = domainSummaryLine(input.config.project);
+        const personas = getDomainPersonas(input.config.project);
+        const actions = getDomainKeyUserActions(input.config.project);
+        const examples = getDomainSuccessExamples(input.config.project);
+        const nonGoals = getDomainNonGoals(input.config.project);
+        const metric = getDomainPrimaryMetric(input.config.project);
+        const vocab = getDomainVocabulary(input.config.project);
+        lines.push("**Domain (project.domain):**");
+        if (domainPrimary)
+            lines.push(`- Primary moment: ${domainPrimary}`);
+        if (personas.length > 0)
+            lines.push(`- Personas: ${personas.join("; ")}`);
+        if (actions.length > 0) {
+            lines.push(`- Key ${vocab.noun}s the product must support:`);
+            for (const a of actions.slice(0, 6))
+                lines.push(`  - ${a}`);
+        }
+        if (examples.length > 0) {
+            lines.push("- Success examples (these are the demos to grade against):");
+            for (const e of examples.slice(0, 6))
+                lines.push(`  - ${e}`);
+        }
+        if (nonGoals.length > 0)
+            lines.push(`- Out of scope: ${nonGoals.join("; ")}`);
+        if (metric)
+            lines.push(`- Primary metric: ${metric}`);
+        lines.push("");
+    }
     // Convergence contract supplies the elevator + loop when present (single source of truth);
     // we deliberately omit parked features so the pitch can't leak deferred surface area.
     if (cc.success) {
@@ -277,9 +476,11 @@ function llmPrompt(input, pitchBrief) {
         "- For each investor, return one grade from: F, D, C, C-, C+, B-, B, B+, A-, A, A+",
         "- Each investor response must be brief (max ~90 words).",
         "- Base the evaluation on the CURRENT state of the product as built (use `builder.status`, `builder.changes.filesCreated/Modified`, `independentQa.recommendation/score/blockers`, and `convergenceContract.isConverged` / `convergenceContract.openObjections`). Do NOT credit the team for capability that is only declared in scope.",
+        "- READ the **SHIPPED SINCE LAST PITCH** section in the pitch brief carefully. If a previous directive you (or another investor) gave is now reflected in completed BUILD_SPEC_LEDGER tasks or git commits, ACKNOWLEDGE the progress in your response and reflect it in your grade — do not repeat directives that have already been addressed.",
+        "- If your prior grade was below the A-band and the shipped delta materially addresses your concern, you should move the grade up. If nothing was shipped or shipped work missed your point, hold or lower the grade and explain why.",
         "- If `convergenceContract.openObjections` contains any `open` or `regressed` objections, treat them as unresolved and reflect that in your grade and response.",
         "- Reward narrowing and parking discipline (one singular loop, parked features in `mustNotShipYet`). Penalise cluttered, multi-bet pitches.",
-        "- If grades are below A-band, include concrete refinement directives that target unresolved objections from `convergenceContract.openObjections` first.",
+        "- If grades are below A-band, include concrete refinement directives that target unresolved objections from `convergenceContract.openObjections` first. Do not re-issue directives already in the `SHIPPED SINCE LAST PITCH` addressed list.",
         "- Output STRICT JSON only. No markdown fences, no prose before/after.",
         "",
         "JSON schema:",
@@ -293,7 +494,10 @@ async function tryRunLlmInvestorPanel(ctx, input, pitchBrief, refinementRound) {
     const command = input.config.project.cursor_automation?.command ?? process.env.FOUNDRY_CURSOR_AGENT_CMD ?? "agent";
     const model = input.config.project.cursor_automation?.qa_model ?? "gpt-5.4-high";
     const prompt = llmPrompt(input, pitchBrief);
-    const implicitModel = ["auto", "default"].includes(model.trim().toLowerCase());
+    const modelName = model.trim().toLowerCase();
+    const modelArgs = modelName === "auto" || modelName === "default"
+        ? ["--model", shellQuote("auto")]
+        : ["--model", shellQuote(model)];
     const shellCommand = [
         command,
         "-p",
@@ -304,7 +508,7 @@ async function tryRunLlmInvestorPanel(ctx, input, pitchBrief, refinementRound) {
         "--approve-mcps",
         "--workspace",
         shellQuote(ctx.repoPath),
-        ...(implicitModel ? [] : ["--model", shellQuote(model)]),
+        ...modelArgs,
         shellQuote(prompt),
     ].join(" ");
     const result = await execShell(shellCommand, ctx.repoPath, 8 * 60_000);
@@ -323,17 +527,16 @@ async function tryRunLlmInvestorPanel(ctx, input, pitchBrief, refinementRound) {
     }
     try {
         const parsed = InvestorPanelLlmDraftSchema.parse(JSON.parse(raw));
-        const ranks = parsed.investors.map((p) => gradeRank(p.grade));
+        const ranks = parsed.investors.map((p) => investorGradeRank(p.grade));
         const worstRank = Math.min(...ranks);
-        return InvestorPanelOutputSchema.parse({
+        return finalizeInvestorPanelOutput({
             pitchBrief: parsed.pitchBrief?.trim() || pitchBrief,
             investors: parsed.investors,
-            worstGrade: GRADE_ORDER[worstRank] ?? "F",
+            worstGrade: INVESTOR_GRADE_ORDER[worstRank] ?? "F",
             worstRank,
-            meetsMinimumGradeA: ranks.every((r) => r >= INVESTOR_MIN_RANK),
             combinedRefinementDirectives: [...new Set(parsed.combinedRefinementDirectives ?? [])].slice(0, 8),
             refinementRound,
-        });
+        }, input);
     }
     catch (err) {
         ctx.logger("[investor_panel] llm parse failed; invalid JSON shape", {
@@ -343,7 +546,7 @@ async function tryRunLlmInvestorPanel(ctx, input, pitchBrief, refinementRound) {
     }
 }
 function responseFor(id, grade, s) {
-    const tighten = gradeRank(grade) < INVESTOR_MIN_RANK
+    const tighten = investorGradeRank(grade) < INVESTOR_ALL_A_MINUS_RANK
         ? " To reach an A-band memo, tighten scope to one heroic claim, add a single crisp success metric with a date, and show how software margins improve as usage grows."
         : " This is fundable at the memo level; ship a narrow wedge and instrument the one metric that proves the loop.";
     if (id === "elon_musk") {
@@ -363,7 +566,7 @@ function responseFor(id, grade, s) {
 function buildDirectives(investors, s) {
     const d = [];
     for (const inv of investors) {
-        if (gradeRank(inv.grade) >= INVESTOR_MIN_RANK)
+        if (investorGradeRank(inv.grade) >= INVESTOR_ALL_A_MINUS_RANK)
             continue;
         if (inv.id === "elon_musk") {
             d.push("Add one 10× bolder milestone and a dated, falsifiable success metric tied to the flywheel.");
@@ -383,6 +586,16 @@ function buildDirectives(investors, s) {
     }
     return [...new Set(d)].slice(0, 8);
 }
+function finalizeInvestorPanelOutput(draft, input) {
+    const grades = draft.investors.map((i) => i.grade);
+    const t = computeInvestorTargetFields(grades, parseAutonomousInvestorConvergence(input.config.project.foundry));
+    return InvestorPanelOutputSchema.parse({
+        ...draft,
+        meetsMinimumGradeA: t.meetsMinimumGradeA,
+        meetsInvestorTarget: t.meetsInvestorTarget,
+        averageInvestorRank: t.averageInvestorRank,
+    });
+}
 export const investorPanelStage = {
     name: "investor_panel",
     description: "Brief investment memo + simulated grades (F–A+) from three archetype investors; emits refinement directives when below A-band.",
@@ -394,7 +607,7 @@ export const investorPanelStage = {
             project: input.config.project.project_name,
             refinementRound,
         });
-        const pitchBrief = buildPitchBrief(input);
+        const pitchBrief = await buildPitchBrief(input, ctx.repoPath);
         const llmOutput = await tryRunLlmInvestorPanel(ctx, input, pitchBrief, refinementRound);
         let output;
         let modeLabel = "GPT-5.4";
@@ -431,20 +644,20 @@ export const investorPanelStage = {
                     response: responseFor("andreessen_horowitz", gA16z, adj),
                 },
             ];
-            const ranks = personas.map((p) => gradeRank(p.grade));
+            const ranks = personas.map((p) => investorGradeRank(p.grade));
             const worstRank = Math.min(...ranks);
-            output = {
+            output = finalizeInvestorPanelOutput({
                 pitchBrief,
                 investors: personas,
-                worstGrade: GRADE_ORDER[worstRank] ?? "F",
+                worstGrade: INVESTOR_GRADE_ORDER[worstRank] ?? "F",
                 worstRank,
-                meetsMinimumGradeA: ranks.every((r) => r >= INVESTOR_MIN_RANK),
-                combinedRefinementDirectives: ranks.every((r) => r >= INVESTOR_MIN_RANK) ? [] : buildDirectives(personas, adj),
+                combinedRefinementDirectives: ranks.every((r) => r >= INVESTOR_ALL_A_MINUS_RANK) ? [] : buildDirectives(personas, adj),
                 refinementRound,
-            };
+            }, input);
             modeLabel = "heuristic fallback";
         }
-        const validated = InvestorPanelOutputSchema.parse(output);
+        const validated = output;
+        const auto = parseAutonomousInvestorConvergence(input.config.project.foundry);
         const md = [
             `# Investor panel — ${input.config.project.project_name}`,
             "",
@@ -459,7 +672,9 @@ export const investorPanelStage = {
             "## Verdict",
             "",
             `- **Worst grade:** ${validated.worstGrade}`,
-            `- **Meets A-band (A- or better):** ${validated.meetsMinimumGradeA ? "yes" : "no"}`,
+            `- **Mean grade rank** (0=F … 10=A+): **${validated.averageInvestorRank.toFixed(2)}**`,
+            `- **All personas in A-band (A- or better):** ${validated.meetsMinimumGradeA ? "yes" : "no"}`,
+            `- **Meets investor target (pipeline bar):** ${validated.meetsInvestorTarget ? "yes" : "no"}${auto.enabled ? ` — autonomous mode: mean ≥ **${auto.minAverageGrade}**` : ""}`,
             validated.combinedRefinementDirectives.length
                 ? ["", "## Refinement directives", "", ...validated.combinedRefinementDirectives.map((d) => `- ${d}`), ""].join("\n")
                 : "",
@@ -468,6 +683,11 @@ export const investorPanelStage = {
             "",
         ].join("\n");
         await writeStageMarkdown(ctx, "investor_panel", "README.md", md);
+        const gradesMap = {};
+        for (const inv of validated.investors) {
+            gradesMap[inv.displayName] = inv.grade;
+        }
+        await recordInvestorPanelPitched(ctx.repoPath, gradesMap, validated.combinedRefinementDirectives, validated.averageInvestorRank);
         return validated;
     },
 };

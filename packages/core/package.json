@@ -14,7 +14,8 @@
     "./investorGrades": "./src/investorGrades.ts",
     "./briefIntent": "./src/briefIntent.ts",
     "./projectDomain": "./src/projectDomain.ts",
-    "./buildSpec": "./src/buildSpec.ts"
+    "./buildSpec": "./src/buildSpec.ts",
+    "./feedbackPolicy": "./src/feedbackPolicy.ts"
   },
   "dependencies": {
     "@foundry/stages": "workspace:*",

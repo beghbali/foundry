@@ -12,4 +12,5 @@ export { independentQaStage, IndependentQaOutputSchema, } from "./independent_qa
 export { releaseAgentStage, ReleaseAgentOutputSchema, } from "./release_agent.js";
 export { growthOperatorStage, GrowthOperatorOutputSchema, } from "./growth_operator.js";
 export { feedbackAgentStage, FeedbackAgentOutputSchema, } from "./feedback_agent.js";
+export { grandWizardStage, GrandWizardOutputSchema, } from "./grand_wizard.js";
 export { investorPanelStage, InvestorPanelOutputSchema, } from "./investor_panel.js";

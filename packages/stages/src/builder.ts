@@ -1686,38 +1686,53 @@ export const builderStage: Stage<StageInputComposition, BuilderOutput> = {
     await writeStageMarkdown(ctx, "builder", "IMPLEMENTATION_PLAN.md", planMd);
 
     const buildSpecLedger = await readBuildSpecLedger(repoPath);
-    const cursorBrief = gwParsed.success
-      ? generateCursorBriefFromBuildSpec(
-          projectName,
-          gwParsed.data,
-          audit,
-          feedback,
-          input.investorRefinement,
-          previousChecklist,
-          buildSpecLedger,
-        )
-      : generateCursorBrief(
-          projectName,
-          audit,
-          pdParsed.success ? pdParsed.data : undefined,
-          monetization,
-          plan,
-          allFileActions,
-          feedback,
-          { paywallGatesDone, edgeRatePathsDone },
-          input.investorRefinement,
-          previousChecklist,
-        );
-    await writeStageMarkdown(ctx, "builder", "CURSOR_BRIEF.md", cursorBrief);
-
-    await mkdir(join(repoPath, ".foundry"), { recursive: true });
-    await writeFile(briefPath, cursorBrief, "utf8");
-    healCursorBriefContractFromRepoScript(repoPath, ctx.logger);
-    notes.push(
-      gwParsed.success
-        ? "Wrote .foundry/CURSOR_BRIEF.md from BUILD_SPEC (Grand Wizard) — template must-ship regen skipped."
-        : "Wrote .foundry/CURSOR_BRIEF.md — open this in Cursor to implement features.",
-    );
+    const skipBriefRegen =
+      openBriefItems.length === 0 && (await fileExists(briefPath));
+    const cursorBrief = skipBriefRegen
+      ? await readFile(briefPath, "utf8")
+      : gwParsed.success
+        ? generateCursorBriefFromBuildSpec(
+            projectName,
+            gwParsed.data,
+            audit,
+            feedback,
+            input.investorRefinement,
+            previousChecklist,
+            buildSpecLedger,
+          )
+        : generateCursorBrief(
+            projectName,
+            audit,
+            pdParsed.success ? pdParsed.data : undefined,
+            monetization,
+            plan,
+            allFileActions,
+            feedback,
+            { paywallGatesDone, edgeRatePathsDone },
+            input.investorRefinement,
+            previousChecklist,
+          );
+    if (!skipBriefRegen) {
+      await writeStageMarkdown(ctx, "builder", "CURSOR_BRIEF.md", cursorBrief);
+      await mkdir(join(repoPath, ".foundry"), { recursive: true });
+      await writeFile(briefPath, cursorBrief, "utf8");
+      notes.push(
+        gwParsed.success
+          ? "Wrote .foundry/CURSOR_BRIEF.md from BUILD_SPEC (Grand Wizard) — template must-ship regen skipped."
+          : "Wrote .foundry/CURSOR_BRIEF.md — open this in Cursor to implement features.",
+      );
+    } else {
+      notes.push(
+        "CURSOR_BRIEF has no open tracked checklist items — skipped brief regen to avoid contract/test oscillation.",
+      );
+    }
+    if (!skipBriefRegen) {
+      healCursorBriefContractFromRepoScript(repoPath, ctx.logger);
+    } else {
+      notes.push(
+        "Skipped brief contract heal — brief unchanged (no open checklist items).",
+      );
+    }
 
     // ---- 8. Determine status ----
     const created = allFileActions.filter((a) => a.action === "created").map((a) => a.file);

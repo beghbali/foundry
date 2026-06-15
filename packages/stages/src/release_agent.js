@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { writeStageMarkdown } from "@foundry/core/artifacts";
+import { stripBriefIdComment } from "@foundry/core/briefIntent";
 import { StageInputCompositionSchema } from "@foundry/core/stageInputs";
 import { z } from "zod";
 import { sh } from "./_shared/exec.js";
@@ -60,6 +61,29 @@ function labelForBriefSection(section) {
 }
 async function scanOpenTrackedBriefItems(repoPath) {
     const briefPath = join(repoPath, ".foundry", "CURSOR_BRIEF.md");
+    // Source of truth: BUILD_SPEC + BUILD_SPEC_LEDGER. The brief markdown's
+    // checkboxes don't survive cycle regenerations, so the release gate now
+    // looks at the wizard spec — a task is "open" iff it isn't in the ledger.
+    try {
+        const [specRaw, ledgerRaw] = await Promise.all([
+            readFile(join(repoPath, ".foundry", "BUILD_SPEC.json"), "utf8"),
+            readFile(join(repoPath, ".foundry", "BUILD_SPEC_LEDGER.json"), "utf8").catch(() => ""),
+        ]);
+        const spec = JSON.parse(specRaw);
+        const ledger = ledgerRaw ? JSON.parse(ledgerRaw) : { tasks: {} };
+        const tasks = spec.slices?.[0]?.tasks ?? [];
+        const closed = ledger.tasks ?? {};
+        const open = tasks.filter((t) => !t.id || !(t.id in closed));
+        const openTrackedLines = open.slice(0, 40).map((t) => {
+            const text = (t.task ?? "").replace(/\s+/g, " ").trim();
+            const truncated = text.length > 280 ? `${text.slice(0, 279)}…` : text;
+            return `[BUILD_SPEC ${t.id ?? "?"}] ${truncated}`;
+        });
+        return { openTrackedItems: open.length, briefPath, openTrackedLines };
+    }
+    catch {
+        /* fall through to legacy brief markdown scan when no spec exists */
+    }
     let raw = "";
     try {
         raw = await readFile(briefPath, "utf8");
@@ -90,7 +114,7 @@ async function scanOpenTrackedBriefItems(repoPath) {
             continue;
         if (section === "other")
             continue;
-        const itemText = trimmed.replace(/^- \[ \]\s*/, "").trim();
+        const itemText = stripBriefIdComment(trimmed.replace(/^- \[ \]\s*/, "").trim());
         if (!itemText)
             continue;
         openTrackedItems++;

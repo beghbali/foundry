@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, existsSync } from "node:fs";
 import { access, appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import chalk from "chalk";
@@ -191,6 +192,43 @@ function envUseBuilderEconomyNearRelease(
   return overrides?.useBuilderEconomyNearRelease ?? raw?.use_builder_economy_near_release ?? true;
 }
 
+function expandHomePath(command: string): string {
+  const trimmed = command.trim();
+  if (trimmed.startsWith("~/")) return join(homedir(), trimmed.slice(2));
+  return trimmed;
+}
+
+/** True when a cursor CLI path exists (relative names are resolved by the shell later). */
+export function cursorAgentCommandExists(command: string): boolean {
+  const trimmed = command.trim();
+  if (!trimmed) return false;
+  if (!trimmed.includes("/")) return true;
+  return existsSync(expandHomePath(trimmed));
+}
+
+/**
+ * Pick the cursor-agent / agent binary. Skips stale `FOUNDRY_CURSOR_AGENT_CMD`
+ * paths when Cursor auto-updates remove old version folders under
+ * `~/.local/share/cursor-agent/versions/`.
+ */
+export function resolveCursorAgentCommand(
+  config: FoundryConfig,
+  overrides?: Partial<CursorAutomationSettings>,
+): string {
+  const raw = config.project.cursor_automation;
+  const candidates: string[] = [];
+  if (overrides?.command?.trim()) candidates.push(overrides.command.trim());
+  if (raw?.command?.trim()) candidates.push(raw.command.trim());
+  const envCmd = process.env.FOUNDRY_CURSOR_AGENT_CMD?.trim();
+  if (envCmd) candidates.push(envCmd);
+  candidates.push("agent");
+
+  for (const candidate of candidates) {
+    if (cursorAgentCommandExists(candidate)) return candidate;
+  }
+  return "agent";
+}
+
 export function resolveCursorAutomationSettings(
   config: FoundryConfig,
   overrides?: Partial<CursorAutomationSettings>,
@@ -200,8 +238,8 @@ export function resolveCursorAutomationSettings(
   const envFast = process.env.FOUNDRY_BUILDER_FAST_MODEL?.trim();
   return {
     enabled: overrides?.enabled ?? raw?.enabled ?? false,
-    command: overrides?.command ?? raw?.command ?? process.env.FOUNDRY_CURSOR_AGENT_CMD ?? "agent",
-    /** Default `auto` omits `--model` so the Cursor agent uses your workspace default (CLI may reject `--model auto`). Override in project.yaml or FOUNDRY_BUILDER_MODEL. */
+    command: resolveCursorAgentCommand(config, overrides),
+    /** Default `auto` passes `--model auto` explicitly (required on Free plan; omitting `--model` picks a named default and fails). */
     builderModel: overrides?.builderModel ?? raw?.builder_model ?? envPrimary ?? "auto",
     builderFastModel:
       overrides?.builderFastModel ??
@@ -1816,7 +1854,7 @@ async function runCursorAgent(
     "--approve-mcps",
     "--workspace",
     repoPath,
-    ...(cursorAgentUsesImplicitModel(model) ? [] : (["--model", model] as const)),
+    ...buildCursorAgentModelArgs(model),
     prompt,
   ];
 
@@ -1847,6 +1885,32 @@ async function runCursorAgent(
     const blob = `${result.stdout}\n${result.stderr}`;
     const retryable = isLikelyCursorTransportFailure(blob);
     if (!retryable || attempt >= maxAttempts) break;
+  }
+
+  if (result.exitCode !== 0) {
+    const blob = `${result.stdout}\n${result.stderr}`;
+    if (isCursorFreePlanAutoOnlyError(blob)) {
+      await appendFile(
+        logPath,
+        `\n\n=== FOUNDRY AUTO FALLBACK (free plan — retrying with --model auto) ===\nconfigured: ${model}\n\n`,
+        "utf8",
+      );
+      const autoArgs = [
+        "-p",
+        "--output-format",
+        "text",
+        "--force",
+        "--trust",
+        "--approve-mcps",
+        "--workspace",
+        repoPath,
+        "--model",
+        "auto",
+        prompt,
+      ];
+      const autoShellCommand = [command, ...autoArgs.map(shellQuote)].join(" ");
+      result = await exec(autoShellCommand, repoPath, timeoutMinutes * 60_000, logPath, true);
+    }
   }
 
   const finalFooter = [
@@ -2069,6 +2133,18 @@ export async function preflightCursorCommand(command: string, cwd: string): Prom
   detail: string;
 }> {
   const shell = process.env.SHELL || "/bin/bash";
+  if (command.includes("/") && !cursorAgentCommandExists(command)) {
+    const envCmd = process.env.FOUNDRY_CURSOR_AGENT_CMD?.trim();
+    let detail =
+      `Cursor command '${command}' does not exist on disk (likely removed by a Cursor CLI auto-update).`;
+    if (envCmd === command) {
+      detail +=
+        " Unset the stale env var (`unset FOUNDRY_CURSOR_AGENT_CMD`) or set `cursor_automation.command` in .foundry/project.yaml to your PATH binary (e.g. `~/.local/bin/cursor-agent`).";
+    } else {
+      detail += " Set `cursor_automation.command` in .foundry/project.yaml to the absolute binary path if needed.";
+    }
+    return { ok: false, detail };
+  }
   const availability = `command -v ${shellQuote(command)} >/dev/null 2>&1 || ${command} --help >/dev/null 2>&1`;
   const availableResult = await execFilePreflight(shell, ["-lc", shellBootstrapCommand(availability)], cwd);
   if (availableResult.exitCode !== 0) {
@@ -2152,9 +2228,25 @@ function cursorModelSkipsAvailabilityCheck(model: string): boolean {
   return m === "auto" || m === "default";
 }
 
-/** Cursor `agent` often rejects `--model auto`; use the app/workspace default by omitting the flag. */
-export function cursorAgentUsesImplicitModel(model: string): boolean {
+/** CLI args for cursor-agent `--model` (Free plan requires explicit `auto`, not omission). */
+export function buildCursorAgentModelArgs(model: string): string[] {
+  const m = model.trim().toLowerCase();
+  if (m === "auto" || m === "default") return ["--model", "auto"];
+  return ["--model", model.trim()];
+}
+
+export function cursorAgentUsesAutoModel(model: string): boolean {
   return cursorModelSkipsAvailabilityCheck(model);
+}
+
+/** Cursor Free / Hobby plans reject named `--model` ids; only `auto` works. */
+export function isCursorFreePlanAutoOnlyError(blob: string): boolean {
+  return /Named models unavailable|Free plans can only use Auto/i.test(blob);
+}
+
+/** @deprecated Use `cursorAgentUsesAutoModel` — kept for callers expecting the old name. */
+export function cursorAgentUsesImplicitModel(model: string): boolean {
+  return cursorAgentUsesAutoModel(model);
 }
 
 export async function preflightCursorModels(
@@ -2182,7 +2274,7 @@ export async function preflightCursorModels(
     return {
       ok: true,
       detail:
-        "Cursor builder uses `auto` / `default` — Foundry omits `--model` (use Cursor's default) and skips `agent models` substring check.",
+        "Cursor builder uses `auto` / `default` — passes `--model auto` explicitly (required on Free plan).",
     };
   }
 

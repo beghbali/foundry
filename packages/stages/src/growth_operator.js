@@ -1,6 +1,7 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { writeStageMarkdown } from "@foundry/core/artifacts";
+import { domainSummaryLine, getDomainPrimaryMetric, } from "@foundry/core/projectDomain";
 import { StageInputCompositionSchema } from "@foundry/core/stageInputs";
 import { z } from "zod";
 import { BuilderOutputSchema } from "./builder.js";
@@ -449,9 +450,15 @@ export const growthOperatorStage = {
         const productOut = productParsed.success ? productParsed.data : undefined;
         const flywheelAlignment = flywheelAlignmentRows(flyParsed, productOut, builderOut);
         const runHistory = await computeRunHistory(ctx.repoPath, ctx.runId, metricsSnapshot);
-        const recommendations = [
-            `Align the next ${experiments.length} experiments with north star: ${northStar.slice(0, 160)}${northStar.length > 160 ? "…" : ""}`,
-        ];
+        // Domain-aware framing: when project.domain is configured, prefer the
+        // configured primary metric / moment over the generic north_star summary
+        // so growth experiments target the same outcome the brief is being graded on.
+        const domainPrimary = domainSummaryLine(input.config.project);
+        const domainMetric = getDomainPrimaryMetric(input.config.project);
+        const headlineRec = domainPrimary
+            ? `Align the next ${experiments.length} experiments with the configured primary moment: ${domainPrimary}${domainMetric ? ` (target: ${domainMetric})` : ""}.`
+            : `Align the next ${experiments.length} experiments with north star: ${northStar.slice(0, 160)}${northStar.length > 160 ? "…" : ""}`;
+        const recommendations = [headlineRec];
         if (productStage === "pre_launch") {
             recommendations.push("Stay focused on release readiness: conversion experiments are secondary until the build ships.");
         }

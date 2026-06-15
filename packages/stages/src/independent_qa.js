@@ -32,6 +32,86 @@ export const IndependentQaOutputSchema = z.object({
     autoFixable: z.array(z.string()),
     recommendation: z.enum(["ship", "fix_first", "blocked"]),
 });
+/**
+ * Attempt to ensure at least one iOS Simulator is in the `Booted` state before
+ * running Maestro. Returns a one-line status string for logging. Best-effort:
+ * never throws, never blocks indefinitely, returns silently when `xcrun` isn't
+ * available (non-macOS hosts) or when a sim is already booted.
+ *
+ * This addresses the "Maestro smoke did not run: no booted simulator/device"
+ * warning that started appearing once we stopped manually booting sims. The
+ * historic behavior of the loop depended on a long-lived booted sim; this
+ * helper restores it without requiring operator setup.
+ */
+async function ensureBootedIosSimulator(repoPath, config) {
+    if (process.platform !== "darwin") {
+        return { ok: false, note: "skipped: not darwin", bootedNow: false };
+    }
+    const xcrun = await sh("command -v xcrun", repoPath, 5_000);
+    if (xcrun.exitCode !== 0) {
+        return { ok: false, note: "skipped: `xcrun` not on PATH", bootedNow: false };
+    }
+    const booted = await sh("xcrun simctl list devices booted --json", repoPath, 10_000);
+    if (booted.exitCode === 0 && /"state"\s*:\s*"Booted"/.test(booted.stdout)) {
+        return { ok: true, note: "already booted", bootedNow: false };
+    }
+    const list = await sh("xcrun simctl list devices available --json", repoPath, 15_000);
+    if (list.exitCode !== 0) {
+        return { ok: false, note: `xcrun simctl list failed: ${truncate(list.stderr || list.stdout, 160)}`, bootedNow: false };
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(list.stdout);
+    }
+    catch {
+        return { ok: false, note: "could not parse `xcrun simctl list` output", bootedNow: false };
+    }
+    const candidates = [];
+    for (const [runtime, entries] of Object.entries(parsed.devices ?? {})) {
+        if (!runtime.toLowerCase().includes("ios"))
+            continue;
+        for (const entry of entries ?? []) {
+            if (!entry.udid || !entry.name)
+                continue;
+            if (entry.isAvailable === false)
+                continue;
+            candidates.push({ udid: entry.udid, name: entry.name, runtime });
+        }
+    }
+    if (candidates.length === 0) {
+        return { ok: false, note: "no available iOS simulator (install one via Xcode)", bootedNow: false };
+    }
+    const preferred = config.preferredSimulator?.toLowerCase();
+    candidates.sort((a, b) => {
+        const aPref = preferred && a.name.toLowerCase().includes(preferred) ? -10 : 0;
+        const bPref = preferred && b.name.toLowerCase().includes(preferred) ? -10 : 0;
+        if (aPref !== bPref)
+            return aPref - bPref;
+        const aIphone = /^iPhone\b/.test(a.name) ? -5 : 0;
+        const bIphone = /^iPhone\b/.test(b.name) ? -5 : 0;
+        if (aIphone !== bIphone)
+            return aIphone - bIphone;
+        return b.runtime.localeCompare(a.runtime);
+    });
+    const target = candidates[0];
+    const bootResult = await sh(`xcrun simctl boot ${quoteShell(target.udid)}`, repoPath, 60_000);
+    if (bootResult.exitCode !== 0 && !/Booted/.test(bootResult.stderr + bootResult.stdout)) {
+        return {
+            ok: false,
+            note: `boot \`${target.name}\` failed: ${truncate(bootResult.stderr || bootResult.stdout, 160)}`,
+            bootedNow: false,
+        };
+    }
+    const deadline = Date.now() + Math.max(30, config.bootTimeoutSeconds) * 1000;
+    while (Date.now() < deadline) {
+        const status = await sh(`xcrun simctl bootstatus ${quoteShell(target.udid)}`, repoPath, 30_000);
+        if (status.exitCode === 0)
+            break;
+        await new Promise((r) => setTimeout(r, 1500));
+    }
+    await sh("open -a Simulator", repoPath, 10_000);
+    return { ok: true, note: `booted ${target.name} (${target.udid.slice(0, 8)})`, bootedNow: true };
+}
 async function fileExists(path) {
     try {
         await stat(path);
@@ -176,6 +256,9 @@ function resolveMaestroConfig(input) {
         flowPath: maestro?.flow_path ?? ".maestro",
         installIfMissing: maestro?.install_if_missing ?? true,
         pipelineCommand: maestro?.pipeline_command?.trim() || undefined,
+        autoBootSimulator: maestro?.auto_boot_simulator ?? process.platform === "darwin",
+        preferredSimulator: maestro?.preferred_simulator?.trim() || undefined,
+        bootTimeoutSeconds: maestro?.boot_timeout_seconds ?? 90,
     };
 }
 function maestroHomeBinary() {
@@ -217,6 +300,52 @@ function truncate(s, max) {
         return s;
     return `${s.slice(0, max)}\n… [truncated]`;
 }
+/**
+ * Best-effort parser that pulls concrete failing test signal out of a test
+ * runner's combined stdout/stderr. Recognizes Jest (`FAIL path/to/x.test.ts`,
+ * `at Object.<anonymous> (path/to/file.ts:42:7)`), Vitest (`❯ path/to/x.test.ts`,
+ * `FAIL  path/to/x.test.ts > Suite > Test`), and Mocha (`AssertionError`).
+ *
+ * Returns the unique set of relative test file paths plus the first error
+ * message line — enough context for Cursor to grep/open and fix without
+ * needing to re-run the suite to discover the failure surface.
+ */
+function extractFailingTestDetails(summary) {
+    const lines = summary.split(/\r?\n/);
+    const filesSet = new Set();
+    // Jest/Vitest: `FAIL <path>` or `FAIL  <path> > Suite > Test`
+    for (const line of lines) {
+        const failMatch = line.match(/^\s*(?:FAIL|❯|✖)\s+([^\s>]+\.(?:t|j)sx?|[^\s>]+\.test\.[a-z]+)\b/);
+        if (failMatch) {
+            filesSet.add(failMatch[1]);
+            continue;
+        }
+        // Vitest stack trace: `❯ packages/foo/tests/bar.test.ts:23`
+        const stackMatch = line.match(/[\s(]((?:[a-zA-Z0-9._/-]+\/)?[a-zA-Z0-9._-]+\.(?:t|j)sx?):(\d+)/);
+        if (stackMatch && /(test|spec|__tests__|\.test\.)/i.test(stackMatch[1])) {
+            filesSet.add(stackMatch[1]);
+        }
+    }
+    let firstErrorLine = "";
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed)
+            continue;
+        if (/^(Error|AssertionError|TypeError|ReferenceError|SyntaxError):/.test(trimmed)) {
+            firstErrorLine = trimmed.slice(0, 200);
+            break;
+        }
+        if (/expected\s+.+\s+to\s+(?:be|equal|match)/i.test(trimmed)) {
+            firstErrorLine = trimmed.slice(0, 200);
+            break;
+        }
+        if (/^✖\s/.test(trimmed) || /^●\s/.test(trimmed)) {
+            firstErrorLine = trimmed.slice(0, 200);
+            break;
+        }
+    }
+    return { failingFiles: [...filesSet], firstErrorLine };
+}
 function estimateLintErrors(stdout, stderr) {
     const blob = `${stdout}\n${stderr}`;
     if (!blob.trim())
@@ -245,6 +374,22 @@ async function countLargeFiles(repoPath) {
         .filter(Boolean);
     return { count, sample: sample.slice(0, 8) };
 }
+/**
+ * Read the previous `independent_qa` output for regression comparison.
+ *
+ * Subtle but important: `foundry loop` runs a *post-Cursor pipeline slice* that
+ * rebuilds `independent_qa`/`release_agent`/etc. but **omits** the `builder`
+ * stage. Those slices write fresh `<runId>/...independent_qa/output.json`
+ * artifacts on top of the Cursor branch state. If we treat them as the
+ * regression baseline, the next outer cycle's pre-Cursor pipeline (which runs
+ * `builder` again from main) inevitably looks like a regression even when
+ * nothing meaningful changed — Cursor's branch had different state than main.
+ *
+ * Strategy: walk runs newest-to-oldest and prefer the most recent run whose
+ * `run.json` manifest *includes* the `builder` stage (a real outer-cycle
+ * baseline). Fall back to the most recent QA artifact only when no pre-Cursor
+ * baseline exists yet (first runs).
+ */
 async function readPreviousIndependentQa(repoPath, currentRunId) {
     const outRoot = join(repoPath, ".foundry", "out");
     let entries;
@@ -255,6 +400,7 @@ async function readPreviousIndependentQa(repoPath, currentRunId) {
         return undefined;
     }
     const runDirs = entries.sort((a, b) => b.localeCompare(a));
+    let fallback;
     for (const runId of runDirs) {
         if (runId === currentRunId)
             continue;
@@ -269,19 +415,35 @@ async function readPreviousIndependentQa(repoPath, currentRunId) {
         const qaDir = sub.find((d) => d.endsWith("_independent_qa"));
         if (!qaDir)
             continue;
-        const outPath = join(runPath, qaDir, "output.json");
+        let qaData;
         try {
-            const raw = await readFile(outPath, "utf8");
+            const raw = await readFile(join(runPath, qaDir, "output.json"), "utf8");
             const parsed = JSON.parse(raw);
             const v = IndependentQaOutputSchema.safeParse(parsed);
-            if (v.success)
-                return v.data;
+            if (!v.success)
+                continue;
+            qaData = v.data;
         }
         catch {
             continue;
         }
+        // Manifest tells us whether this run was a full pre-Cursor outer cycle.
+        let isOuterCyclePreCursor = false;
+        try {
+            const rawManifest = await readFile(join(runPath, "run.json"), "utf8");
+            const manifest = JSON.parse(rawManifest);
+            isOuterCyclePreCursor = (manifest.stages ?? []).some((s) => s.stage === "builder" && s.status !== "skipped" && s.status !== "pending");
+        }
+        catch {
+            // Older runs may not have a parsable manifest; treat as unknown and only
+            // use as last-resort fallback below.
+        }
+        if (isOuterCyclePreCursor)
+            return qaData;
+        if (!fallback)
+            fallback = qaData;
     }
-    return undefined;
+    return fallback;
 }
 function recommendationFromScore(score) {
     if (score >= 70)
@@ -371,8 +533,23 @@ export const independentQaStage = {
                 passed: testsPassed,
                 details: testsPassed ? `Exit 0 (${cmd})` : `Exit ${r.exitCode} (${cmd}). See testSummary.`,
             });
-            if (!testsPassed)
-                blockers.push("Test suite failed after builder changes.");
+            if (!testsPassed) {
+                // Expand the blocker with concrete failing test paths + the first
+                // assertion/error line. Without this, the work packet only carries
+                // the generic "Test suite failed" string and Cursor has no anchor
+                // (file path, test name) to actually fix anything — the loop spins
+                // for cycles repeating the same vague target.
+                const failingDetails = extractFailingTestDetails(testSummary);
+                if (failingDetails.failingFiles.length > 0 || failingDetails.firstErrorLine) {
+                    const fileList = failingDetails.failingFiles.slice(0, 4).join(", ");
+                    const moreFiles = failingDetails.failingFiles.length > 4 ? ` (+${failingDetails.failingFiles.length - 4} more)` : "";
+                    const errLine = failingDetails.firstErrorLine ? ` First error: ${failingDetails.firstErrorLine}` : "";
+                    blockers.push(`Test suite failed after builder changes.${fileList ? ` Failing files: ${fileList}${moreFiles}.` : ""}${errLine}`);
+                }
+                else {
+                    blockers.push("Test suite failed after builder changes.");
+                }
+            }
         }
         else {
             checks.push({
@@ -452,6 +629,12 @@ export const independentQaStage = {
             }
             else if (maestro.pipelineCommand) {
                 const cmd = maestro.pipelineCommand;
+                if (maestro.autoBootSimulator) {
+                    const boot = await ensureBootedIosSimulator(repoPath, maestro);
+                    ctx.logger("[independent_qa] maestro.simulator", boot);
+                    if (!boot.ok && boot.note !== "skipped: not darwin")
+                        warnings.push(`Simulator auto-boot: ${boot.note}`);
+                }
                 screenshotSinceMs = Date.now();
                 ctx.logger("[independent_qa] maestro", { cmd, mode: "pipeline_command" });
                 const r = await sh(cmd, repoPath, TEST_TIMEOUT_MS);
@@ -506,6 +689,12 @@ export const independentQaStage = {
                     }
                     const debugDir = join(repoPath, ".maestro-debug");
                     const cmd = `${quoteShell(maestroCommand.command)} test ${quoteShell(maestro.flowPath)} --debug-output ${quoteShell(debugDir)} --flatten-debug-output`;
+                    if (maestro.autoBootSimulator) {
+                        const boot = await ensureBootedIosSimulator(repoPath, maestro);
+                        ctx.logger("[independent_qa] maestro.simulator", boot);
+                        if (!boot.ok && boot.note !== "skipped: not darwin")
+                            warnings.push(`Simulator auto-boot: ${boot.note}`);
+                    }
                     screenshotSinceMs = Date.now();
                     ctx.logger("[independent_qa] maestro", { cmd });
                     const r = await sh(cmd, repoPath, TEST_TIMEOUT_MS);

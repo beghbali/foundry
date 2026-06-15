@@ -124,6 +124,12 @@ export const ProjectYamlSchema = z.object({
            * in `foundry loop` until **both** the investor target is met and `convergence_contract` is converged
            * with no open/regressed objections (read from the latest artifact on disk).
            */
+          feedback: z
+            .object({
+              /** Supabase (and other remote) feedback from these emails is auto-approved for implementation. Defaults to bashir@gmail.com. */
+              owner_emails: z.array(z.string().email()).optional(),
+            })
+            .optional(),
           autonomous_investor_convergence: z
             .object({
               enabled: z.preprocess((v) => {

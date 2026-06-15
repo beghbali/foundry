@@ -1,4 +1,6 @@
 import { writeStageMarkdown } from "@foundry/core/artifacts";
+import { ProjectDomainSchema } from "@foundry/core/config";
+import { domainMustShipLines, getDomainKeyUserActions, getDomainNonGoals, getDomainPrimaryMetric, getDomainPrimaryUserAction, getDomainSuccessExamples, getDomainVocabulary, hasDomain, } from "@foundry/core/projectDomain";
 import { InvestorRefinementContextSchema } from "@foundry/core/stageInputs";
 import { z } from "zod";
 import { ConvergenceContractOutputSchema } from "./convergence_contract.js";
@@ -12,6 +14,7 @@ const ProductDefInputSchema = z.object({
             north_star: z.string(),
             core_differentiators: z.array(z.string()).optional(),
             constraints: z.array(z.string()).optional(),
+            domain: ProjectDomainSchema.optional(),
         }),
     }),
     repoInventory: RepoInventoryOutputSchema,
@@ -352,18 +355,36 @@ function buildWebDataPlatform(input, caps) {
     };
 }
 function buildGeneric(input, caps) {
-    const projectName = input.config.project.project_name;
-    const northStar = input.config.project.north_star;
-    const configDifferentiators = input.config.project.core_differentiators ?? [];
+    const project = input.config.project;
+    const projectName = project.project_name;
+    const northStar = project.north_star;
+    const configDifferentiators = project.core_differentiators ?? [];
     const primaryLoop = input.flywheel.flywheel[0];
     const phase1Focus = input.flywheel.focusRecommendation.phase1;
+    // ── Domain block (project.domain) — when present, all generic SaaS phrasing
+    //    below is replaced with the user-supplied vocabulary, primary action,
+    //    and concrete key user actions. This is what previously caused brief
+    //    items to read "Outcome visibility: the user sees a concrete result…"
+    //    even on a barcode-scanner repo.
+    const domainPresent = hasDomain(project);
+    const domainPrimary = getDomainPrimaryUserAction(project);
+    const domainActions = getDomainKeyUserActions(project);
+    const domainExamples = getDomainSuccessExamples(project);
+    const domainNonGoals = getDomainNonGoals(project);
+    const domainMetric = getDomainPrimaryMetric(project);
+    const domainVocab = getDomainVocabulary(project);
+    const domainMustShipFromYaml = domainMustShipLines(project);
     const platform = caps.hasExpo
         ? "mobile (Expo/React Native)"
         : caps.stack === "node"
             ? "web application"
             : "the primary client";
-    const oneLiner = `${projectName} is a ${platform} product that delivers ${northStar.toLowerCase().replace(/\.$/, "")} through an opinionated, guided workflow — so users get results without configuration overhead.`;
-    const targetUser = `Users who need ${northStar.toLowerCase().replace(/\.$/, "")} but find existing tools too broad, too manual, or too slow to deliver value in the first session.`;
+    const oneLiner = domainPresent && domainPrimary
+        ? `${projectName} — ${domainPrimary}`
+        : `${projectName} is a ${platform} product that delivers ${northStar.toLowerCase().replace(/\.$/, "")} through an opinionated, guided workflow — so users get results without configuration overhead.`;
+    const targetUser = domainPresent && (project.domain?.personas?.length ?? 0) > 0
+        ? `Built for ${(project.domain?.personas ?? []).join("; ")}.`
+        : `Users who need ${northStar.toLowerCase().replace(/\.$/, "")} but find existing tools too broad, too manual, or too slow to deliver value in the first session.`;
     const coreWorkflows = primaryLoop
         ? [
             {
@@ -393,54 +414,97 @@ function buildGeneric(input, caps) {
                 successMetric: "next_best_action_completion_rate — % of sessions where the recommended action is completed.",
             },
         ];
-    const differentiators = [
-        ...configDifferentiators,
-        "Opinionated defaults that deliver value before the user invests effort.",
-        "Guided workflow that compounds with usage instead of requiring upfront configuration.",
-    ];
-    const mustShip = [
-        `Core value loop on ${platform}: ${phase1Focus[0] ?? "shortest path from trigger to outcome."}`,
-        "First-session value: a new user completes the primary job without onboarding friction.",
-        ...(caps.hasSupabase ? ["Supabase auth + data persistence for user context."] : []),
-        "Outcome visibility: the user sees a concrete result after each interaction.",
-    ];
-    const shouldShip = [
-        "Progressive personalization as the product learns from usage.",
-        "Notification or reminder when a recurring trigger occurs.",
-        ...(phase1Focus.length > 2 ? [phase1Focus[2]] : []),
-    ];
-    const wontShip = [
-        "Broad feature surface beyond the validated core loop.",
-        "Social or community features before retention is proven.",
-        "Integrations or plugins before the primary workflow is sticky.",
-        "Paid acquisition channels before organic referral signals appear.",
-    ];
-    const acceptanceCriteria = [
-        {
-            id: "AC-01",
-            description: "A new user completes the core job in the first session without guidance.",
-            test: "End-to-end test: new account → complete primary workflow → verify outcome is visible.",
-        },
-        {
-            id: "AC-02",
-            description: "Repeat usage improves recommendation relevance.",
-            test: "Simulate 4 sessions of usage → verify the product adapts output based on accumulated context.",
-        },
-        {
-            id: "AC-03",
-            description: "The primary workflow completes in under 3 seconds on target hardware.",
-            test: "Performance test: measure time from action trigger to visible result.",
-        },
-        ...(caps.hasSupabase
-            ? [
-                {
-                    id: "AC-04",
-                    description: "User context persists and syncs via Supabase.",
-                    test: "Complete an action → sign in on a new device → verify context and history appear.",
-                },
-            ]
-            : []),
-    ];
+    const differentiators = domainPresent
+        ? configDifferentiators
+        : [
+            ...configDifferentiators,
+            "Opinionated defaults that deliver value before the user invests effort.",
+            "Guided workflow that compounds with usage instead of requiring upfront configuration.",
+        ];
+    // ── mustShip — domain block wins outright (so it does not interleave with
+    //    boilerplate). Without a domain, fall back to the previous generic mix.
+    const mustShip = domainMustShipFromYaml.length > 0
+        ? domainMustShipFromYaml
+        : [
+            `Core value loop on ${platform}: ${phase1Focus[0] ?? "shortest path from trigger to outcome."}`,
+            "First-session value: a new user completes the primary job without onboarding friction.",
+            ...(caps.hasSupabase ? ["Supabase auth + data persistence for user context."] : []),
+            "Outcome visibility: the user sees a concrete result after each interaction.",
+        ];
+    const shouldShip = domainPresent
+        ? [
+            // Domain mode: stretch items become things the product would amplify
+            // *next*, anchored on the configured vocabulary. Skip the generic
+            // "Progressive personalization" / "Notification or reminder" lines so
+            // the brief stays specific.
+            ...(domainExamples.length > 0
+                ? [`Cover the success examples documented in project.domain.success_examples (${domainExamples.length} cases).`]
+                : []),
+            ...(phase1Focus.length > 2 ? [phase1Focus[2]] : []),
+        ]
+        : [
+            "Progressive personalization as the product learns from usage.",
+            "Notification or reminder when a recurring trigger occurs.",
+            ...(phase1Focus.length > 2 ? [phase1Focus[2]] : []),
+        ];
+    const wontShip = domainNonGoals.length > 0
+        ? domainNonGoals
+        : [
+            "Broad feature surface beyond the validated core loop.",
+            "Social or community features before retention is proven.",
+            "Integrations or plugins before the primary workflow is sticky.",
+            "Paid acquisition channels before organic referral signals appear.",
+        ];
+    const acceptanceCriteria = domainPresent && domainActions.length > 0
+        ? [
+            {
+                id: "AC-01",
+                description: domainPrimary
+                    ? `A new ${domainVocab.actor} completes "${domainPrimary}" in the first session.`
+                    : `A new ${domainVocab.actor} completes the primary ${domainVocab.noun} in the first session.`,
+                test: `End-to-end: new account → ${domainVocab.verb} → verify ${domainVocab.outcome} is visible.`,
+            },
+            ...domainExamples.slice(0, 3).map((example, i) => ({
+                id: `AC-${String(i + 2).padStart(2, "0")}`,
+                description: `Success example: ${example}`,
+                test: `Reproduce the example end-to-end and verify the stated ${domainVocab.outcome}.`,
+            })),
+            ...(domainMetric
+                ? [
+                    {
+                        id: `AC-${String(2 + Math.min(3, domainExamples.length)).padStart(2, "0")}`,
+                        description: `Primary metric is observable in-app: ${domainMetric}.`,
+                        test: `Instrument the metric and verify it reports for a real ${domainVocab.noun}.`,
+                    },
+                ]
+                : []),
+        ]
+        : [
+            {
+                id: "AC-01",
+                description: "A new user completes the core job in the first session without guidance.",
+                test: "End-to-end test: new account → complete primary workflow → verify outcome is visible.",
+            },
+            {
+                id: "AC-02",
+                description: "Repeat usage improves recommendation relevance.",
+                test: "Simulate 4 sessions of usage → verify the product adapts output based on accumulated context.",
+            },
+            {
+                id: "AC-03",
+                description: "The primary workflow completes in under 3 seconds on target hardware.",
+                test: "Performance test: measure time from action trigger to visible result.",
+            },
+            ...(caps.hasSupabase
+                ? [
+                    {
+                        id: "AC-04",
+                        description: "User context persists and syncs via Supabase.",
+                        test: "Complete an action → sign in on a new device → verify context and history appear.",
+                    },
+                ]
+                : []),
+        ];
     return {
         oneLiner,
         targetUser,

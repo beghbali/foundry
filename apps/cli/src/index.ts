@@ -22,6 +22,10 @@ import {
   taskCompletedByEdits,
   writeBuildSpecLedger,
 } from "@foundry/core/buildSpec";
+import {
+  resolveFeedbackOwnerEmails,
+  type FeedbackImplementationApproval,
+} from "@foundry/core/feedbackPolicy";
 
 import {
   chooseBuilderModel,
@@ -43,6 +47,7 @@ import {
   readStageJson,
   resolveCursorAutomationSettings,
   isLikelyCursorTransportFailure,
+  isCursorFreePlanAutoOnlyError,
   runBuilderAgent,
   commitQaGatingFoundryArtifacts,
   syncCursorBuilderReportFromRecentCommits,
@@ -56,6 +61,7 @@ import {
   evaluateAutoPromoteToMain,
   isDurableLoopShip,
   isQaShipClean,
+  shouldRunPrePromotePipelineVerify,
   logFoundryLoopDiagram,
   releaseCandidateVerdictForCycle,
   type DurableShipContext,
@@ -82,6 +88,7 @@ import {
   workPacketOpenCount,
   workPacketReopenCount,
   workPacketSummaryLine,
+  syncBuilderDirectivePacketClosure,
   type WorkPacket,
 } from "./workPacket.js";
 
@@ -1460,6 +1467,8 @@ type FeedbackLedgerItem = {
   status: "open" | "resolved" | "ignored";
   repoActionable: boolean;
   shouldImplement: boolean;
+  submitterEmail?: string;
+  implementationApproval?: FeedbackImplementationApproval;
   implementationNote?: string;
   presentInLatestCollection: boolean;
 };
@@ -1593,14 +1602,139 @@ function feedbackIdFromSummary(summary: string): string {
 }
 
 function describeFeedbackItem(item: FeedbackLedgerItem): string {
+  const approval =
+    item.implementationApproval && item.implementationApproval !== "auto"
+      ? `approval=${item.implementationApproval}`
+      : null;
   return [
     `[${item.status}]`,
     item.shouldImplement ? "implement=yes" : "implement=no",
+    approval,
     `${item.type}/${item.priority}`,
     item.id,
     "-",
     truncateForDisplay(item.summary, 110),
-  ].join(" ");
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+async function countImplementNowFeedback(repoPath: string): Promise<number> {
+  const ledger = await readFeedbackLedger(repoPath);
+  return ledger.items.filter((item) => item.status === "open" && item.shouldImplement).length;
+}
+
+async function promptPendingFeedbackApprovals(
+  repoPath: string,
+  opts: { noWait: boolean; ownerEmails: Set<string> },
+): Promise<number> {
+  const ledger = await readFeedbackLedger(repoPath);
+  let changed = false;
+
+  for (const item of ledger.items) {
+    if (
+      item.status === "open" &&
+      item.source === "supabase" &&
+      item.implementationApproval === "postponed"
+    ) {
+      item.implementationApproval = "pending";
+      changed = true;
+    }
+  }
+
+  const pending = ledger.items.filter(
+    (item) =>
+      item.status === "open" &&
+      item.source === "supabase" &&
+      item.implementationApproval === "pending" &&
+      !item.shouldImplement,
+  );
+
+  if (pending.length === 0) {
+    if (changed) {
+      ledger.updatedAt = new Date().toISOString();
+      await writeFeedbackLedger(repoPath, ledger);
+    }
+    return countImplementNowFeedback(repoPath);
+  }
+
+  const interactive = process.stdin.isTTY && process.stdout.isTTY && !opts.noWait;
+  if (!interactive) {
+    console.log(
+      chalk.yellow(
+        `  ${pending.length} external feedback item(s) need approval — non-interactive mode; postponing until a TTY loop run.`,
+      ),
+    );
+    for (const item of pending) {
+      if (item.implementationApproval !== "postponed") {
+        item.implementationApproval = "postponed";
+        changed = true;
+      }
+    }
+    if (changed) {
+      ledger.updatedAt = new Date().toISOString();
+      await writeFeedbackLedger(repoPath, ledger);
+    }
+    return countImplementNowFeedback(repoPath);
+  }
+
+  console.log(chalk.bold(`\nFeedback approval (${pending.length} item(s) from other accounts)`));
+  console.log(chalk.gray("Actions: [a] approve  [n] decline  [p] postpone  [q] quit review\n"));
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    for (let index = 0; index < pending.length; index++) {
+      const current = pending[index]!;
+      console.log(chalk.bold(`${index + 1}/${pending.length} ${current.id}`));
+      console.log(`  from: ${current.submitterEmail ?? "unknown"}`);
+      console.log(`  ${current.type}/${current.priority}: ${truncateForDisplay(current.summary, 220)}`);
+      const answer = (await rl.question(chalk.cyan("  Action [a/n/p/q]: "))).trim().toLowerCase();
+      if (answer === "q") {
+        console.log(chalk.yellow("\nStopped feedback approval early.\n"));
+        break;
+      }
+
+      const idx = ledger.items.findIndex((item) => item.id === current.id);
+      if (idx < 0) continue;
+
+      const now = new Date().toISOString();
+      if (answer === "a" || answer === "y") {
+        ledger.items[idx] = {
+          ...ledger.items[idx]!,
+          shouldImplement: true,
+          repoActionable: true,
+          implementationApproval: "approved",
+          lastSeenAt: now,
+        };
+        console.log(chalk.green("  Approved for implementation.\n"));
+      } else if (answer === "n") {
+        ledger.items[idx] = {
+          ...ledger.items[idx]!,
+          shouldImplement: false,
+          implementationApproval: "declined",
+          lastSeenAt: now,
+        };
+        console.log(chalk.gray("  Declined.\n"));
+      } else {
+        ledger.items[idx] = {
+          ...ledger.items[idx]!,
+          shouldImplement: false,
+          implementationApproval: "postponed",
+          lastSeenAt: now,
+        };
+        console.log(chalk.gray("  Postponed until next loop.\n"));
+      }
+      changed = true;
+    }
+  } finally {
+    rl.close();
+  }
+
+  if (changed) {
+    ledger.updatedAt = new Date().toISOString();
+    await writeFeedbackLedger(repoPath, ledger);
+  }
+  return countImplementNowFeedback(repoPath);
 }
 
 async function updateFeedbackItem(
@@ -1684,6 +1818,7 @@ async function reviewFeedbackLedger(repoPath: string, includeClosed = false): Pr
           status: "open",
           shouldImplement: true,
           repoActionable: true,
+          implementationApproval: "approved",
           lastSeenAt: new Date().toISOString(),
         }));
         implemented++;
@@ -2340,8 +2475,9 @@ feedbackProgram
         seenCount: 1,
         status: "open",
         repoActionable: type !== "praise",
-        shouldImplement: Boolean(opts.implement) || type === "bug" || type === "crash",
-        implementationNote: opts.note,
+        shouldImplement: type !== "praise",
+        implementationApproval: "auto",
+        implementationNote: opts.note ?? "CLI/manual feedback — auto-approved for implementation.",
         presentInLatestCollection: true,
       };
       ledger.items.unshift(item);
@@ -2385,6 +2521,7 @@ feedbackProgram
       status: item.status === "ignored" ? "open" : item.status,
       shouldImplement: true,
       repoActionable: true,
+      implementationApproval: "approved",
       implementationNote: opts.note ?? item.implementationNote,
       lastSeenAt: new Date().toISOString(),
     }));
@@ -3164,7 +3301,14 @@ program
             );
           }
         } catch {
-          /* env points to a non-existent path; the preflight will report it. */
+          console.log(
+            chalk.yellow(
+              `  WARNING: FOUNDRY_CURSOR_AGENT_CMD points to a missing binary:\n` +
+                `    ${envPinnedCursor}\n` +
+                `  Foundry is using \`${cursorSettings.command}\` instead. Remove the stale env var:\n` +
+                `    unset FOUNDRY_CURSOR_AGENT_CMD`,
+            ),
+          );
         }
       }
       const preflight = await preflightCursorCommand(cursorSettings.command, repoPath);
@@ -3251,7 +3395,6 @@ program
       let cycleCursorQaArtifactFileCount = 0;
       let endQaReused = false;
       /** Post-Cursor `independent_qa` ran fresh (no cache) and returned ship this cycle. */
-      let cycleEndQaVerifiedFresh = false;
       if (maxCycles > 0 && cycle > maxCycles) {
         console.log(chalk.yellow(`\nReached max cycles (${maxCycles}). Stopping.`));
         break;
@@ -3331,6 +3474,18 @@ program
       let pipelineQa = await readStageJson<PipelineIndependentQa>(repoPath, manifest, "independent_qa");
       outerPipelineQa = pipelineQa;
       let feedbackOutput = await readStageJson<PipelineFeedbackBrief>(repoPath, manifest, "feedback_agent");
+      const feedbackOwnerEmails = resolveFeedbackOwnerEmails(foundryConfig.project.foundry);
+      let implementNowFeedbackCount = await promptPendingFeedbackApprovals(repoPath, {
+        noWait,
+        ownerEmails: feedbackOwnerEmails,
+      });
+      if (implementNowFeedbackCount > 0) {
+        console.log(
+          chalk.cyan(
+            `  Feedback queue: ${implementNowFeedbackCount} open item(s) approved for implementation (CLI + owner auto-approved).`,
+          ),
+        );
+      }
       let builderRemainingBlockers = await readBuilderRemainingBlockers(repoPath);
       let workPacket = await buildWorkPacketForRun({
         repoPath,
@@ -3430,7 +3585,6 @@ program
       previousProgress = initialProgress;
 
       if (cursorSettings.enabled) {
-        let implementNowFeedbackCount = feedbackOutput?.ledgerSummary?.implementNowItems ?? 0;
         let activePacketCounts = packetBriefCounts(workPacket);
         if (pipelineQa?.recommendation === "ship" && implementNowFeedbackCount === 0 && activePacketCounts.total === 0) {
           const parts = [
@@ -3567,6 +3721,7 @@ program
               ],
               codeChanged: false,
             });
+            workPacket = await syncBuilderDirectivePacketClosure(repoPath, workPacket);
             activePacketCounts = packetBriefCounts(workPacket);
           }
           // Guard: don't invoke Cursor when there is literally nothing to do.
@@ -3871,6 +4026,20 @@ program
               // accepts. Exit the OUTER loop, not just the inner.
               modelLookupRejected = true;
             }
+            // Free / Hobby plan: named `--model` ids are rejected; only Auto works.
+            if (isCursorFreePlanAutoOnlyError(agentBlob)) {
+              console.log(
+                chalk.red.bold(
+                  "\n  CURSOR FREE PLAN: named models unavailable — only Auto works on your current plan.",
+                ),
+              );
+              console.log(
+                chalk.yellow(
+                  "  Set `.foundry/project.yaml` → `cursor_automation.builder_model: \"auto\"` (and fast/economy/qa to \"auto\").\n" +
+                    "  Foundry passes `--model auto` explicitly for auto/default; named models retry once with `--model auto` on Free plan.",
+                ),
+              );
+            }
             // Cursor Ultra / plan quota: Opus (or other premium) monthly cap.
             // Retrying with the same model will fail until the billing cycle
             // resets. Point at `auto` so the operator can keep the loop moving.
@@ -3885,9 +4054,9 @@ program
               );
               console.log(
                 chalk.yellow(
-                  "  If API / on-demand usage is exhausted but Auto+Composer still has headroom (see Cursor Usage),\n" +
+                  "  If API / on-demand usage is exhausted but Auto still has headroom (see Cursor Usage),\n" +
                     "  set `.foundry/project.yaml` → `cursor_automation.builder_model: \"auto\"` (and fast/economy: \"auto\").\n" +
-                    "  Foundry omits `--model` so cursor-agent bills against Auto+Composer instead of named opus/gpt-5.4-* models.\n" +
+                    "  Foundry passes `--model auto` explicitly so cursor-agent uses Auto instead of named opus/gpt-5.4-* models.\n" +
                     "  Or one run: FOUNDRY_BUILDER_MODEL=auto FOUNDRY_BUILDER_FAST_MODEL=auto foundry loop ...\n" +
                     "  Avoid opus-* and gpt-5.4-* ids until the billing cycle resets (~check Usage page).",
                 ),
@@ -3939,7 +4108,6 @@ program
           }
 
           pipelineQa = await readStageJson<PipelineIndependentQa>(repoPath, manifest, "independent_qa");
-          cycleEndQaVerifiedFresh = isQaShipClean(pipelineQa) && !endQaReused;
 
           releaseOutput = await readStageJson<ReleaseAgentBrief>(repoPath, manifest, "release_agent");
           const rerunBuilderOutput = await readStageJson<BuilderLoopMeta>(repoPath, manifest, "builder");
@@ -3966,7 +4134,7 @@ program
             cycleProducedInvestorPanel = true;
           }
           feedbackOutput = await readStageJson<PipelineFeedbackBrief>(repoPath, manifest, "feedback_agent");
-          implementNowFeedbackCount = feedbackOutput?.ledgerSummary?.implementNowItems ?? 0;
+          implementNowFeedbackCount = await countImplementNowFeedback(repoPath);
           builderRemainingBlockers = await readBuilderRemainingBlockers(repoPath);
           workPacket = await refreshWorkPacket(repoPath, workPacket, {
             briefOpenItems: stabilize
@@ -3991,6 +4159,7 @@ program
             ],
             codeChanged: builderRun.hadCodeChanges,
           });
+          workPacket = await syncBuilderDirectivePacketClosure(repoPath, workPacket);
           activePacketCounts = packetBriefCounts(workPacket);
 
           // Stop only on durable ship — post-Cursor green without commits does not count.
@@ -4316,11 +4485,11 @@ program
       if (
         alwaysPromoteToMain &&
         builderOutput?.branchName?.startsWith("foundry/") &&
-        promoteDecision.ok &&
-        !isQaShipClean(outerPipelineQa) &&
-        !(cycleEndQaVerifiedFresh && isQaShipClean(pipelineQa) && !endQaReused)
+        shouldRunPrePromotePipelineVerify(endCycleCtx)
       ) {
-        const verifySpinner = ora("Pre-promote QA verify (fresh independent_qa on branch)...").start();
+        const verifySpinner = ora(
+          "Pre-promote verify (builder + independent_qa on branch HEAD — simulates next outer cycle)...",
+        ).start();
         try {
           await syncCursorBuilderReportFromRecentCommits(repoPath);
           await commitQaGatingFoundryArtifacts(repoPath, manifest.runId);
@@ -4330,7 +4499,7 @@ program
             foundryRoot,
             quiet: true,
             allowInvestorRefinement: false,
-            stagesOverride: ["independent_qa"],
+            stagesOverride: ["builder", "independent_qa"],
             disableStageReuse: true,
           });
           const verifyQa = await readStageJson<PipelineIndependentQa>(
@@ -4339,29 +4508,31 @@ program
             "independent_qa",
           );
           if (!isQaShipClean(verifyQa)) {
+            const blocker = verifyQa?.blockers?.[0];
             promoteDecision = {
               ok: false,
-              reason: "pre-promote independent_qa verify failed on branch HEAD",
+              reason: `pre-promote builder+QA verify failed — merge would regress on next outer cycle${blocker ? `: ${truncateForDisplay(blocker, 120)}` : ""}`,
             };
-            verifySpinner.warn("Pre-promote QA verify failed — skipping merge to main.");
+            verifySpinner.warn("Pre-promote builder+QA verify failed — skipping merge to main.");
           } else {
-            verifySpinner.succeed("Pre-promote QA verify passed.");
+            promoteDecision = {
+              ok: true,
+              reason: "pre-promote builder+QA verify passed (outer was red at cycle start)",
+            };
+            verifySpinner.succeed("Pre-promote builder+QA verify passed.");
           }
         } catch (err) {
           promoteDecision = {
             ok: false,
             reason: err instanceof Error ? err.message : String(err),
           };
-          verifySpinner.fail("Pre-promote QA verify errored.");
+          verifySpinner.fail("Pre-promote builder+QA verify errored.");
         }
       } else if (
         alwaysPromoteToMain &&
         builderOutput?.branchName?.startsWith("foundry/") &&
         promoteDecision.ok &&
-        !isQaShipClean(outerPipelineQa) &&
-        cycleEndQaVerifiedFresh &&
-        isQaShipClean(pipelineQa) &&
-        !endQaReused
+        isQaShipClean(outerPipelineQa)
       ) {
         const syncSpinner = ora("Pre-promote: syncing CURSOR_BUILDER_REPORT from branch commits...").start();
         try {

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { writeStageMarkdown } from "@foundry/core/artifacts";
+import { domainSummaryLine, getDomainPersonas, getDomainPrimaryUserAction, getDomainVocabulary, } from "@foundry/core/projectDomain";
 import { StageInputCompositionSchema, } from "@foundry/core/stageInputs";
 import { z } from "zod";
 import { FirstPrinciplesOutputSchema } from "./first_principles.js";
@@ -34,6 +35,15 @@ const InvestorPanelHintSchema = z.object({
     pitchBrief: z.string().optional(),
     refinementRound: z.number().int().min(0).default(0),
     combinedRefinementDirectives: z.array(z.string()).default([]),
+    /**
+     * When `true`, the panel mean grade is at or above the configured target
+     * (e.g. mean >= B+ for autonomous_investor_convergence). Below-target panels
+     * still seed contract objections from individual sub-target investors, but
+     * the combined refinement directives become *advisory* and stop blocking
+     * convergence. Without this conditional, `combinedRefinementDirectives` were
+     * always seeded, so even an at-target panel kept the contract un-converged.
+     */
+    meetsInvestorTarget: z.boolean().optional(),
     investors: z
         .array(z.object({
         id: z.string(),
@@ -336,9 +346,9 @@ const POSITIVE_PHRASES = /^(yes|the best|interesting|promising|useful|great|stro
 function collectObjectionSeeds(panel, ir) {
     const seeds = [];
     if (panel) {
+        // Below-target investors always seed objections (their feedback is the
+        // resolution target). Above-target investors are noted as supporters.
         for (const inv of panel.investors) {
-            // Skip investors who already gave A-band — their narrative response is
-            // approval, not a blocker. (We still ingest panel-level directives below.)
             if (!BLOCKING_GRADES.has(inv.grade))
                 continue;
             const text = inv.response.trim();
@@ -349,18 +359,24 @@ function collectObjectionSeeds(panel, ir) {
                 text,
             });
         }
-        for (const directive of panel.combinedRefinementDirectives) {
-            const t = directive.trim();
-            if (t.length < 12)
-                continue;
-            // Skip purely positive statements that the LLM occasionally emits.
-            if (POSITIVE_PHRASES.test(t) && !/\b(but|however|although|still|yet|need|must|should|require)\b/i.test(t)) {
-                continue;
+        // Combined refinement directives only block convergence when the panel
+        // is *below target*. At target, they're advisory polish notes; treating
+        // them as objections kept good panels from converging.
+        if (panel.meetsInvestorTarget !== true) {
+            for (const directive of panel.combinedRefinementDirectives) {
+                const t = directive.trim();
+                if (t.length < 12)
+                    continue;
+                if (POSITIVE_PHRASES.test(t) && !/\b(but|however|although|still|yet|need|must|should|require)\b/i.test(t)) {
+                    continue;
+                }
+                seeds.push({ source: `directive:r${panel.refinementRound}`, text: t });
             }
-            seeds.push({ source: `directive:r${panel.refinementRound}`, text: t });
         }
     }
     if (ir) {
+        // The refinement loop's own directives stay blocking — they are the
+        // explicit "fix this before re-grading" signal from the runner.
         for (const directive of ir.directives) {
             const t = directive.trim();
             if (t.length < 12)
@@ -485,11 +501,16 @@ function rankObjections(items) {
  * scope discipline can be considered resolved by structural evidence alone —
  * when ALL of:
  *   - exactly one singular loop (always true by schema)
- *   - mustShip count is small (≤ NARRATIVE_TIGHT_MUSTSHIP)
+ *   - mustShip count is at or below the must-ship cap (`NARRATIVE_TIGHT_MUSTSHIP`)
  *   - parked list has real items (≥ 2)
  *   - the product thesis is concise (≤ NARRATIVE_TIGHT_THESIS_CHARS)
+ *
+ * Previously narrative tightness used a stricter threshold (5) than the
+ * structural cap (`MAX_MUST_SHIP = 8`), so a contract with 6–8 must-ship
+ * items was structurally valid but kept seeding narrative objections that
+ * blocked `isConverged: true`. Aligning the two thresholds removes that gap.
  */
-const NARRATIVE_TIGHT_MUSTSHIP = 5;
+const NARRATIVE_TIGHT_MUSTSHIP = MAX_MUST_SHIP;
 const NARRATIVE_TIGHT_THESIS_CHARS = 240;
 function isContractNarrative_Tight(draft) {
     return (draft.mustShip.length > 0 &&
@@ -801,14 +822,26 @@ function buildDraft(args) {
     const ir = input.investorRefinement;
     const projectName = input.config.project.project_name;
     const northStar = input.config.project.north_star;
+    // Domain block lets the contract reuse the configured primary moment / metric
+    // / vocabulary so productThesis isn't a generic "delivers <northStar>" line.
+    const domainPrimary = getDomainPrimaryUserAction(input.config.project);
+    const domainSummary = domainSummaryLine(input.config.project);
+    const domainPersonas = getDomainPersonas(input.config.project);
+    const domainVocab = getDomainVocabulary(input.config.project);
     const singularLoop = buildSingularLoop(flywheel, productDefinition, northStar, ir, input.config.metrics?.metrics);
     const { mustShip, spilled } = pickMustShip(productDefinition, flywheel, singularLoop.name);
     const productThesis = productDefinition?.oneLiner?.trim() ??
-        `${projectName} delivers ${northStar.replace(/\.$/, "")} through one tight loop the user repeats with confidence.`;
+        (domainSummary
+            ? `${projectName} — ${domainSummary}`
+            : `${projectName} delivers ${northStar.replace(/\.$/, "")} through one tight loop the user repeats with confidence.`);
     const targetUser = productDefinition?.targetUser?.trim() ??
-        `Users who need ${northStar.toLowerCase().replace(/\.$/, "")} but are blocked by broad, slow, or untrusted alternatives.`;
+        (domainPersonas.length > 0
+            ? `Built for ${domainPersonas.join("; ")}.`
+            : `Users who need ${northStar.toLowerCase().replace(/\.$/, "")} but are blocked by broad, slow, or untrusted alternatives.`);
     const primaryJobToBeDone = productDefinition?.coreWorkflows[0]?.successMetric?.split("—")[0]?.trim() ??
-        `Complete one trustworthy ${singularLoop.name.toLowerCase()} session.`;
+        (domainPrimary
+            ? domainPrimary
+            : `Complete one trustworthy ${singularLoop.name.toLowerCase()} ${domainVocab.noun}.`);
     // mustNotShipYet: kill_list items + parkable spillover from must-ship + Phase-2 focus
     const parkedNamesSet = new Set();
     const parkedSeeds = [];
@@ -1104,8 +1137,14 @@ export const convergenceContractStage = {
         }, { core_mvp: 0, evidence_needed: 0, later_expansion: 0, do_not_build_yet: 0, rejected: 0 });
         const pdParsed = ProductDefinitionHintSchema.safeParse(input.productDefinition);
         const warnings = computeWarnings(draft, pdParsed.success ? pdParsed.data : undefined, panelData, reconciledObjections);
-        const isConverged = warnings.length === 0 &&
-            draft.mustShip.length > 0 &&
+        // Convergence only requires:
+        //   1. The MVP scope is structurally valid (1..MAX_MUST_SHIP must-ship items).
+        //   2. No open or regressed objections remain.
+        // Warnings (e.g. "thesis is verbose", advisory metric hints) are surfaced
+        // separately but no longer block convergence — they're advisories the loop
+        // can ship through. This keeps an at-target investor panel + tight
+        // contract from being stuck on cosmetic polish.
+        const isConverged = draft.mustShip.length > 0 &&
             draft.mustShip.length <= MAX_MUST_SHIP &&
             reconciledObjections.every((o) => o.status === "resolved" || o.status === "reduced");
         const output = {

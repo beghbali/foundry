@@ -629,7 +629,11 @@ async function tryRunLlmGrandWizard(
     input.config.project.cursor_automation?.command ?? process.env.FOUNDRY_CURSOR_AGENT_CMD ?? "agent";
   const model = input.config.project.cursor_automation?.grand_wizard_model ?? "gpt-5.4-high";
   const prompt = llmPrompt(input, heuristic, alreadyAddressed);
-  const implicitModel = ["auto", "default"].includes(model.trim().toLowerCase());
+  const modelName = model.trim().toLowerCase();
+  const modelArgs =
+    modelName === "auto" || modelName === "default"
+      ? ["--model", shellQuote("auto")]
+      : ["--model", shellQuote(model)];
   const shellCommand = [
     command,
     "-p",
@@ -640,7 +644,7 @@ async function tryRunLlmGrandWizard(
     "--approve-mcps",
     "--workspace",
     shellQuote(ctx.repoPath),
-    ...(implicitModel ? [] : ["--model", shellQuote(model)]),
+    ...modelArgs,
     shellQuote(prompt),
   ].join(" ");
 

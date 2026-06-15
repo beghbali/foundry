@@ -3,6 +3,11 @@ import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 
 import { writeStageMarkdown } from "@foundry/core/artifacts";
+import {
+  isAutoApprovedFeedback,
+  resolveFeedbackOwnerEmails,
+  type FeedbackImplementationApproval,
+} from "@foundry/core/feedbackPolicy";
 import { StageInputCompositionSchema, type StageInputComposition } from "@foundry/core/stageInputs";
 import type { RunContext, Stage } from "@foundry/core/types";
 import { z } from "zod";
@@ -79,6 +84,10 @@ const FeedbackLedgerItemSchema = z.object({
   status: z.enum(["open", "resolved", "ignored"]),
   repoActionable: z.boolean(),
   shouldImplement: z.boolean(),
+  submitterEmail: z.string().optional(),
+  implementationApproval: z
+    .enum(["auto", "pending", "approved", "declined", "postponed"])
+    .optional(),
   implementationNote: z.string().optional(),
   presentInLatestCollection: z.boolean(),
 });
@@ -137,7 +146,9 @@ type FeedbackItem = z.infer<typeof FeedbackLedgerItemSchema>;
 type RawFeedbackItem = Pick<
   FeedbackItem,
   "id" | "type" | "summary" | "priority" | "source" | "relatedGap" | "relatedAC" | "timestamp"
->;
+> & {
+  submitterEmail?: string;
+};
 
 function stableId(parts: string[]): string {
   const h = createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 12);
@@ -285,6 +296,57 @@ async function readPriorFeedbackOutput(
   return undefined;
 }
 
+function extractEmailFromContext(context: unknown): string | undefined {
+  if (!context || typeof context !== "object") return undefined;
+  const record = context as Record<string, unknown>;
+  for (const key of ["email", "user_email", "submitter_email", "author_email"]) {
+    if (typeof record[key] === "string" && record[key]) return record[key]!.trim().toLowerCase();
+  }
+  return undefined;
+}
+
+function extractSubmitterEmail(
+  row: Record<string, unknown>,
+  userEmailById: Map<string, string>,
+): string | undefined {
+  const fromContext = extractEmailFromContext(row.context);
+  if (fromContext) return fromContext;
+  if (typeof row.user_email === "string" && row.user_email) return row.user_email.trim().toLowerCase();
+  if (typeof row.email === "string" && row.email) return row.email.trim().toLowerCase();
+  const userId = typeof row.user_id === "string" ? row.user_id : undefined;
+  if (userId && userEmailById.has(userId)) return userEmailById.get(userId);
+  return undefined;
+}
+
+async function resolveAuthUserEmails(
+  ctx: RunContext,
+  url: string,
+  key: string,
+  userIds: string[],
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  const unique = [...new Set(userIds.filter(Boolean))].slice(0, 100);
+  if (unique.length === 0) return map;
+
+  const esc = (s: string) => s.replace(/'/g, `'\\''`);
+  const base = url.replace(/\/$/, "");
+  for (const userId of unique) {
+    const endpoint = `${base}/auth/v1/admin/users/${userId}`;
+    const cmd = `curl -sS '${esc(endpoint)}' -H 'apikey: ${esc(key)}' -H 'Authorization: Bearer ${esc(key)}'`;
+    const res = await sh(cmd, ctx.repoPath, 15_000);
+    if (res.exitCode !== 0) continue;
+    try {
+      const user = JSON.parse(res.stdout) as { email?: string };
+      if (typeof user.email === "string" && user.email) {
+        map.set(userId, user.email.trim().toLowerCase());
+      }
+    } catch {
+      /* skip malformed auth response */
+    }
+  }
+  return map;
+}
+
 async function collectSupabase(ctx: RunContext): Promise<{ items: RawFeedbackItem[]; available: boolean }> {
   const repoEnv = await readRepoEnv(ctx.repoPath);
   const url =
@@ -318,14 +380,19 @@ async function collectSupabase(ctx: RunContext): Promise<{ items: RawFeedbackIte
   const rows = (await fetchRows("feedback_events")) ?? (await fetchRows("feedback"));
   if (!rows) return { items: [], available: false };
 
+  const userIds = rows
+    .map((row) => (typeof row.user_id === "string" ? row.user_id : undefined))
+    .filter((id): id is string => Boolean(id));
+  const userEmailById = await resolveAuthUserEmails(ctx, url, key, userIds);
+
   const items: RawFeedbackItem[] = [];
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     const summary =
+      (typeof row.text === "string" && row.text) ||
       (typeof row.message === "string" && row.message) ||
       (typeof row.body === "string" && row.body) ||
       (typeof row.summary === "string" && row.summary) ||
-      (typeof row.text === "string" && row.text) ||
       JSON.stringify(row).slice(0, 500);
 
     const rawType = typeof row.type === "string" ? row.type.toLowerCase() : "";
@@ -371,6 +438,7 @@ async function collectSupabase(ctx: RunContext): Promise<{ items: RawFeedbackIte
       priority,
       source: "supabase",
       timestamp: ts,
+      submitterEmail: extractSubmitterEmail(row, userEmailById),
     });
   }
 
@@ -478,7 +546,95 @@ function sortFeedbackItems(items: FeedbackItem[]): FeedbackItem[] {
   });
 }
 
-function mergeLedger(existing: FeedbackLedger, collected: RawFeedbackItem[], collectedAt: string): FeedbackLedger {
+function resolveFeedbackImplementation(
+  raw: RawFeedbackItem,
+  prior: FeedbackItem | undefined,
+  inferred: Pick<FeedbackItem, "repoActionable" | "shouldImplement" | "implementationNote">,
+  ownerEmails: Set<string>,
+): Pick<
+  FeedbackItem,
+  "repoActionable" | "shouldImplement" | "implementationNote" | "submitterEmail" | "implementationApproval"
+> {
+  const submitterEmail = raw.submitterEmail ?? prior?.submitterEmail;
+  const autoApproved = isAutoApprovedFeedback(raw.source, submitterEmail, ownerEmails);
+
+  if (autoApproved && raw.type !== "praise") {
+    return {
+      submitterEmail,
+      repoActionable: true,
+      shouldImplement: true,
+      implementationApproval: "auto",
+      implementationNote:
+        prior?.implementationNote ??
+        (raw.source.startsWith("manual:")
+          ? "CLI/manual feedback — auto-approved for implementation."
+          : "Owner feedback — auto-approved for implementation."),
+    };
+  }
+
+  if (raw.source === "supabase" && !autoApproved) {
+    const priorApproval = prior?.implementationApproval;
+    if (priorApproval === "approved") {
+      return {
+        submitterEmail,
+        repoActionable: true,
+        shouldImplement: true,
+        implementationApproval: "approved",
+        implementationNote: prior?.implementationNote ?? inferred.implementationNote,
+      };
+    }
+    if (priorApproval === "declined") {
+      return {
+        submitterEmail,
+        repoActionable: inferred.repoActionable || prior?.repoActionable || false,
+        shouldImplement: false,
+        implementationApproval: "declined",
+        implementationNote: prior?.implementationNote ?? "Declined during Foundry loop review.",
+      };
+    }
+    return {
+      submitterEmail,
+      repoActionable: inferred.repoActionable || prior?.repoActionable || false,
+      shouldImplement: false,
+      implementationApproval: "pending",
+      implementationNote:
+        prior?.implementationNote ??
+        `External feedback from ${submitterEmail ?? "unknown submitter"} — approve during Foundry loop to implement.`,
+    };
+  }
+
+  const repoActionable = inferred.repoActionable ? (prior?.repoActionable ?? false) || true : prior?.repoActionable ?? false;
+  let shouldImplement = inferred.shouldImplement;
+  if (prior?.shouldImplement === true && (prior.implementationApproval === "approved" || prior.implementationApproval === "auto")) {
+    shouldImplement = true;
+  } else if (inferred.shouldImplement) {
+    shouldImplement = (prior?.shouldImplement ?? false) || true;
+  } else if (prior?.shouldImplement === true && prior.implementationApproval === "approved") {
+    shouldImplement = true;
+  } else {
+    shouldImplement = false;
+  }
+
+  let implementationApproval: FeedbackImplementationApproval | undefined = prior?.implementationApproval;
+  if (shouldImplement && !implementationApproval && inferred.shouldImplement) {
+    implementationApproval = "approved";
+  }
+
+  return {
+    submitterEmail,
+    repoActionable,
+    shouldImplement,
+    implementationApproval,
+    implementationNote: prior?.implementationNote ?? inferred.implementationNote,
+  };
+}
+
+function mergeLedger(
+  existing: FeedbackLedger,
+  collected: RawFeedbackItem[],
+  collectedAt: string,
+  ownerEmails: Set<string>,
+): FeedbackLedger {
   const priorById = new Map(existing.items.map((item) => [item.id, item]));
   const merged: FeedbackItem[] = [];
   const isGeneratedSource = (source: string): boolean =>
@@ -487,8 +643,7 @@ function mergeLedger(existing: FeedbackLedger, collected: RawFeedbackItem[], col
   for (const raw of collected) {
     const prior = priorById.get(raw.id);
     const inferred = inferImplementation(raw);
-    const repoActionable = inferred.repoActionable ? (prior?.repoActionable ?? false) || true : false;
-    const shouldImplement = inferred.shouldImplement ? (prior?.shouldImplement ?? false) || true : false;
+    const resolved = resolveFeedbackImplementation(raw, prior, inferred, ownerEmails);
     const generatedPrior = prior ? isGeneratedSource(prior.source) : false;
     const sameGeneratedSignal = generatedPrior && prior?.summary === raw.summary;
     const status =
@@ -501,8 +656,9 @@ function mergeLedger(existing: FeedbackLedger, collected: RawFeedbackItem[], col
             : (prior?.status ?? "open");
     const shouldRefreshNote =
       !prior?.implementationNote ||
-      (!prior.shouldImplement && shouldImplement) ||
-      (!prior.repoActionable && repoActionable);
+      (!prior.shouldImplement && resolved.shouldImplement) ||
+      (!prior.repoActionable && resolved.repoActionable) ||
+      prior.implementationApproval !== resolved.implementationApproval;
     merged.push({
       id: raw.id,
       type: raw.type,
@@ -516,9 +672,11 @@ function mergeLedger(existing: FeedbackLedger, collected: RawFeedbackItem[], col
       lastSeenAt: collectedAt,
       seenCount: Math.max(1, (prior?.seenCount ?? 0) + 1),
       status,
-      repoActionable,
-      shouldImplement,
-      implementationNote: shouldRefreshNote ? inferred.implementationNote : prior.implementationNote,
+      repoActionable: resolved.repoActionable,
+      shouldImplement: resolved.shouldImplement,
+      submitterEmail: resolved.submitterEmail,
+      implementationApproval: resolved.implementationApproval,
+      implementationNote: shouldRefreshNote ? resolved.implementationNote : prior?.implementationNote,
       presentInLatestCollection: true,
     });
   }
@@ -526,7 +684,7 @@ function mergeLedger(existing: FeedbackLedger, collected: RawFeedbackItem[], col
   for (const prior of existing.items) {
     if (merged.some((item) => item.id === prior.id)) continue;
     const staleGeneratedOpen = prior.status === "open" && isGeneratedSource(prior.source);
-    merged.push({
+    let next: FeedbackItem = {
       ...prior,
       status: staleGeneratedOpen ? "resolved" : prior.status,
       implementationNote: staleGeneratedOpen
@@ -538,7 +696,20 @@ function mergeLedger(existing: FeedbackLedger, collected: RawFeedbackItem[], col
             .join(" ")
         : prior.implementationNote,
       presentInLatestCollection: false,
-    });
+    };
+    if (
+      isAutoApprovedFeedback(prior.source, prior.submitterEmail, ownerEmails) &&
+      prior.status === "open" &&
+      prior.type !== "praise"
+    ) {
+      next = {
+        ...next,
+        repoActionable: true,
+        shouldImplement: true,
+        implementationApproval: "auto",
+      };
+    }
+    merged.push(next);
   }
 
   return {
@@ -1152,7 +1323,8 @@ export const feedbackAgentStage: Stage<StageInputComposition, FeedbackAgentOutpu
     items = crossReference(items, gaps, acs);
 
     const collectedAt = new Date().toISOString();
-    const ledger = mergeLedger(await readFeedbackLedger(ctx.repoPath), items, collectedAt);
+    const ownerEmails = resolveFeedbackOwnerEmails(input.config.project.foundry);
+    const ledger = mergeLedger(await readFeedbackLedger(ctx.repoPath), items, collectedAt, ownerEmails);
     await writeFeedbackLedger(ctx.repoPath, ledger);
 
     const activeItems = sortFeedbackItems(ledger.items.filter((it) => it.status === "open"));
