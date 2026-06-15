@@ -3372,6 +3372,22 @@ program
      * passed `--no-wait` expecting continued convergence.
      */
     let consecutiveAbortCycles = 0;
+    /**
+     * Count of consecutive outer cycles that produced no real progress — no
+     * Cursor product/QA-artifact files, no feedback addressed, and an identical
+     * work-packet / QA signature. Once the build is green but investor
+     * convergence is unreachable (e.g. a fixed panel grade keeps the mean below
+     * target and there is no new work to raise it), the loop otherwise re-runs
+     * the full pipeline forever — burning the ~140s independent_qa stage every
+     * cycle for nothing. After `MAX_CONSECUTIVE_NO_PROGRESS_CYCLES` we stop and
+     * tell the operator how to give the loop new work.
+     */
+    let consecutiveNoProgressCycles = 0;
+    let lastNoProgressSignature: string | undefined;
+    const MAX_CONSECUTIVE_NO_PROGRESS_CYCLES = Number.parseInt(
+      process.env.FOUNDRY_MAX_NOPROGRESS_CYCLES ?? "3",
+      10,
+    );
 
     while (true) {
       cycle++;
@@ -4580,6 +4596,29 @@ program
       investorOutput = await readStageJson<InvestorPanelBrief>(repoPath, manifest, "investor_panel");
       const contractAtRelease = await readContractConvergenceGate(repoPath);
 
+      // Track whether this cycle moved anything real. A cycle that wrote no
+      // Cursor product/QA-artifact files, addressed no feedback, and left the
+      // work-packet / QA signature unchanged is pure spin: nothing fed the
+      // downstream stages (incl. investor_panel) anything new to grade.
+      const cycleNoProductProgress =
+        cycleCursorProductFileCount === 0 &&
+        cycleCursorQaArtifactFileCount === 0 &&
+        implementNowFeedbackCount === 0;
+      const progressSignature = [
+        workPacketOpenCount(workPacket),
+        workPacketClosedCount(workPacket),
+        pipelineQa?.score ?? -1,
+        pipelineQa?.blockers?.length ?? 0,
+      ].join("|");
+      if (!cycleNoProductProgress) {
+        consecutiveNoProgressCycles = 0;
+      } else if (progressSignature === lastNoProgressSignature) {
+        consecutiveNoProgressCycles++;
+      } else {
+        consecutiveNoProgressCycles = 1;
+      }
+      lastNoProgressSignature = progressSignature;
+
       if (releaseOutput?.status === "awaiting_approval") {
         const invMetPost = investorPanelMetTarget(investorOutput, foundryConfig.project.foundry, loopProfile);
         if (autonomousInv.deferReleaseUntilInvestorTarget && (!invMetPost || !contractAtRelease.ok)) {
@@ -4591,6 +4630,36 @@ program
               `\n  Autonomous investor convergence: skipping release approval and EAS prompts (${reasons.join("; ")}).`,
             ),
           );
+          if (consecutiveNoProgressCycles >= MAX_CONSECUTIVE_NO_PROGRESS_CYCLES) {
+            console.log(chalk.red.bold("\n  LOOP STALLED — STOPPING TO SAVE COMPUTE"));
+            console.log(
+              chalk.red(
+                `  ${consecutiveNoProgressCycles} consecutive cycles produced no new product code, no packet movement, and no QA change, yet investor convergence is still unmet (${reasons.join("; ")}).`,
+              ),
+            );
+            console.log(
+              chalk.red(
+                "  The pipeline cannot raise investor grades without new work, so re-running it just burns the independent_qa stage each cycle.",
+              ),
+            );
+            console.log(chalk.yellow("\n  To make progress, pick one:"));
+            console.log(
+              chalk.yellow(
+                "  • Approve/ship the current green build: re-run `foundry ship` (or `foundry loop` without --no-wait) in a TTY and approve.",
+              ),
+            );
+            console.log(
+              chalk.yellow(
+                "  • Give the loop new work: add/refine `builder.directives` in .foundry/project.yaml, or re-run with `--reset-spec` to revive dropped directives.",
+              ),
+            );
+            console.log(
+              chalk.yellow(
+                "  • Lower the bar in .foundry/project.yaml under `foundry.autonomous_investor_convergence`: set `min_average_grade` (or `defer_release_prompt_until_investor_target: false`, or `enabled: false`) if B+ is unreachable for this scope.\n",
+              ),
+            );
+            break;
+          }
           console.log(
             chalk.gray(
               "  Continuing the outer loop: next cycle runs the full pipeline (including feedback_agent) so Supabase + ledger feedback stay merged before Cursor.\n",
