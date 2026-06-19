@@ -13,6 +13,13 @@ const BuilderDirectiveSchema = z.preprocess(
     description: z.string(),
     files: z.array(z.string()).default([]),
     notes: z.string().optional(),
+    /**
+     * "add" (default) = build/wire this surface. "remove" = strip this surface
+     * from user-facing screens; the directive is verified by its ABSENCE
+     * (e.g. a test/Maestro assertion that the text/testID no longer appears),
+     * not by new code. Lets the loop subtract clutter, not only accrete it.
+     */
+    action: z.enum(["add", "remove"]).default("add"),
   }),
 );
 
@@ -103,6 +110,12 @@ export const ProjectYamlSchema = z.object({
       z
         .object({
           apply_baseline_shell: z.boolean().optional(),
+          /**
+           * Informational pin of the Foundry engine version (git short SHA) that
+           * produced/validated this project's runs. Lets you reproduce/bisect which
+           * engine change caused a behavior change. Not enforced at runtime.
+           */
+          engine_pin: z.string().optional(),
           /**
            * Single long-lived branch for builder commits until release (e.g. `foundry/release`).
            * When omitted, each pipeline run uses `foundry/<runId>` (legacy).

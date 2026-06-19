@@ -268,6 +268,12 @@ export const InvestorPanelOutputSchema = z.object({
   averageInvestorRank: z.number(),
   combinedRefinementDirectives: z.array(z.string()),
   refinementRound: z.number().int().min(0),
+  /**
+   * True when the panel could not actually grade the product (LLM grader
+   * unavailable) and Foundry failed closed instead of grading planning docs.
+   * Such a panel never satisfies the convergence bar.
+   */
+  panelUnavailable: z.boolean().optional(),
 });
 
 export type InvestorPanelOutput = z.infer<typeof InvestorPanelOutputSchema>;
@@ -748,6 +754,59 @@ function buildDirectives(
   return [...new Set(d)].slice(0, 8);
 }
 
+/**
+ * Whether the document-only heuristic fallback is explicitly opted into. By
+ * default the panel fails closed when the LLM grader is unavailable, because
+ * heuristic grades score planning artifacts (one-liner length, must-ship
+ * count, convergence flags) — not the built product — and have historically
+ * certified incomprehensible apps as A-band.
+ */
+function investorHeuristicFallbackAllowed(): boolean {
+  const v = (process.env.FOUNDRY_INVESTOR_ALLOW_HEURISTIC ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+/**
+ * Builds a non-passing "panel unavailable" output used when the LLM grader is
+ * unavailable and the heuristic fallback is not explicitly opted into. It can
+ * never satisfy the convergence bar (all grades F, meetsInvestorTarget=false),
+ * so the loop will not promote/converge on a panel that never saw the product.
+ */
+function buildUnavailableInvestorPanelOutput(
+  pitchBrief: string,
+  refinementRound: number,
+  input: StageInputComposition,
+): InvestorPanelOutput {
+  const note =
+    "Investor panel could not run: the LLM grader (cursor-agent) was unavailable, so no product-grounded grades were produced. " +
+    "Foundry fails closed here instead of grading planning documents. Fix the grader (install/authenticate cursor-agent, or set " +
+    "cursor_automation.command / FOUNDRY_CURSOR_AGENT_CMD), or set FOUNDRY_INVESTOR_ALLOW_HEURISTIC=1 to explicitly opt into the " +
+    "document-only heuristic fallback.";
+  const personas: Array<z.infer<typeof PersonaSchema>> = [
+    { id: "elon_musk", displayName: "Elon Musk (archetype)", grade: "F", response: note },
+    { id: "steve_jobs", displayName: "Steve Jobs (archetype)", grade: "F", response: note },
+    { id: "andreessen_horowitz", displayName: "Andreessen Horowitz (archetype)", grade: "F", response: note },
+  ];
+  const t = computeInvestorTargetFields(
+    personas.map((p) => p.grade),
+    parseAutonomousInvestorConvergence(input.config.project.foundry),
+  );
+  return InvestorPanelOutputSchema.parse({
+    pitchBrief,
+    investors: personas,
+    worstGrade: "F",
+    worstRank: 0,
+    meetsMinimumGradeA: false,
+    meetsInvestorTarget: false,
+    averageInvestorRank: t.averageInvestorRank,
+    combinedRefinementDirectives: [
+      "Restore the investor LLM grader so the panel can grade the built product, not planning documents (install/authenticate cursor-agent or set cursor_automation.command / FOUNDRY_CURSOR_AGENT_CMD).",
+    ],
+    refinementRound,
+    panelUnavailable: true,
+  });
+}
+
 function finalizeInvestorPanelOutput(
   draft: {
     pitchBrief: string;
@@ -789,6 +848,12 @@ export const investorPanelStage: Stage<StageInputComposition, InvestorPanelOutpu
     let modeLabel = "GPT-5.4";
     if (llmOutput) {
       output = llmOutput;
+    } else if (!investorHeuristicFallbackAllowed()) {
+      ctx.logger("[investor_panel] LLM unavailable — failing closed (no heuristic grades)", {
+        hint: "set FOUNDRY_INVESTOR_ALLOW_HEURISTIC=1 to opt into the document-only heuristic fallback",
+      });
+      output = buildUnavailableInvestorPanelOutput(pitchBrief, refinementRound, input);
+      modeLabel = "panel unavailable (LLM grader offline)";
     } else {
       const signals = extractSignals(input);
       const bump = refinementRound * 4;

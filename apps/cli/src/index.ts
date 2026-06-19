@@ -946,6 +946,12 @@ async function buildWorkPacketForRun(params: {
         const files = d.files?.length
           ? ` — files: ${d.files.map((f) => `\`${f}\``).join(", ")}`
           : "";
+        // Removal directives are verified by absence: tell Cursor to strip the
+        // surface AND add/keep a test asserting it no longer appears, so the
+        // loop can subtract clutter rather than only accrete features.
+        if (d.action === "remove") {
+          return `[builder-directive][remove] Remove from user-facing screens: ${desc}. Done = the surface is deleted AND a test asserts its absence (text/testID no longer present).${files}`;
+        }
         return `[builder-directive] ${desc}${files}`;
       })
       .filter((line) => line.length > 0);
@@ -3388,6 +3394,14 @@ program
       process.env.FOUNDRY_MAX_NOPROGRESS_CYCLES ?? "3",
       10,
     );
+    /**
+     * Signature of the last state actually promoted to main. Used to skip
+     * re-promoting an identical green state on a cycle that produced no product
+     * progress — otherwise the loop re-merges Foundry artifact churn into main
+     * every cycle (the "promote same build 40→43 times" waste) even though
+     * nothing about the product changed.
+     */
+    let lastPromotedSignature: string | undefined;
 
     while (true) {
       cycle++;
@@ -4498,6 +4512,26 @@ program
       let promoteDecision = evaluateAutoPromoteToMain(endCycleCtx);
       let promotedThisCycle = false;
 
+      // Don't re-promote an identical green state on a cycle that produced no
+      // product progress. Re-merging Foundry artifact churn into main every
+      // cycle is the "promote the same build N times" waste. The first time a
+      // state goes green it still promotes (no prior signature to match).
+      const cycleHadProductProgress =
+        cycleCursorProductFileCount > 0 || cycleCursorQaArtifactFileCount > 0;
+      const promoteSignature = [
+        pipelineQa?.score ?? -1,
+        pipelineQa?.blockers?.length ?? 0,
+        workPacketOpenCount(workPacket),
+        workPacketClosedCount(workPacket),
+      ].join("|");
+      if (promoteDecision.ok && !cycleHadProductProgress && promoteSignature === lastPromotedSignature) {
+        promoteDecision = {
+          ok: false,
+          reason:
+            "no product progress since the last promotion and the green state is unchanged — skipping redundant re-merge of Foundry artifacts into main",
+        };
+      }
+
       if (
         alwaysPromoteToMain &&
         builderOutput?.branchName?.startsWith("foundry/") &&
@@ -4569,6 +4603,7 @@ program
         const promotion = await promoteApprovedBranch(repoPath, manifest, builderOutput);
         if (promotion.status === "promoted") {
           promotedThisCycle = true;
+          lastPromotedSignature = promoteSignature;
           promoSpinner.succeed(`Release branch promotion: ${promotion.detail}`);
         } else if (promotion.status === "skipped") {
           promoSpinner.warn(`Release branch promotion skipped: ${promotion.detail}`);

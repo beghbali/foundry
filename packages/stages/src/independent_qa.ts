@@ -720,15 +720,25 @@ export const independentQaStage: Stage<StageInputComposition, IndependentQaOutpu
           const message = envOnly
             ? "Maestro smoke did not run: no booted simulator/device (environmental — not a code failure)."
             : "Maestro smoke flows failed.";
-          if (envOnly) {
+          if (envOnly && !maestro.required) {
             warnings.push(message);
             manualTasks.push(
               "Boot an iOS Simulator (or connect a device), run `npx expo run:ios` (or your platform build), then re-run smoke (or use `qa_automation.maestro.pipeline_command` with a script that starts Metro).",
             );
           } else if (maestro.required) {
-            blockers.push(message);
+            // required:true means we MUST see the product work to ship.
+            // "Couldn't verify" (env-only) is not "ship" — block it too.
+            blockers.push(
+              envOnly
+                ? `${message} Required UX smoke could not be verified on a device/simulator — blocking ship (qa_automation.maestro.required is true).`
+                : message,
+            );
             maestroFailureIsShipBlocking = true;
-            manualTasks.push(maestroShipBlockingManualHint(r.stdout, r.stderr));
+            manualTasks.push(
+              envOnly
+                ? "Boot an iOS Simulator (or connect a device), then re-run so the required scan→verdict UX smoke can actually execute."
+                : maestroShipBlockingManualHint(r.stdout, r.stderr),
+            );
           } else {
             warnings.push(`${message} Treating as warning because qa_automation.maestro.required is false.`);
           }
@@ -777,15 +787,24 @@ export const independentQaStage: Stage<StageInputComposition, IndependentQaOutpu
             const message = envOnly
               ? "Maestro smoke did not run: no booted simulator/device (environmental — not a code failure)."
               : "Maestro smoke flows failed.";
-            if (envOnly) {
+            if (envOnly && !maestro.required) {
               warnings.push(message);
               manualTasks.push(
                 "Boot an iOS Simulator (or connect a device), run `npx expo run:ios` (or your platform build), then `maestro test` on the configured flow path.",
               );
             } else if (maestro.required) {
-              blockers.push(message);
+              // required:true means we MUST see the product work to ship.
+              blockers.push(
+                envOnly
+                  ? `${message} Required UX smoke could not be verified on a device/simulator — blocking ship (qa_automation.maestro.required is true).`
+                  : message,
+              );
               maestroFailureIsShipBlocking = true;
-              manualTasks.push(maestroShipBlockingManualHint(r.stdout, r.stderr));
+              manualTasks.push(
+                envOnly
+                  ? "Boot an iOS Simulator (or connect a device), then re-run so the required scan→verdict UX smoke can actually execute."
+                  : maestroShipBlockingManualHint(r.stdout, r.stderr),
+              );
             } else {
               warnings.push(`${message} Treating as warning because qa_automation.maestro.required is false.`);
             }
