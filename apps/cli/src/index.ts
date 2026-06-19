@@ -15,11 +15,11 @@ import {
   resolveAutonomousInvestorConvergenceForRun,
 } from "@foundry/core/investorGrades";
 import {
+  applyBuildSpecTaskCompletions,
   computeUpstreamFingerprint,
   primaryBuildSpecSlice,
   readBuildSpecFromRepo,
   readBuildSpecLedger,
-  taskCompletedByEdits,
   writeBuildSpecLedger,
 } from "@foundry/core/buildSpec";
 import {
@@ -51,6 +51,7 @@ import {
   runBuilderAgent,
   commitQaGatingFoundryArtifacts,
   syncCursorBuilderReportFromRecentCommits,
+  reconcileBuildSpecLedgerFromGitHistory,
   sampleUncheckedBriefLines,
   shouldRunCursorAutomation,
   type BriefCriticalCounts,
@@ -816,55 +817,20 @@ async function updateBuildSpecLedgerFromPass(
   const spec = await readBuildSpecFromRepo(repoPath);
   if (!spec) return;
   const ledger = await readBuildSpecLedger(repoPath);
-  const touched = new Set(builderRun.changedFiles);
-  const newlyCompleted: string[] = [];
-
-  const slice = spec.slices[0];
-  if (!slice) return;
-  for (const task of slice.tasks) {
-    if (task.id in ledger.tasks) continue;
-    if (!taskCompletedByEdits(task, builderRun.changedFiles)) continue;
-    const taskStats = (builderRun.diffStats ?? []).filter((s) => task.files.includes(s.file));
-    ledger.tasks[task.id] = {
-      completedAt: new Date().toISOString(),
-      runId,
-      filesTouched: task.files.filter((f) => touched.has(f)),
-      locAdded: taskStats.reduce((s, x) => s + x.added, 0),
-      locRemoved: taskStats.reduce((s, x) => s + x.removed, 0),
-    };
-    newlyCompleted.push(task.id);
-  }
-
-  let newlyAddressedParents: string[] = [];
-  if (Array.isArray(spec.parentDirectives) && spec.parentDirectives.length > 0) {
-    const addressedMap = { ...(ledger.addressedParents ?? {}) };
-    for (const parent of spec.parentDirectives) {
-      if (parent.id in addressedMap) continue;
-      if (parent.childTaskIds.length === 0) continue;
-      const allClosed = parent.childTaskIds.every((cid) => cid in ledger.tasks);
-      if (allClosed) {
-        addressedMap[parent.id] = {
-          text: parent.text,
-          source: parent.source,
-          addressedAt: new Date().toISOString(),
-        };
-        newlyAddressedParents.push(parent.id);
-      }
-    }
-    ledger.addressedParents = addressedMap;
-  }
+  const { ledger: nextLedger, newlyCompleted, newlyAddressedParents } = applyBuildSpecTaskCompletions(
+    spec,
+    ledger,
+    builderRun.changedFiles,
+    runId,
+    builderRun.diffStats ?? [],
+  );
 
   if (newlyCompleted.length > 0) {
-    ledger.updatedAt = new Date().toISOString();
-    ledger.stuckCycles = 0;
-    await writeBuildSpecLedger(repoPath, ledger);
-    // Count only tasks from the CURRENT spec — ledger.tasks contains entries
-    // from prior specs whose task IDs are different from the current set.
-    // (Previously this read Object.keys(ledger.tasks).length which produced
-    // nonsense like "14/5 cumulative".)
-    const totalDone = slice.tasks.filter((t) => t.id in ledger.tasks).length;
-    const totalTasks = slice.tasks.length;
-    const totalAddressed = Object.keys(ledger.addressedParents ?? {}).length;
+    await writeBuildSpecLedger(repoPath, nextLedger);
+    const slice = spec.slices[0];
+    const totalDone = slice ? slice.tasks.filter((t) => t.id in nextLedger.tasks).length : newlyCompleted.length;
+    const totalTasks = slice?.tasks.length ?? newlyCompleted.length;
+    const totalAddressed = Object.keys(nextLedger.addressedParents ?? {}).length;
     console.log(
       chalk.green(
         `  BUILD_SPEC_LEDGER: closed ${newlyCompleted.length} task(s) this pass (${totalDone}/${totalTasks} cumulative). Closed: ${newlyCompleted.join(", ")}`,
@@ -878,20 +844,22 @@ async function updateBuildSpecLedgerFromPass(
       );
     }
   } else if (newlyAddressedParents.length > 0) {
-    ledger.updatedAt = new Date().toISOString();
-    await writeBuildSpecLedger(repoPath, ledger);
+    await writeBuildSpecLedger(repoPath, nextLedger);
     console.log(
       chalk.green(
         `  BUILD_SPEC_LEDGER: ${newlyAddressedParents.length} parent directive(s) now ADDRESSED (won't re-emit).`,
       ),
     );
-  } else if (slice.tasks.some((t) => !(t.id in ledger.tasks))) {
-    const remaining = slice.tasks.filter((t) => !(t.id in ledger.tasks)).map((t) => t.id);
-    console.log(
-      chalk.yellow(
-        `  BUILD_SPEC_LEDGER: 0 task(s) fully closed by this pass (edits did not cover all files for any open task). Open: ${remaining.slice(0, 4).join(", ")}${remaining.length > 4 ? ` … +${remaining.length - 4}` : ""}`,
-      ),
-    );
+  } else {
+    const slice = spec.slices[0];
+    if (slice?.tasks.some((t) => !(t.id in nextLedger.tasks))) {
+      const remaining = slice.tasks.filter((t) => !(t.id in nextLedger.tasks)).map((t) => t.id);
+      console.log(
+        chalk.yellow(
+          `  BUILD_SPEC_LEDGER: 0 task(s) fully closed by this pass (edits did not cover all files for any open task). Open: ${remaining.slice(0, 4).join(", ")}${remaining.length > 4 ? ` … +${remaining.length - 4}` : ""}`,
+        ),
+      );
+    }
   }
 }
 
@@ -3218,6 +3186,11 @@ program
       }
       if (wiped.length > 0) {
         console.log(chalk.yellow(`  Reset spec: removed ${wiped.join(", ")} — Grand Wizard will regenerate from scratch.`));
+        console.log(
+          chalk.gray(
+            "  BUILD_SPEC_LEDGER will be reconciled from recent git history on main/HEAD after the pipeline runs.",
+          ),
+        );
       } else {
         console.log(chalk.gray("  Reset spec: nothing to remove."));
       }
@@ -3511,6 +3484,15 @@ program
       let builderOutput = await readStageJson<BuilderLoopMeta>(repoPath, manifest, "builder");
       let investorOutput = await readStageJson<InvestorPanelBrief>(repoPath, manifest, "investor_panel");
       let briefCounts = await countCriticalBriefItems(briefPath);
+      const ledgerReconcile = await reconcileBuildSpecLedgerFromGitHistory(repoPath, manifest.runId);
+      if (ledgerReconcile.newlyCompleted.length > 0) {
+        console.log(
+          chalk.green(
+            `  BUILD_SPEC_LEDGER: reconciled ${ledgerReconcile.newlyCompleted.length} task(s) from git history — ${ledgerReconcile.newlyCompleted.join(", ")}`,
+          ),
+        );
+        briefCounts = await countCriticalBriefItems(briefPath);
+      }
       let briefMetrics = await readBriefMetrics(briefPath);
       let pipelineQa = await readStageJson<PipelineIndependentQa>(repoPath, manifest, "independent_qa");
       outerPipelineQa = pipelineQa;

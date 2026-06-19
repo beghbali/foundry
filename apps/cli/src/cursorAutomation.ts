@@ -818,6 +818,28 @@ function extractMarkdownSubsectionLines(md: string, headingLine: string): string
 
 type BriefProgress = { complete: number; total: number };
 
+/** BUILD_SPEC ledger progress — matches release_agent open-task gate. */
+async function countBuildSpecBriefProgress(repoPath: string): Promise<BriefProgress> {
+  const foundryDir = join(repoPath, ".foundry");
+  try {
+    const [specRaw, ledgerRaw] = await Promise.all([
+      readFile(join(foundryDir, "BUILD_SPEC.json"), "utf8"),
+      readFile(join(foundryDir, "BUILD_SPEC_LEDGER.json"), "utf8").catch(() => ""),
+    ]);
+    type SpecShape = { slices?: Array<{ tasks?: Array<{ id?: string }> }> };
+    type LedgerShape = { tasks?: Record<string, unknown> };
+    const spec = JSON.parse(specRaw) as SpecShape;
+    const ledger = ledgerRaw ? (JSON.parse(ledgerRaw) as LedgerShape) : { tasks: {} };
+    const tasks = spec.slices?.[0]?.tasks ?? [];
+    if (tasks.length === 0) return { complete: 0, total: 0 };
+    const closed = ledger.tasks ?? {};
+    const complete = tasks.filter((t) => t.id && t.id in closed).length;
+    return { complete, total: tasks.length };
+  } catch {
+    return { complete: 0, total: 0 };
+  }
+}
+
 async function countTrackedBriefProgress(briefPath: string): Promise<BriefProgress> {
   let raw = "";
   try {
@@ -852,7 +874,11 @@ export async function summarizeCursorBuilderReportMd(repoPath: string): Promise<
   const p = join(repoPath, ".foundry", "CURSOR_BUILDER_REPORT.md");
   try {
     const raw = await readFile(p, "utf8");
-    const brief = await countTrackedBriefProgress(join(repoPath, ".foundry", "CURSOR_BRIEF.md"));
+    const specBrief = await countBuildSpecBriefProgress(repoPath);
+    const brief =
+      specBrief.total > 0
+        ? specBrief
+        : await countTrackedBriefProgress(join(repoPath, ".foundry", "CURSOR_BRIEF.md"));
     const feedbackResolved = countTopLevelNumberedLines(
       extractMarkdownSubsectionLines(raw, "### Feedback ledger items resolved:"),
     );
@@ -1401,6 +1427,169 @@ async function currentGitBranch(repoPath: string): Promise<string | undefined> {
   return result.stdout.trim() || undefined;
 }
 
+type GitBuilderBaseline = {
+  targetBranch: string;
+  head: string;
+  mainHead: string;
+};
+
+async function resolveGitRef(repoPath: string, ref: string): Promise<string | undefined> {
+  const result = await exec(`git rev-parse --verify ${shellQuote(ref)}`, repoPath, 15_000);
+  if (result.exitCode !== 0) return undefined;
+  return result.stdout.trim() || undefined;
+}
+
+async function captureGitBuilderBaseline(repoPath: string, manifest: RunManifest): Promise<GitBuilderBaseline> {
+  const builder = await readStageJson<{ branchName?: string }>(repoPath, manifest, "builder");
+  const targetBranch = builder?.branchName?.trim() ?? (await currentGitBranch(repoPath)) ?? "main";
+  const head = (await resolveGitRef(repoPath, "HEAD")) ?? "";
+  const mainHead = (await resolveGitRef(repoPath, "main")) ?? head;
+  return { targetBranch, head, mainHead };
+}
+
+function isCommittableProductPath(path: string): boolean {
+  return isProductSourcePath(path) && !isGeneratedFoundryPath(path);
+}
+
+async function collectProductFilesFromCommitRange(repoPath: string, range: string): Promise<string[]> {
+  const log = await exec(`git log ${range} --name-only --pretty=format:`, repoPath, 30_000);
+  if (log.exitCode !== 0) return [];
+  const files = new Set<string>();
+  for (const line of log.stdout.split("\n")) {
+    const p = normalizePorcelainPath(line.trim());
+    if (p && isCommittableProductPath(p)) files.add(p);
+  }
+  return [...files];
+}
+
+async function readDiffStatsForCommitRange(repoPath: string, range: string): Promise<FileDiffStat[]> {
+  const result = await exec(`git log ${range} --numstat --pretty=format:`, repoPath, 30_000);
+  if (result.exitCode !== 0) return [];
+  const byFile = new Map<string, FileDiffStat>();
+  for (const line of result.stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || !/^[0-9-]+\s+[0-9-]+\s+/.test(trimmed)) continue;
+    const [addedRaw, removedRaw, ...fileParts] = trimmed.split(/\s+/);
+    const file = fileParts.join(" ");
+    if (!file || !isCommittableProductPath(file)) continue;
+    const added = addedRaw === "-" ? 0 : Number.parseInt(addedRaw ?? "0", 10) || 0;
+    const removed = removedRaw === "-" ? 0 : Number.parseInt(removedRaw ?? "0", 10) || 0;
+    const existing = byFile.get(file) ?? { file, added: 0, removed: 0 };
+    existing.added += added;
+    existing.removed += removed;
+    byFile.set(file, existing);
+  }
+  return [...byFile.values()];
+}
+
+type RecoverAgentChangesResult = {
+  files: string[];
+  diffStats?: FileDiffStat[];
+  note?: string;
+  pushWarning?: string;
+};
+
+/**
+ * When Cursor commits on the builder branch or wanders to `main`, recover product
+ * file paths so Foundry can credit the pass and update BUILD_SPEC_LEDGER.
+ */
+async function recoverAgentProductChanges(
+  repoPath: string,
+  baseline: GitBuilderBaseline,
+): Promise<RecoverAgentChangesResult> {
+  const { targetBranch } = baseline;
+  let current = await currentGitBranch(repoPath);
+
+  if (current && current !== targetBranch) {
+    const checkout = await exec(`git checkout ${shellQuote(targetBranch)}`, repoPath, 30_000);
+    if (checkout.exitCode !== 0) {
+      return {
+        files: [],
+        note: `Cursor left branch '${current}' and checkout back to '${targetBranch}' failed.`,
+      };
+    }
+    current = targetBranch;
+  }
+
+  if (baseline.head) {
+    const branchRange = `${baseline.head}..HEAD`;
+    const branchFiles = await collectProductFilesFromCommitRange(repoPath, branchRange);
+    if (branchFiles.length > 0) {
+      return {
+        files: branchFiles,
+        diffStats: await readDiffStatsForCommitRange(repoPath, branchRange),
+        note: `Recovered ${branchFiles.length} product file(s) from commits on ${targetBranch} during the Cursor session.`,
+      };
+    }
+  }
+
+  const mainNow = await resolveGitRef(repoPath, "main");
+  if (mainNow && baseline.mainHead && mainNow !== baseline.mainHead) {
+    const mainRange = `${baseline.mainHead}..main`;
+    const mainFiles = await collectProductFilesFromCommitRange(repoPath, mainRange);
+    if (mainFiles.length > 0) {
+      let pushWarning: string | undefined;
+      let note = `Cursor committed to main (${baseline.mainHead.slice(0, 7)}..${mainNow.slice(0, 7)}); integrating into ${targetBranch}.`;
+      if (current === targetBranch) {
+        const merge = await exec(
+          `git merge main -m ${shellQuote("foundry: integrate Cursor commits that landed on main")}`,
+          repoPath,
+          120_000,
+        );
+        if (merge.exitCode !== 0) {
+          note += ` Merge into ${targetBranch} failed — ledger will still credit main-side files.`;
+        } else {
+          const pushResult = await pushWithUpstreamRecovery(repoPath, targetBranch);
+          if (!pushResult.ok) {
+            pushWarning = pushResult.detail;
+          }
+        }
+      }
+      return {
+        files: mainFiles,
+        diffStats: await readDiffStatsForCommitRange(repoPath, mainRange),
+        note,
+        pushWarning,
+      };
+    }
+  }
+
+  return { files: [] };
+}
+
+/** Reconcile BUILD_SPEC_LEDGER from recent product commits on HEAD and main. */
+export async function reconcileBuildSpecLedgerFromGitHistory(
+  repoPath: string,
+  runId: string,
+  options?: { maxCommits?: number },
+): Promise<{ newlyCompleted: string[]; newlyAddressedParents: string[] }> {
+  const { reconcileOpenBuildSpecTasks } = await import("@foundry/core/buildSpec");
+  const max = options?.maxCommits ?? 50;
+  const refs: string[] = [];
+  if (await resolveGitRef(repoPath, "HEAD")) refs.push("HEAD");
+  if (await resolveGitRef(repoPath, "main")) refs.push("main");
+
+  const files = new Set<string>();
+  for (const ref of refs) {
+    const log = await exec(`git log ${ref} -${max} --name-only --pretty=format:`, repoPath, 30_000);
+    if (log.exitCode !== 0) continue;
+    for (const line of log.stdout.split("\n")) {
+      const p = normalizePorcelainPath(line.trim());
+      if (p && isCommittableProductPath(p)) files.add(p);
+    }
+  }
+
+  if (files.size === 0) {
+    return { newlyCompleted: [], newlyAddressedParents: [] };
+  }
+
+  const result = await reconcileOpenBuildSpecTasks(repoPath, runId, [...files]);
+  return {
+    newlyCompleted: result.newlyCompleted,
+    newlyAddressedParents: result.newlyAddressedParents,
+  };
+}
+
 async function ensureCursorBuilderBranch(
   repoPath: string,
   manifest: RunManifest,
@@ -1818,6 +2007,12 @@ function buildBuilderPrompt(
     "13. If `.maestro/` flows exist and QA reported device smoke failures, fix the product code and/or the Maestro flows so they pass without weakening coverage.",
     "14. Leave the repo with product source changes ready: Foundry auto-commits non-`.foundry` paths. Do not leave `apps/` / `packages/` / `supabase/` edits unstaged.",
     "",
+    "Git rules (strict — Foundry owns commits and branch promotion):",
+    "- Do NOT run `git commit`, `git push`, `git merge`, or `git rebase`.",
+    "- Do NOT run `git checkout` or switch branches — stay on the current builder branch for the entire pass.",
+    "- Leave all product edits unstaged/uncommitted; Foundry will auto-commit and push after you finish.",
+    "- If work already exists on `main`, edit files on the current branch only when a delta is still required.",
+    "",
     "Important constraints:",
     "- Do not ask for human input.",
     "- Do not stop at planning; write code.",
@@ -1973,6 +2168,7 @@ async function finalizeBuilderAgentResult(
     statusHint?: string;
     implementationRetryUsed?: boolean;
     pushWarning?: string;
+    diffStats?: FileDiffStat[];
   },
 ): Promise<CursorAgentRunResult> {
   const pendingQa = await classifyPorcelainPaths(repoPath);
@@ -1980,7 +2176,9 @@ async function finalizeBuilderAgentResult(
   await syncCursorBuilderReportFilesChanged(repoPath, productFiles, qaFoundryPaths);
   const qaSync = await commitQaGatingFoundryArtifacts(repoPath, runId);
   const pushWarning = [opts?.pushWarning, qaSync.pushWarning].filter(Boolean).join("\n") || undefined;
-  const diffStats = productFiles.length > 0 ? await readDiffStatsForHead(repoPath) : [];
+  const diffStats =
+    opts?.diffStats ??
+    (productFiles.length > 0 ? await readDiffStatsForHead(repoPath) : []);
   return {
     ...base,
     changedFiles: productFiles,
@@ -2022,6 +2220,49 @@ export async function runBuilderAgent(
   const chosenModel = modelOverride ?? settings.builderModel;
 
   const innerIdx = builderContext?.innerLoopIndex;
+  const baseline = await captureGitBuilderBaseline(repoPath, manifest);
+
+  const finalizeAfterCommit = async (
+    agentResult: CursorAgentRunResult,
+    files: string[],
+    opts?: {
+      pushWarning?: string;
+      statusHint?: string;
+      implementationRetryUsed?: boolean;
+      diffStats?: FileDiffStat[];
+    },
+  ): Promise<CursorAgentRunResult> =>
+    finalizeBuilderAgentResult(repoPath, manifest.runId, agentResult, files, {
+      pushWarning: opts?.pushWarning,
+      statusHint: opts?.statusHint,
+      implementationRetryUsed: opts?.implementationRetryUsed,
+      diffStats: opts?.diffStats,
+    });
+
+  const tryRecoverOrCommit = async (
+    agentResult: CursorAgentRunResult,
+    commitOutcome: AutoCommitOutcome,
+    opts?: { implementationRetryUsed?: boolean; statusHint?: string },
+  ): Promise<CursorAgentRunResult | null> => {
+    if (commitOutcome.files.length > 0) {
+      return finalizeAfterCommit(agentResult, commitOutcome.files, {
+        pushWarning: commitOutcome.pushWarning,
+        implementationRetryUsed: opts?.implementationRetryUsed,
+      });
+    }
+    const recovered = await recoverAgentProductChanges(repoPath, baseline);
+    if (recovered.files.length > 0) {
+      const statusHint = [opts?.statusHint, recovered.note].filter(Boolean).join(" ") || undefined;
+      return finalizeAfterCommit(agentResult, recovered.files, {
+        pushWarning: recovered.pushWarning,
+        statusHint,
+        implementationRetryUsed: opts?.implementationRetryUsed,
+        diffStats: recovered.diffStats,
+      });
+    }
+    return null;
+  };
+
   let result = await runCursorAgent(
     repoPath,
     manifest.runId,
@@ -2037,12 +2278,8 @@ export async function runBuilderAgent(
 
   try {
     let commitOutcome = await autoCommitCursorBuilderChanges(repoPath, manifest.runId);
-    let pushWarning = commitOutcome.pushWarning;
-    if (commitOutcome.files.length > 0) {
-      return finalizeBuilderAgentResult(repoPath, manifest.runId, result, commitOutcome.files, {
-        pushWarning,
-      });
-    }
+    const first = await tryRecoverOrCommit(result, commitOutcome);
+    if (first) return first;
 
     const classifiedFirst = await classifyPorcelainPaths(repoPath);
     statusHint = formatBuilderStatusHint(classifiedFirst);
@@ -2069,19 +2306,18 @@ export async function runBuilderAgent(
     }
 
     commitOutcome = await autoCommitCursorBuilderChanges(repoPath, manifest.runId);
-    pushWarning = commitOutcome.pushWarning;
-    const changedFiles = commitOutcome.files;
-    if (changedFiles.length === 0) {
-      const classifiedSecond = await classifyPorcelainPaths(repoPath);
-      statusHint = `${statusHint} After implementation retry: ${formatBuilderStatusHint(classifiedSecond)}`;
-    } else {
-      statusHint = undefined;
-    }
+    const second = await tryRecoverOrCommit(result, commitOutcome, {
+      implementationRetryUsed: true,
+      statusHint,
+    });
+    if (second) return second;
 
-    return finalizeBuilderAgentResult(repoPath, manifest.runId, result, changedFiles, {
+    const classifiedSecond = await classifyPorcelainPaths(repoPath);
+    statusHint = `${statusHint} After implementation retry: ${formatBuilderStatusHint(classifiedSecond)}`;
+
+    return finalizeBuilderAgentResult(repoPath, manifest.runId, result, [], {
       statusHint,
       implementationRetryUsed,
-      pushWarning,
     });
   } catch (err) {
     return {

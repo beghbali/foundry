@@ -424,6 +424,94 @@ export async function readBuildSpecFromRepo(repoPath: string): Promise<GrandWiza
   }
 }
 
+export type BuildSpecTaskCompletionResult = {
+  ledger: BuildSpecLedger;
+  newlyCompleted: string[];
+  newlyAddressedParents: string[];
+};
+
+/** Mark open BUILD_SPEC tasks complete when `touchedFiles` satisfy `taskCompletedByEdits`. */
+export function applyBuildSpecTaskCompletions(
+  spec: GrandWizardOutput,
+  ledger: BuildSpecLedger,
+  touchedFiles: ReadonlyArray<string>,
+  runId: string,
+  diffStats: ReadonlyArray<{ file: string; added: number; removed: number }> = [],
+): BuildSpecTaskCompletionResult {
+  const touched = new Set(touchedFiles);
+  const newlyCompleted: string[] = [];
+  const slice = spec.slices[0];
+  if (!slice) {
+    return { ledger, newlyCompleted, newlyAddressedParents: [] };
+  }
+
+  for (const task of slice.tasks) {
+    if (task.id in ledger.tasks) continue;
+    if (!taskCompletedByEdits(task, touchedFiles)) continue;
+    const taskStats = diffStats.filter((s) => task.files.includes(s.file));
+    ledger.tasks[task.id] = {
+      completedAt: new Date().toISOString(),
+      runId,
+      filesTouched: task.files.filter((f) => touched.has(f)),
+      locAdded: taskStats.reduce((s, x) => s + x.added, 0),
+      locRemoved: taskStats.reduce((s, x) => s + x.removed, 0),
+    };
+    newlyCompleted.push(task.id);
+  }
+
+  let newlyAddressedParents: string[] = [];
+  if (Array.isArray(spec.parentDirectives) && spec.parentDirectives.length > 0) {
+    const addressedMap = { ...(ledger.addressedParents ?? {}) };
+    for (const parent of spec.parentDirectives) {
+      if (parent.id in addressedMap) continue;
+      if (parent.childTaskIds.length === 0) continue;
+      const allClosed = parent.childTaskIds.every((cid) => cid in ledger.tasks);
+      if (allClosed) {
+        addressedMap[parent.id] = {
+          text: parent.text,
+          source: parent.source,
+          addressedAt: new Date().toISOString(),
+        };
+        newlyAddressedParents.push(parent.id);
+      }
+    }
+    ledger.addressedParents = addressedMap;
+  }
+
+  if (newlyCompleted.length > 0 || newlyAddressedParents.length > 0) {
+    ledger.updatedAt = new Date().toISOString();
+    if (newlyCompleted.length > 0) ledger.stuckCycles = 0;
+  }
+
+  return { ledger, newlyCompleted, newlyAddressedParents };
+}
+
+/**
+ * Close BUILD_SPEC tasks whose anchor files already appear in recent git history.
+ * Used after `--reset-spec` or when Cursor committed on another branch.
+ */
+export async function reconcileOpenBuildSpecTasks(
+  repoPath: string,
+  runId: string,
+  touchedFiles: ReadonlyArray<string>,
+  diffStats: ReadonlyArray<{ file: string; added: number; removed: number }> = [],
+): Promise<BuildSpecTaskCompletionResult & { persisted: boolean }> {
+  const spec = await readBuildSpecFromRepo(repoPath);
+  if (!spec) {
+    return {
+      ledger: await readBuildSpecLedger(repoPath),
+      newlyCompleted: [],
+      newlyAddressedParents: [],
+      persisted: false,
+    };
+  }
+  const ledger = await readBuildSpecLedger(repoPath);
+  const result = applyBuildSpecTaskCompletions(spec, ledger, touchedFiles, runId, diffStats);
+  const persisted = result.newlyCompleted.length > 0 || result.newlyAddressedParents.length > 0;
+  if (persisted) await writeBuildSpecLedger(repoPath, result.ledger);
+  return { ...result, persisted };
+}
+
 export function renderBuildSpecMarkdown(spec: GrandWizardOutput, projectName: string): string {
   const primary = primaryBuildSpecSlice(spec);
   const lines: string[] = [
