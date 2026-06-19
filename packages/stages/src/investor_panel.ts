@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 
 import { writeStageMarkdown } from "@foundry/core/artifacts";
 import { readBuildSpecFromRepo, readBuildSpecLedger } from "@foundry/core/buildSpec";
+import { resolveFoundryCursorModel } from "@foundry/core/cursorModels";
 
 const execFileAsync = promisify(execFile);
 
@@ -642,7 +643,11 @@ async function tryRunLlmInvestorPanel(
 ): Promise<InvestorPanelOutput | undefined> {
   const command =
     input.config.project.cursor_automation?.command ?? process.env.FOUNDRY_CURSOR_AGENT_CMD ?? "agent";
-  const model = input.config.project.cursor_automation?.qa_model ?? "gpt-5.4-high";
+  const model = resolveFoundryCursorModel(
+    input.config.project.cursor_automation?.investor_panel_model ??
+      input.config.project.cursor_automation?.qa_model,
+    "investorPanelModel",
+  );
   const prompt = llmPrompt(input, pitchBrief);
   const modelName = model.trim().toLowerCase();
   const modelArgs =

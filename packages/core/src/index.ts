@@ -10,3 +10,4 @@ export * from "./briefIntent.js";
 export * from "./projectDomain.js";
 export * from "./buildSpec.js";
 export * from "./feedbackPolicy.js";
+export * from "./cursorModels.js";

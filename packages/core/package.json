@@ -15,7 +15,8 @@
     "./briefIntent": "./src/briefIntent.ts",
     "./projectDomain": "./src/projectDomain.ts",
     "./buildSpec": "./src/buildSpec.ts",
-    "./feedbackPolicy": "./src/feedbackPolicy.ts"
+    "./feedbackPolicy": "./src/feedbackPolicy.ts",
+    "./cursorModels": "./src/cursorModels.ts"
   },
   "dependencies": {
     "@foundry/stages": "workspace:*",

@@ -2068,15 +2068,20 @@ program
           "  # investor_panel_when_release_ready: true",
           "cursor_automation:",
           "  enabled: true",
-          '  builder_model: "auto"',
-          '  builder_fast_model: "auto"',
+          '  builder_model: "claude-opus-4-8-thinking-high"',
+          '  builder_fast_model: "composer-2.5-fast"',
+          '  builder_economy_model: "composer-2.5-fast"',
+          '  grand_wizard_model: "gpt-5.3-codex"',
+          '  grand_wizard_strict_model: "claude-opus-4-8-thinking-high"',
+          '  investor_panel_model: "claude-opus-4-8-thinking-high"',
           "  max_inner_loops: 12",
           "  timeout_minutes: 45",
           "qa_automation:",
           "  maestro:",
           "    enabled: false",
           "    required: false",
-          '    command: "maestro"',
+          '    pipeline_command: "npm run maestro:smoke -w @your/mobile --"',
+          '    command: "npm run maestro:smoke -w @your/mobile --"',
           '    flow_path: ".maestro"',
           "    install_if_missing: true",
           "release_automation:",
@@ -3326,6 +3331,9 @@ program
         cursorSettings.builderModel,
         cursorSettings.builderFastModel,
         cursorSettings.builderEconomyModel,
+        cursorSettings.grandWizardModel,
+        cursorSettings.grandWizardStrictModel,
+        cursorSettings.investorPanelModel,
       ]);
       if (!modelPreflight.ok) {
         console.error(chalk.red(modelPreflight.detail));
@@ -3333,6 +3341,9 @@ program
       }
       console.log(chalk.gray(`  Cursor builder model (primary): ${cursorSettings.builderModel}`));
       console.log(chalk.gray(`  Cursor builder model (fast): ${cursorSettings.builderFastModel}`));
+      console.log(chalk.gray(`  Cursor builder model (economy): ${cursorSettings.builderEconomyModel}`));
+      console.log(chalk.gray(`  Grand Wizard model: ${cursorSettings.grandWizardModel} (strict retry: ${cursorSettings.grandWizardStrictModel})`));
+      console.log(chalk.gray(`  Investor panel model: ${cursorSettings.investorPanelModel}`));
       console.log(
         chalk.gray(
           cursorSettings.useBuilderEconomyNearRelease

@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import chalk from "chalk";
 import { readLatestArtifact, type FoundryConfig, type RunManifest } from "@foundry/core";
+import { FOUNDRY_CURSOR_MODEL_DEFAULTS, resolveFoundryCursorModel } from "@foundry/core/cursorModels";
 import { stripBriefIdComment } from "@foundry/core/briefIntent";
 
 export interface CursorAutomationSettings {
@@ -20,7 +21,12 @@ export interface CursorAutomationSettings {
    * the Cursor builder uses `builderEconomyModel` for every inner pass. Not used while `blocked_pre_release` (open brief / builder gates).
    */
   useBuilderEconomyNearRelease: boolean;
+  grandWizardModel: string;
+  grandWizardStrictModel: string;
+  investorPanelModel: string;
+  /** @deprecated Alias for investorPanelModel */
   qaModel: string;
+  /** @deprecated Alias for grandWizardStrictModel */
   qaStrictModel: string;
   maxInnerLoops: number;
   timeoutMinutes: number;
@@ -239,21 +245,36 @@ export function resolveCursorAutomationSettings(
   return {
     enabled: overrides?.enabled ?? raw?.enabled ?? false,
     command: resolveCursorAgentCommand(config, overrides),
-    /** Default `auto` passes `--model auto` explicitly (required on Free plan; omitting `--model` picks a named default and fails). */
-    builderModel: overrides?.builderModel ?? raw?.builder_model ?? envPrimary ?? "auto",
+    builderModel:
+      overrides?.builderModel ??
+      raw?.builder_model ??
+      envPrimary ??
+      FOUNDRY_CURSOR_MODEL_DEFAULTS.builderModel,
     builderFastModel:
       overrides?.builderFastModel ??
       raw?.builder_fast_model ??
       envFast ??
-      "auto",
+      FOUNDRY_CURSOR_MODEL_DEFAULTS.builderFastModel,
     builderEconomyModel:
       overrides?.builderEconomyModel ??
       raw?.builder_economy_model ??
       process.env.FOUNDRY_BUILDER_ECONOMY_MODEL ??
-      "auto",
+      FOUNDRY_CURSOR_MODEL_DEFAULTS.builderEconomyModel,
     useBuilderEconomyNearRelease: envUseBuilderEconomyNearRelease(raw, overrides),
-    qaModel: overrides?.qaModel ?? raw?.qa_model ?? "gpt-5.4-high",
-    qaStrictModel: overrides?.qaStrictModel ?? raw?.qa_strict_model ?? "gpt-5.4-xhigh",
+    grandWizardModel: resolveFoundryCursorModel(raw?.grand_wizard_model, "grandWizardModel"),
+    grandWizardStrictModel: resolveFoundryCursorModel(
+      raw?.grand_wizard_strict_model ?? raw?.qa_strict_model,
+      "grandWizardStrictModel",
+    ),
+    investorPanelModel: resolveFoundryCursorModel(
+      raw?.investor_panel_model ?? raw?.qa_model,
+      "investorPanelModel",
+    ),
+    qaModel: resolveFoundryCursorModel(raw?.investor_panel_model ?? raw?.qa_model, "investorPanelModel"),
+    qaStrictModel: resolveFoundryCursorModel(
+      raw?.grand_wizard_strict_model ?? raw?.qa_strict_model,
+      "grandWizardStrictModel",
+    ),
     maxInnerLoops: Math.min(overrides?.maxInnerLoops ?? raw?.max_inner_loops ?? 3, 3),
     timeoutMinutes: overrides?.timeoutMinutes ?? raw?.timeout_minutes ?? 45,
   };
@@ -1741,6 +1762,12 @@ function buildBuilderPrompt(
 
   const base = [
     "You are the dedicated Cursor builder agent for this repository.",
+    "",
+    "PRIORITY ORDER (strict — product before paperwork):",
+    "1. Open `[builder-directive]` rows in `.foundry/WORK_PACKET.md`, especially `[builder-directive][remove]` — edit the listed screen files under `apps/` / `packages/` and add/update tests proving absence or behavior.",
+    "2. Concrete tasks from `.foundry/BUILD_SPEC.md` primary slice (when `tasks[]` is non-empty).",
+    "3. Pipeline QA blockers from `independent_qa/output.json` — but NEVER close builder-directives by editing `foundryContract.js`, `briefContract.ts`, or `.foundry/WORK_PACKET.json` alone without matching product file changes.",
+    "4. Do not satisfy a pass by only editing `.foundry/` generated artifacts.",
     "",
     "Scope: implement the **primary slice** from `.foundry/BUILD_SPEC.md` (if present) via the active work packet (`.foundry/WORK_PACKET.md`). When BUILD_SPEC exists, do **not** widen beyond that slice or deferred items.",
     "",

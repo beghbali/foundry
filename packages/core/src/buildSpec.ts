@@ -29,6 +29,7 @@ export const ParentDirectiveSchema = z.object({
     "convergence_must_ship",
     "product_must_ship",
     "feedback",
+    "project_directive",
     "other",
   ]),
   /** Original (often vague) directive text. */
@@ -59,7 +60,7 @@ export const GrandWizardOutputSchema = z.object({
   parentDirectives: z.array(ParentDirectiveSchema).default([]),
   deferred: z.array(z.string()).default([]),
   definitionOfDone: z.array(z.string()).default([]),
-  source: z.enum(["heuristic", "llm", "heuristic+llm", "cached"]),
+  source: z.enum(["heuristic", "llm", "heuristic+llm", "heuristic+yaml", "cached"]),
   notes: z.array(z.string()).default([]),
   /** Heuristic flags surfaced for the loop console (e.g. uncovered directives). */
   diagnostics: z
@@ -262,6 +263,8 @@ export function computeUpstreamFingerprint(input: {
   openObjections?: string[];
   mustShip?: string[];
   feedbackHighlights?: string[];
+  /** Stable hash of project.yaml `builder.directives` so spec regens when operators change scope. */
+  builderDirectives?: string[];
 }): string {
   const tokens = (xs: string[] | undefined): string[] => {
     if (!xs || xs.length === 0) return [];
@@ -278,6 +281,7 @@ export function computeUpstreamFingerprint(input: {
     oo: tokens(input.openObjections),
     ms: tokens(input.mustShip),
     fb: tokens(input.feedbackHighlights),
+    bd: tokens(input.builderDirectives),
   });
   return createHash("sha256").update(payload).digest("hex").slice(0, 16);
 }

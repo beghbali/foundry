@@ -23,6 +23,7 @@ import {
   type GrandWizardOutput,
   type ParentDirective,
 } from "@foundry/core/buildSpec";
+import { resolveFoundryCursorModel } from "@foundry/core/cursorModels";
 import { StageInputCompositionSchema, type StageInputComposition } from "@foundry/core/stageInputs";
 import type { RunContext, Stage } from "@foundry/core/types";
 import { z } from "zod";
@@ -190,6 +191,10 @@ function upstreamFingerprintForInput(input: StageInputComposition): string {
   const pd = ProductDefinitionOutputSchema.safeParse(input.productDefinition);
   const inv = InvestorPanelOutputSchema.safeParse(input.investorPanel);
   const fb = FeedbackAgentOutputSchema.safeParse(input.feedback);
+  const builderDirectives = (input.config.project.builder?.directives ?? []).map((d) => {
+    const files = (d.files ?? []).join(",");
+    return `${d.action ?? "add"}:${d.description.trim()}:${files}`;
+  });
   return computeUpstreamFingerprint({
     investorRefinementDirectives: input.investorRefinement?.directives ?? [],
     investorPanelDirectives: inv.success ? inv.data.combinedRefinementDirectives ?? [] : [],
@@ -203,7 +208,119 @@ function upstreamFingerprintForInput(input: StageInputComposition): string {
           .map((item) => item.summary)
           .slice(0, 10)
       : [],
+    builderDirectives,
   });
+}
+
+function resolveGrandWizardModel(input: StageInputComposition, tier: "primary" | "strict"): string {
+  const raw = input.config.project.cursor_automation;
+  if (tier === "strict") {
+    return resolveFoundryCursorModel(
+      raw?.grand_wizard_strict_model ?? raw?.qa_strict_model,
+      "grandWizardStrictModel",
+    );
+  }
+  return resolveFoundryCursorModel(raw?.grand_wizard_model, "grandWizardModel");
+}
+
+function countPrimarySliceTasks(output: GrandWizardOutput): number {
+  return output.slices[0]?.tasks.length ?? 0;
+}
+
+function isProtectedProjectDirective(text: string, input: StageInputComposition): boolean {
+  for (const d of input.config.project.builder?.directives ?? []) {
+    const desc = d.description.trim();
+    if (!desc) continue;
+    if (fuzzyDirectiveMatch(text, desc)) return true;
+    if (fuzzyDirectiveMatch(text, `[project] ${desc}`)) return true;
+    if (d.action === "remove" && fuzzyDirectiveMatch(text, `Remove from user-facing surfaces: ${desc}`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Deterministic fallback: turn project.yaml `builder.directives` into concrete BUILD_SPEC tasks. */
+function synthesizeTasksFromBuilderDirectives(
+  input: StageInputComposition,
+  output: GrandWizardOutput,
+  screens: Array<{ name: string; file: string }>,
+): GrandWizardOutput {
+  const directives = input.config.project.builder?.directives ?? [];
+  if (directives.length === 0 || countPrimarySliceTasks(output) > 0) return output;
+
+  const slice = output.slices[0]!;
+  const tasks: ConcreteTask[] = [];
+  const parentDirectives: ParentDirective[] = [...output.parentDirectives];
+
+  for (const [index, directive] of directives.entries()) {
+    if (tasks.length >= MAX_TASKS_PER_SLICE) break;
+    const desc = directive.description.trim();
+    if (!desc) continue;
+    const parentId = `dir-yaml-${index + 1}`;
+    const files =
+      directive.files?.length > 0
+        ? uniqueStrings(directive.files)
+        : guessFilesForText(desc, screens);
+    if (files.length === 0) continue;
+
+    const taskText =
+      directive.action === "remove"
+        ? `Remove from user-facing screens: ${desc}. Done = surface deleted AND a test asserts absence (text/testID no longer present).`
+        : desc;
+
+    const taskId = mintTaskId(parentId, 1);
+    tasks.push({
+      id: taskId,
+      task: taskText,
+      files,
+      verification:
+        directive.action === "remove"
+          ? `Automated test or Maestro flow asserts the removed surface is absent from ${files[0]}.`
+          : `Behavior change observable in ${files[0]} and covered by repo tests.`,
+      decomposedFrom: [parentId],
+    });
+
+    if (!parentDirectives.some((p) => p.id === parentId)) {
+      parentDirectives.push({
+        id: parentId,
+        source: "project_directive",
+        text: taskText,
+        childTaskIds: [taskId],
+      });
+    } else {
+      const idx = parentDirectives.findIndex((p) => p.id === parentId);
+      if (idx >= 0) {
+        parentDirectives[idx] = {
+          ...parentDirectives[idx]!,
+          childTaskIds: uniqueStrings([...parentDirectives[idx]!.childTaskIds, taskId]),
+        };
+      }
+    }
+  }
+
+  if (tasks.length === 0) return output;
+
+  return {
+    ...output,
+    source: output.source === "heuristic" ? "heuristic+yaml" : output.source,
+    parentDirectives,
+    slices: [
+      {
+        ...slice,
+        tasks,
+        files: uniqueStrings([...slice.files, ...tasks.flatMap((t) => t.files)]).slice(0, 12),
+      },
+    ],
+    notes: uniqueStrings([
+      ...output.notes,
+      `Synthesized ${tasks.length} concrete task(s) from project.yaml builder.directives (deterministic fallback).`,
+    ]),
+    diagnostics: {
+      ...output.diagnostics,
+      directivesWithoutTasks: parentDirectives.filter((p) => p.childTaskIds.length === 0).map((p) => p.text),
+    },
+  };
 }
 
 function collectParentDirectives(input: StageInputComposition): {
@@ -263,6 +380,19 @@ function collectParentDirectives(input: StageInputComposition): {
       const weight = item.priority === "high" ? 100 : item.priority === "medium" ? 75 : 55;
       push(item.summary, weight, "feedback");
     }
+  }
+
+  for (const directive of input.config.project.builder?.directives ?? []) {
+    const desc = directive.description.trim();
+    if (!desc) continue;
+    const filesNote = directive.files?.length
+      ? ` — files: ${directive.files.map((f) => `\`${f}\``).join(", ")}`
+      : "";
+    const text =
+      directive.action === "remove"
+        ? `[project] Remove from user-facing surfaces: ${desc}${filesNote}`
+        : `[project] ${desc}${filesNote}`;
+    push(text, 130, "project_directive");
   }
 
   parents.sort((a, b) => b.weight - a.weight || a.text.localeCompare(b.text));
@@ -556,17 +686,34 @@ function llmPrompt(
   input: StageInputComposition,
   heuristic: GrandWizardOutput,
   alreadyAddressed: ReadonlyArray<{ text: string; addressedAt?: string }>,
+  mandatory = false,
 ): string {
+  const yamlDirectives = input.config.project.builder?.directives ?? [];
+  const yamlBlock =
+    yamlDirectives.length > 0
+      ? [
+          "PROJECT.YAML BUILDER DIRECTIVES (highest priority — each MUST become ≥1 concrete task with listed files):",
+          ...yamlDirectives.slice(0, 8).map((d, i) => {
+            const files = d.files?.length ? d.files.join(", ") : "(infer from description)";
+            return `${i + 1}. [${d.action ?? "add"}] ${d.description.replace(/\s+/g, " ").slice(0, 200)} → files: ${files}`;
+          }),
+          "",
+        ].join("\n")
+      : "";
   const addressedBlock =
     alreadyAddressed.length > 0
       ? [
           "PRIOR-CYCLES ADDRESSED DIRECTIVES — DO NOT RE-EMIT EQUIVALENTS:",
           "These directives were already resolved in earlier cycles (the relevant product code was edited and the parent was marked addressed in BUILD_SPEC_LEDGER.addressedParents). You MUST NOT create new tasks that re-do these same intents under reworded titles. If upstream directives sound similar (e.g. 'Replace X with Y' / 'Replace X with Z' / 'Remove X' / 'Delete X'), treat them as the SAME and DROP them — do not emit them as parents or tasks.",
           ...alreadyAddressed.slice(0, 20).map((p, i) => `${i + 1}. ${p.text.replace(/\s+/g, " ").slice(0, 220)}`),
-          "If every current upstream directive matches an addressed one above, emit an EMPTY primarySlice.tasks (`tasks: []`) and explain in `notes`. Do NOT invent make-work to fill the slice.",
+          mandatory
+            ? "Do NOT emit empty tasks[] while project.yaml builder.directives remain — decompose them even if some upstream items were addressed."
+            : "If every current upstream directive matches an addressed one above, emit an EMPTY primarySlice.tasks (`tasks: []`) and explain in `notes`. Do NOT invent make-work to fill the slice.",
           "",
         ].join("\n")
-      : "";
+      : mandatory
+        ? "MANDATORY DECOMPOSITION: upstream produced zero concrete tasks. project.yaml builder.directives and/or open parent directives MUST each become ≥1 code-anchored task. Empty `tasks: []` is forbidden.\n"
+        : "";
   return [
     "You are the Grand Wizard. Your job is to DECOMPOSE vague upstream directives into concrete, code-anchored engineering tasks for the next Cursor pass.",
     "",
@@ -580,6 +727,7 @@ function llmPrompt(
     "- 3-7 concrete tasks total in the primary slice. No more.",
     "- Pick ONE specific 'act' / loop step when the directive says 'make one act feel inevitable'. Don't restate the directive — answer it (e.g. 'point camera at packaged food → scan UPC → render deterministic explanation').",
     "",
+    yamlBlock,
     addressedBlock,
     "Output STRICT JSON, no markdown fences:",
     `{
@@ -624,11 +772,13 @@ async function tryRunLlmGrandWizard(
   input: StageInputComposition,
   heuristic: GrandWizardOutput,
   alreadyAddressed: ReadonlyArray<{ text: string; addressedAt?: string }>,
+  modelOverride?: string,
+  opts?: { mandatory?: boolean },
 ): Promise<GrandWizardOutput | undefined> {
   const command =
     input.config.project.cursor_automation?.command ?? process.env.FOUNDRY_CURSOR_AGENT_CMD ?? "agent";
-  const model = input.config.project.cursor_automation?.grand_wizard_model ?? "gpt-5.4-high";
-  const prompt = llmPrompt(input, heuristic, alreadyAddressed);
+  const model = modelOverride ?? resolveGrandWizardModel(input, "primary");
+  const prompt = llmPrompt(input, heuristic, alreadyAddressed, opts?.mandatory);
   const modelName = model.trim().toLowerCase();
   const modelArgs =
     modelName === "auto" || modelName === "default"
@@ -793,6 +943,11 @@ export const grandWizardStage: Stage<StageInputComposition, GrandWizardOutput> =
       const survivingParents: ParentDirective[] = [];
       for (const p of carry.parentDirectives) {
         const key = droppedParentKey(p.text);
+        if (isProtectedProjectDirective(p.text, input)) {
+          survivingParents.push(p);
+          delete cachedStreak[key];
+          continue;
+        }
         if (p.childTaskIds.length === 0) {
           const next = (cachedStreak[key] ?? 0) + 1;
           if (next >= STUCK_DROP_THRESHOLD) {
@@ -857,8 +1012,60 @@ export const grandWizardStage: Stage<StageInputComposition, GrandWizardOutput> =
       text: p.text,
       addressedAt: p.addressedAt,
     }));
-    const llmRefined = await tryRunLlmGrandWizard(ctx, input, heuristicDraft, addressedForPrompt);
+    const audit = CurrentStateAuditOutputSchema.safeParse(input.currentStateAudit);
+    const screens = (audit.success ? audit.data.screens : []) ?? [];
+
+    let llmRefined = await tryRunLlmGrandWizard(
+      ctx,
+      input,
+      heuristicDraft,
+      addressedForPrompt,
+      resolveGrandWizardModel(input, "primary"),
+    );
     let output = llmRefined ?? heuristicDraft;
+
+    if (countPrimarySliceTasks(output) === 0) {
+      output = synthesizeTasksFromBuilderDirectives(input, output, screens);
+    }
+
+    if (countPrimarySliceTasks(output) === 0) {
+      const strictModel = resolveGrandWizardModel(input, "strict");
+      ctx.logger("[grand_wizard] zero tasks after heuristic — retrying LLM decomposition", {
+        primaryModel: resolveGrandWizardModel(input, "primary"),
+        strictModel,
+        builderDirectives: input.config.project.builder?.directives?.length ?? 0,
+        undecomposedParents: output.diagnostics.directivesWithoutTasks.length,
+      });
+      const retry = await tryRunLlmGrandWizard(
+        ctx,
+        input,
+        output,
+        addressedForPrompt,
+        strictModel,
+        { mandatory: true },
+      );
+      if (retry) {
+        output = retry;
+        llmRefined = retry;
+      }
+    }
+
+    if (countPrimarySliceTasks(output) === 0) {
+      output = synthesizeTasksFromBuilderDirectives(input, output, screens);
+    }
+
+    if (
+      countPrimarySliceTasks(output) === 0 &&
+      (input.config.project.builder?.directives?.length ?? 0) > 0
+    ) {
+      output = {
+        ...output,
+        notes: uniqueStringsLocal([
+          ...output.notes,
+          "BLOCKING: Grand Wizard produced zero concrete tasks despite project.yaml builder.directives. Authenticate cursor-agent / set cursor_automation.command so LLM decomposition can run.",
+        ]),
+      };
+    }
 
     if (Object.keys(ledger.tasks).length > 0) {
       const slice = output.slices[0]!;
@@ -920,6 +1127,10 @@ export const grandWizardStage: Stage<StageInputComposition, GrandWizardOutput> =
     const newlyDropped: string[] = [];
     for (const p of output.parentDirectives) {
       const key = droppedParentKey(p.text);
+      if (isProtectedProjectDirective(p.text, input)) {
+        delete updatedStreak[key];
+        continue;
+      }
       if (p.childTaskIds.length === 0) {
         const next = (updatedStreak[key] ?? 0) + 1;
         if (next >= STUCK_DROP_THRESHOLD) {

@@ -288,15 +288,38 @@ function maestroInstallTasks(command: string, flowPath: string): string[] {
   return lines;
 }
 
+function resolveMaestroPipelineCommand(config: MaestroConfig): string | undefined {
+  const explicit = config.pipelineCommand?.trim();
+  if (explicit) return explicit;
+  const cmd = config.command.trim();
+  if (!cmd) return undefined;
+  // npm/pnpm/yarn wrapper scripts (e.g. `npm run maestro:smoke -w @pkg --`) bootstrap Metro + Expo Go.
+  if (/^(npm|pnpm|yarn)\s+run\b/i.test(cmd)) return cmd;
+  if (/\bmaestro:/i.test(cmd)) return cmd;
+  return undefined;
+}
+
 function resolveMaestroConfig(input: StageInputComposition): MaestroConfig {
   const maestro = input.config.project.qa_automation?.maestro;
+  const command = maestro?.command ?? "maestro";
+  const pipelineCommand = maestro?.pipeline_command?.trim() || resolveMaestroPipelineCommand({
+    enabled: maestro?.enabled ?? false,
+    required: maestro?.required ?? false,
+    command,
+    flowPath: maestro?.flow_path ?? ".maestro",
+    installIfMissing: maestro?.install_if_missing ?? true,
+    pipelineCommand: undefined,
+    autoBootSimulator: maestro?.auto_boot_simulator ?? process.platform === "darwin",
+    preferredSimulator: maestro?.preferred_simulator?.trim() || undefined,
+    bootTimeoutSeconds: maestro?.boot_timeout_seconds ?? 90,
+  });
   return {
     enabled: maestro?.enabled ?? false,
     required: maestro?.required ?? false,
-    command: maestro?.command ?? "maestro",
+    command,
     flowPath: maestro?.flow_path ?? ".maestro",
     installIfMissing: maestro?.install_if_missing ?? true,
-    pipelineCommand: maestro?.pipeline_command?.trim() || undefined,
+    pipelineCommand,
     autoBootSimulator: maestro?.auto_boot_simulator ?? process.platform === "darwin",
     preferredSimulator: maestro?.preferred_simulator?.trim() || undefined,
     bootTimeoutSeconds: maestro?.boot_timeout_seconds ?? 90,

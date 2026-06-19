@@ -51,6 +51,27 @@ When Maestro was required but couldn't run (no simulator / env-only failure), it
 to a warning, so a required UX smoke silently "passed". Fix: `packages/stages/src/independent_qa.ts`
 now blocks ship when `required: true` and the smoke can't be verified — "couldn't verify" ≠ "ship".
 
+### FND-7 — Grand Wizard drops product directives while meta tasks close — FIXED (this batch)
+Heuristic decomposition returned `tasks: []` for vague investor directives while
+testable meta work closed via contract gates. `builder.directives` in project.yaml
+were ignored upstream.
+Fix: inject `project_directive` parents from yaml; synthesize concrete tasks when
+LLM fails; mandatory strict-model LLM retry when tasks stay empty; protect yaml
+directives from stuck-drop; include builder.directives in upstream fingerprint
+(`packages/stages/src/grand_wizard.ts`, `packages/core/src/buildSpec.ts`).
+
+### FND-8 — Maestro QA used bare binary when yaml only set npm wrapper `command` — FIXED (this batch)
+`independent_qa` ran `~/.maestro/bin/maestro test` without Metro when
+`qa_automation.maestro.command` was `npm run maestro:smoke …` but
+`pipeline_command` was unset. Fix: auto-promote npm/yarn wrapper commands to
+`pipeline_command` (`packages/stages/src/independent_qa.ts`).
+
+### FND-9 — Model defaults still assumed Free `auto` / gpt-5.4 — FIXED (this batch)
+Paid-plan defaults: Opus 4.8 (builder + investor), Composer 2.5 fast/economy,
+Codex 5.3 (Grand Wizard primary), Opus 4.8 strict retry. Added
+`investor_panel_model` / `grand_wizard_strict_model` config fields
+(`packages/core/src/cursorModels.ts`, `apps/cli/src/cursorAutomation.ts`).
+
 ---
 
 ## OPEN
@@ -60,9 +81,3 @@ FND-2/FND-5 close the worst holes, but there is still no first-class Foundry che
 asserts a human-comprehensible first session (e.g. product identity + result visible).
 Today this is delegated to the product's Maestro flow (made enforceable by FND-5).
 Next: a stage-level "UX legibility" check that doesn't depend on each project wiring it.
-
-### FND-7 — Grand Wizard drops correct-but-vague directives while keeping testable meta
-Directives like "cut scope to a single hero workflow" sat undecomposed for 18+ cycles
-(dropped), while testable meta items ("keep convergence contract in sync") were closed.
-Net effect: the loop optimizes for what's mechanically closeable, not product value.
-Needs: better decomposition or a priority that protects product directives from being dropped.

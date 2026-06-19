@@ -170,13 +170,19 @@ export const ProjectYamlSchema = z.object({
       command: z.string().optional(),
       builder_model: z.string().optional(),
       builder_fast_model: z.string().optional(),
-      /** Used when `use_builder_economy_near_release` applies (default `auto`). */
+      /** Used when `use_builder_economy_near_release` applies (default Composer fast). */
       builder_economy_model: z.string().optional(),
       /** When true (default), use `builder_economy_model` if QA ship + no code blockers + release is awaiting_approval (not blocked_pre_release). */
       use_builder_economy_near_release: z.boolean().optional(),
-      /** Model for `grand_wizard` consolidation (default `gpt-5.4-high`). */
+      /** Model for `grand_wizard` BUILD_SPEC decomposition (default `gpt-5.3-codex`). */
       grand_wizard_model: z.string().optional(),
+      /** Second-pass Grand Wizard model when decomposition returns zero tasks (default Opus 4.8). */
+      grand_wizard_strict_model: z.string().optional(),
+      /** Model for `investor_panel` LLM grader (default Opus 4.8). */
+      investor_panel_model: z.string().optional(),
+      /** @deprecated Use `investor_panel_model`. Kept for backwards compatibility. */
       qa_model: z.string().optional(),
+      /** @deprecated Use `grand_wizard_strict_model`. Kept for backwards compatibility. */
       qa_strict_model: z.string().optional(),
       max_inner_loops: z.coerce.number().int().positive().optional(),
       timeout_minutes: z.coerce.number().int().positive().optional(),
