@@ -2041,6 +2041,7 @@ function buildBuilderPrompt(
     "4. Run the project's lint/test commands for the touched area and fix failures.",
     "",
     "Do NOT satisfy this pass by only editing `.foundry/CURSOR_BRIEF.md`, `.foundry/CURSOR_BUILDER_REPORT.md`, `.foundry/WORK_PACKET.md`, or automation logs.",
+    "Do NOT run any git commands — stay on the current branch and leave product edits unstaged for Foundry auto-commit.",
   ].join("\n");
 }
 
