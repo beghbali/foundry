@@ -174,11 +174,27 @@ export function separateManualAndCodeItems(items: string[]): {
   };
 }
 
+/**
+ * Maestro blocker lines from `independent_qa`. Matches both:
+ *   - flow failures: "Maestro smoke flows failed."
+ *   - environmental "could not run": "Maestro smoke did not run: no booted simulator/device …"
+ * The environmental variant is NOT a product-code defect — Cursor cannot boot a simulator, so a
+ * loop that escalates to the premium builder on it only burns tokens and risks regressions.
+ */
+export function isMaestroBlockerLine(blocker: string): boolean {
+  const t = blocker.trim();
+  return (
+    /^maestro smoke flows failed\.?$/i.test(t) ||
+    /^maestro smoke did not run\b/i.test(t) ||
+    /\bno booted simulator\/device\b/i.test(t)
+  );
+}
+
 /** Generic Maestro failure line from `independent_qa` when flows did not pass (may still be env/device). */
 export function qaCodeBlockersAreOnlyMaestroSmokeFailed(qa: PipelineIndependentQa | undefined): boolean {
   const code = separateManualAndCodeItems(qa?.blockers ?? []).code;
   if (code.length === 0) return false;
-  return code.every((b) => /^maestro smoke flows failed\.?$/i.test(b.trim()));
+  return code.every((b) => isMaestroBlockerLine(b));
 }
 
 /** Maestro-only blocker while otherwise ship + tests green → don't burn primary on every inner pass; stall detection ignores QA "stuck". */

@@ -17,6 +17,7 @@ import {
 import {
   applyBuildSpecTaskCompletions,
   computeUpstreamFingerprint,
+  isEnvironmentalWorkItem,
   primaryBuildSpecSlice,
   readBuildSpecFromRepo,
   readBuildSpecLedger,
@@ -1593,9 +1594,22 @@ function describeFeedbackItem(item: FeedbackLedgerItem): string {
     .join(" ");
 }
 
+/** Open `shouldImplement` feedback text that is environmental (disk, builder.log, maestro, simctl, eas …). */
+function isEnvironmentalFeedbackItem(item: { summary?: string; type?: string }): boolean {
+  return isEnvironmentalWorkItem(`${item.summary ?? ""} ${item.type ?? ""}`);
+}
+
+/**
+ * Count open feedback items Cursor can productively implement. Environmental items
+ * (e.g. "automation_log: builder.log — disk at 100% capacity", maestro/simctl/eas) are
+ * surfaced to the human but excluded here so they never force a Cursor inner loop that
+ * cannot fix them — that pattern just burns the premium builder and risks regressions.
+ */
 async function countImplementNowFeedback(repoPath: string): Promise<number> {
   const ledger = await readFeedbackLedger(repoPath);
-  return ledger.items.filter((item) => item.status === "open" && item.shouldImplement).length;
+  return ledger.items.filter(
+    (item) => item.status === "open" && item.shouldImplement && !isEnvironmentalFeedbackItem(item),
+  ).length;
 }
 
 async function promptPendingFeedbackApprovals(
@@ -3492,6 +3506,31 @@ program
           ),
         );
         briefCounts = await countCriticalBriefItems(briefPath);
+        // Re-run release_agent against the reconciled ledger so the ship gate / release checklist
+        // reflects the just-closed tasks instead of stale "N open" items from the pre-reconcile scan.
+        try {
+          const rescan = await runPipeline({
+            repoPath,
+            pipelineName: opts.pipeline,
+            foundryRoot,
+            quiet: true,
+            stagesOverride: ["release_agent"],
+            disableStageReuse: true,
+          });
+          const rescanned = await readStageJson<ReleaseAgentBrief>(repoPath, rescan, "release_agent");
+          if (rescanned) {
+            releaseOutput = rescanned;
+            console.log(
+              chalk.gray("  release_agent: re-scanned ship gate after ledger reconcile."),
+            );
+          }
+        } catch (err) {
+          console.log(
+            chalk.yellow(
+              `  release_agent re-scan after reconcile failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+            ),
+          );
+        }
       }
       let briefMetrics = await readBriefMetrics(briefPath);
       let pipelineQa = await readStageJson<PipelineIndependentQa>(repoPath, manifest, "independent_qa");
@@ -3506,6 +3545,16 @@ program
         console.log(
           chalk.cyan(
             `  Feedback queue: ${implementNowFeedbackCount} open item(s) approved for implementation (CLI + owner auto-approved).`,
+          ),
+        );
+      }
+      const deferredEnvFeedback = (await readFeedbackLedger(repoPath)).items.filter(
+        (item) => item.status === "open" && item.shouldImplement && isEnvironmentalFeedbackItem(item),
+      );
+      if (deferredEnvFeedback.length > 0) {
+        console.log(
+          chalk.gray(
+            `  Feedback queue: ${deferredEnvFeedback.length} environmental item(s) deferred (not Cursor-fixable, e.g. disk/simulator/CI) — surfaced for the human, not driving the builder.`,
           ),
         );
       }
