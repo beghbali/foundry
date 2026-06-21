@@ -58,6 +58,8 @@ type MaestroConfig = {
   preferredSimulator?: string;
   /** Max seconds to wait for the simulator to reach `Booted` state after boot. */
   bootTimeoutSeconds: number;
+  /** Max seconds for the Maestro smoke run itself (Metro cold start + bundle + flows). Default 900s. */
+  runTimeoutSeconds: number;
 };
 
 /**
@@ -312,6 +314,7 @@ function resolveMaestroConfig(input: StageInputComposition): MaestroConfig {
     autoBootSimulator: maestro?.auto_boot_simulator ?? process.platform === "darwin",
     preferredSimulator: maestro?.preferred_simulator?.trim() || undefined,
     bootTimeoutSeconds: maestro?.boot_timeout_seconds ?? 90,
+    runTimeoutSeconds: maestro?.run_timeout_seconds ?? 900,
   });
   return {
     enabled: maestro?.enabled ?? false,
@@ -323,6 +326,7 @@ function resolveMaestroConfig(input: StageInputComposition): MaestroConfig {
     autoBootSimulator: maestro?.auto_boot_simulator ?? process.platform === "darwin",
     preferredSimulator: maestro?.preferred_simulator?.trim() || undefined,
     bootTimeoutSeconds: maestro?.boot_timeout_seconds ?? 90,
+    runTimeoutSeconds: maestro?.run_timeout_seconds ?? 900,
   };
 }
 
@@ -728,8 +732,13 @@ export const independentQaStage: Stage<StageInputComposition, IndependentQaOutpu
           if (!boot.ok && boot.note !== "skipped: not darwin") warnings.push(`Simulator auto-boot: ${boot.note}`);
         }
         screenshotSinceMs = Date.now();
-        ctx.logger("[independent_qa] maestro", { cmd, mode: "pipeline_command" });
-        const r = await sh(cmd, repoPath, TEST_TIMEOUT_MS);
+        const maestroTimeoutMs = Math.max(60, maestro.runTimeoutSeconds) * 1000;
+        ctx.logger("[independent_qa] maestro", {
+          cmd,
+          mode: "pipeline_command",
+          timeoutMs: maestroTimeoutMs,
+        });
+        const r = await sh(cmd, repoPath, maestroTimeoutMs);
         maestroPassed = r.exitCode === 0;
         checks.push({
           name: "maestro_smoke",
@@ -795,8 +804,9 @@ export const independentQaStage: Stage<StageInputComposition, IndependentQaOutpu
             if (!boot.ok && boot.note !== "skipped: not darwin") warnings.push(`Simulator auto-boot: ${boot.note}`);
           }
           screenshotSinceMs = Date.now();
-          ctx.logger("[independent_qa] maestro", { cmd });
-          const r = await sh(cmd, repoPath, TEST_TIMEOUT_MS);
+          const maestroTimeoutMs = Math.max(60, maestro.runTimeoutSeconds) * 1000;
+          ctx.logger("[independent_qa] maestro", { cmd, timeoutMs: maestroTimeoutMs });
+          const r = await sh(cmd, repoPath, maestroTimeoutMs);
           maestroPassed = r.exitCode === 0;
           checks.push({
             name: "maestro_smoke",

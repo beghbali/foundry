@@ -205,6 +205,8 @@ export const ProjectYamlSchema = z.object({
           preferred_simulator: z.string().optional(),
           /** Max seconds to wait for the simulator to reach `Booted` state after `simctl boot`. Default 90s. */
           boot_timeout_seconds: z.number().int().min(10).max(600).optional(),
+          /** Max seconds for the Maestro smoke run itself (Metro cold start + bundle + flows). Default 900s (15m). Maestro is far slower than unit tests, so it gets its own budget instead of the 2m test timeout. */
+          run_timeout_seconds: z.number().int().min(60).max(3600).optional(),
         })
         .optional(),
     })
