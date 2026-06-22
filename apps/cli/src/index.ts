@@ -2297,9 +2297,46 @@ program
       }
 
       const pipelineQa = await readStageJson<PipelineIndependentQa>(repoPath, manifest, "independent_qa");
-      const releaseOutput = await readStageJson<ReleaseAgentBrief>(repoPath, manifest, "release_agent");
+      let releaseOutput = await readStageJson<ReleaseAgentBrief>(repoPath, manifest, "release_agent");
       const builderOutput = await readStageJson<BuilderLoopMeta>(repoPath, manifest, "builder");
       const builderRemainingBlockers = await readBuilderRemainingBlockers(repoPath);
+
+      // Grand Wizard regenerates BUILD_SPEC tasks with fresh IDs every run, but the
+      // ledger records completions under the prior run's IDs. Without reconciling,
+      // already-shipped work shows up as perpetually "open" tracked brief items and
+      // blocks the release gate forever (release_agent => blocked_pre_release). The
+      // loop path already does this; ship must too, or `foundry ship` can never clear
+      // a brief whose code is committed under different task IDs. Reconcile by matching
+      // committed product files in recent git history to the new tasks' anchor files.
+      const shipLedgerReconcile = await reconcileBuildSpecLedgerFromGitHistory(repoPath, manifest.runId);
+      if (shipLedgerReconcile.newlyCompleted.length > 0) {
+        console.log(
+          chalk.green(
+            `  BUILD_SPEC_LEDGER: reconciled ${shipLedgerReconcile.newlyCompleted.length} task(s) from git history — ${shipLedgerReconcile.newlyCompleted.join(", ")}`,
+          ),
+        );
+        try {
+          const rescan = await runPipeline({
+            repoPath,
+            pipelineName: pipeline,
+            foundryRoot,
+            quiet: true,
+            stagesOverride: ["release_agent"],
+            disableStageReuse: true,
+          });
+          const rescanned = await readStageJson<ReleaseAgentBrief>(repoPath, rescan, "release_agent");
+          if (rescanned) {
+            releaseOutput = rescanned;
+            console.log(chalk.gray("  release_agent: re-scanned ship gate after ledger reconcile."));
+          }
+        } catch (err) {
+          console.log(
+            chalk.yellow(
+              `  release_agent re-scan after ledger reconcile failed (${err instanceof Error ? err.message : String(err)}); using pre-reconcile ship gate.`,
+            ),
+          );
+        }
+      }
 
       await logShipGateConsole(repoPath, manifest, { pipelineQa, release: releaseOutput });
       printUnblockGuidance(
