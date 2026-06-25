@@ -118,34 +118,35 @@ async function buildSinceLastPitchSection(repoPath: string): Promise<string> {
   }
 
   if (newlyCompleted.length > 0) {
-    lines.push("- Concrete task IDs completed (from BUILD_SPEC_LEDGER):");
-    for (const id of newlyCompleted.slice(0, 8)) {
+    // Product-phrased only — never leak internal task IDs / ledger mechanics into
+    // the pitch, or the panel critiques our bookkeeping instead of the product.
+    const descriptions: string[] = [];
+    for (const id of newlyCompleted) {
       const task = spec?.slices[0]?.tasks.find((t) => t.id === id);
-      if (task) {
-        lines.push(`  - **${id}**: ${task.task} (verify: ${task.verification})`);
-      } else {
-        const ledgerEntry = ledger.tasks[id];
-        const filesNote = ledgerEntry && ledgerEntry.filesTouched.length > 0 ? ` files: ${ledgerEntry.filesTouched.slice(0, 3).join(", ")}` : "";
-        lines.push(`  - **${id}**${filesNote}`);
-      }
+      if (task) descriptions.push(task.task);
+    }
+    if (descriptions.length > 0) {
+      lines.push("- Product work shipped since last pitch:");
+      for (const desc of descriptions.slice(0, 8)) lines.push(`  - ${desc}`);
+    } else {
+      lines.push(`- ${newlyCompleted.length} product task(s) completed since last pitch (see git diff above).`);
     }
   }
 
-  if (spec) {
-    const slice = spec.slices[0];
-    const openTasks = slice?.tasks.filter((t) => !(t.id in ledger.tasks)) ?? [];
-    if (openTasks.length > 0) {
-      lines.push(`- Still open this cycle (${openTasks.length}): ${openTasks.map((t) => t.id).slice(0, 6).join(", ")}.`);
-    }
-    if (spec.parentDirectives.length > 0) {
-      const addressedParents = spec.parentDirectives.filter((p) =>
-        p.childTaskIds.length > 0 && p.childTaskIds.every((cid) => cid in ledger.tasks),
+  // Grade-up signal: product goals fully delivered in shipped code. We surface the
+  // human-readable directive text (not task IDs) so the panel rewards real
+  // progress. We deliberately do NOT list "still open" internal task counts —
+  // the panel grades the product a user sees, not our open-item bookkeeping.
+  if (spec && spec.parentDirectives.length > 0) {
+    const addressedParents = spec.parentDirectives.filter(
+      (p) => p.childTaskIds.length > 0 && p.childTaskIds.every((cid) => cid in ledger.tasks),
+    );
+    if (addressedParents.length > 0) {
+      lines.push(
+        `- Product goals now delivered in shipped code (grade these up): ${addressedParents
+          .map((p) => `"${p.text.slice(0, 80)}"`)
+          .join("; ")}.`,
       );
-      if (addressedParents.length > 0) {
-        lines.push(
-          `- Parent directives now ADDRESSED in code (grade these up): ${addressedParents.map((p) => `"${p.text.slice(0, 80)}"`).join("; ")}.`,
-        );
-      }
     }
   }
 
@@ -267,7 +268,15 @@ export const InvestorPanelOutputSchema = z.object({
   /** When `foundry.autonomous_investor_convergence` is enabled, pipeline/loop use this bar (mean grade). */
   meetsInvestorTarget: z.boolean(),
   averageInvestorRank: z.number(),
+  /** Product-shaped, code-actionable refinement directives the loop should act on. */
   combinedRefinementDirectives: z.array(z.string()),
+  /**
+   * Evidence/ops asks that require real devices or real users (on-device p95,
+   * Yuka benchmarks, D1/D7 retention, prod migration verification). Surfaced to
+   * the human; they never drive Cursor or block convergence. Foundry-internal
+   * tracker chatter is dropped entirely and never appears here.
+   */
+  deferredHumanDirectives: z.array(z.string()).default([]),
   refinementRound: z.number().int().min(0),
   /**
    * True when the panel could not actually grade the product (LLM grader
@@ -283,6 +292,7 @@ const InvestorPanelLlmDraftSchema = z.object({
   pitchBrief: z.string().optional(),
   investors: z.array(PersonaSchema).length(3),
   combinedRefinementDirectives: z.array(z.string()).optional(),
+  deferredHumanDirectives: z.array(z.string()).optional(),
 });
 
 type Signals = {
@@ -585,23 +595,50 @@ function extractJsonObject(text: string): string | undefined {
 }
 
 function llmContext(input: StageInputComposition, pitchBrief: string): string {
+  // Hygiene: only feed the panel product-facing inputs. We deliberately omit raw
+  // Foundry internals (`builder` changes/status, `releaseAgent` checklist,
+  // `currentStateAudit`, `feedback` ledger, `growthOperator`) because dumping them
+  // makes the LLM critique our tooling ("builder partial", "BUILD_SPEC tasks
+  // open") instead of the product. QA is reduced to a compact recommendation.
+  const cc = ConvergenceContractOutputSchema.safeParse(input.convergenceContract);
+  let convergenceContract: unknown = input.convergenceContract;
+  if (cc.success) {
+    // Drop tooling objections; tag evidence/ops so the LLM does not lower the
+    // PRODUCT grade for go-to-market data it cannot produce from code.
+    const filteredObjections = cc.data.openObjections
+      .filter((o) => classifyInvestorDirective(o.objection) !== "foundry_meta")
+      .map((o) => {
+        const category = classifyInvestorDirective(o.objection);
+        return category === "evidence" || category === "ops"
+          ? {
+              ...o,
+              category,
+              note: "human/non-code: do NOT lower the product grade for this; put it under deferredHumanDirectives",
+            }
+          : { ...o, category };
+      });
+    convergenceContract = { ...cc.data, openObjections: filteredObjections };
+  }
+
+  const qaEv = QaEvidenceSchema.safeParse(input.independentQa);
+  const qaSummary = qaEv.success
+    ? {
+        recommendation: qaEv.data.recommendation ?? "missing",
+        score: qaEv.data.score,
+        blockerCount: qaEv.data.blockers?.length ?? 0,
+      }
+    : { recommendation: "missing" };
+
   const payload = {
     project: input.config.project,
     metrics: input.config.metrics,
-    gates: input.config.gates,
-    currentStateAudit: input.currentStateAudit,
     marketGap: input.marketGap,
     firstPrinciples: input.firstPrinciples,
     flywheel: input.flywheel,
-    convergenceContract: input.convergenceContract,
+    convergenceContract,
     productDefinition: input.productDefinition,
     monetizationConfig: input.monetizationConfig,
-    builder: input.builder,
-    independentQa: input.independentQa,
-    releaseAgent: input.releaseAgent,
-    growthOperator: input.growthOperator,
-    feedback: input.feedback,
-    investorRefinement: input.investorRefinement,
+    qaSummary,
     pitchBrief,
   };
   return JSON.stringify(payload, null, 2);
@@ -619,16 +656,17 @@ function llmPrompt(input: StageInputComposition, pitchBrief: string): string {
     "- Keep the pitch brief to 4-7 lines.",
     "- For each investor, return one grade from: F, D, C, C-, C+, B-, B, B+, A-, A, A+",
     "- Each investor response must be brief (max ~90 words).",
-    "- Base the evaluation on the CURRENT state of the product as built (use `builder.status`, `builder.changes.filesCreated/Modified`, `independentQa.recommendation/score/blockers`, and `convergenceContract.isConverged` / `convergenceContract.openObjections`). Do NOT credit the team for capability that is only declared in scope.",
-    "- READ the **SHIPPED SINCE LAST PITCH** section in the pitch brief carefully. If a previous directive you (or another investor) gave is now reflected in completed BUILD_SPEC_LEDGER tasks or git commits, ACKNOWLEDGE the progress in your response and reflect it in your grade — do not repeat directives that have already been addressed.",
-    "- If your prior grade was below the A-band and the shipped delta materially addresses your concern, you should move the grade up. If nothing was shipped or shipped work missed your point, hold or lower the grade and explain why.",
-    "- If `convergenceContract.openObjections` contains any `open` or `regressed` objections, treat them as unresolved and reflect that in your grade and response.",
-    "- Reward narrowing and parking discipline (one singular loop, parked features in `mustNotShipYet`). Penalise cluttered, multi-bet pitches.",
-    "- If grades are below A-band, include concrete refinement directives that target unresolved objections from `convergenceContract.openObjections` first. Do not re-issue directives already in the `SHIPPED SINCE LAST PITCH` addressed list.",
+    "- GRADE THE PRODUCT A USER EXPERIENCES: the scan→verdict flow, first-session clarity/delight, differentiation, and the monetization model. Use `qaSummary` (recommendation/score) and `convergenceContract` (thesis, singular loop, isConverged, openObjections) as evidence. Do NOT credit capability that is only declared in scope.",
+    "- READ the **SHIPPED SINCE LAST PITCH** section. If shipped product work addresses a prior directive, ACKNOWLEDGE it and move your grade up. If nothing relevant shipped, hold or lower the grade and explain why.",
+    "- CRITICAL — NEVER comment on or grade Foundry's internal tooling: build specs, ledgers, work packets, task IDs (e.g. 't1', 'dir-29'), 'builder partial / zero-delta', tracker reconciliation, primary slices, or the loop itself. These are NOT the product. Ignore any objection phrased in those terms entirely — do not echo it as a directive and do not let it affect the grade.",
+    "- CRITICAL — do NOT lower the PRODUCT grade for go-to-market EVIDENCE that requires real devices or real users (on-device latency / p95, Yuka benchmark numbers, D1/D7 retention, cohort / acceptance numbers, production migration verification). Grade the product as built. Put any such ask in `deferredHumanDirectives` (a human runs them), never in `combinedRefinementDirectives`.",
+    "- Treat only PRODUCT/UX/positioning items in `convergenceContract.openObjections` (status open/regressed) as grade-affecting; objections tagged category 'evidence' or 'ops' are non-code and must not lower the product grade.",
+    "- Reward narrowing and parking discipline (one singular loop, parked features). Penalise cluttered, multi-bet pitches.",
+    "- When grades are below the A-band, put concrete PRODUCT refinement directives in `combinedRefinementDirectives`. Each MUST be specific and code-actionable: name the screen / component / file and the exact change (e.g. \"In `ProductResultScreen.tsx`, replace the secondary card stack with …\"). No vague prose ('tighten', 'delight', 'polish'), no tooling, no evidence asks. If you have no product-shaped change to request, return an empty array.",
     "- Output STRICT JSON only. No markdown fences, no prose before/after.",
     "",
     "JSON schema:",
-    '{"pitchBrief":"string","investors":[{"id":"elon_musk|steve_jobs|andreessen_horowitz","displayName":"string","grade":"F|D|C|C-|C+|B-|B|B+|A-|A|A+","response":"string"}],"combinedRefinementDirectives":["string"]}',
+    '{"pitchBrief":"string","investors":[{"id":"elon_musk|steve_jobs|andreessen_horowitz","displayName":"string","grade":"F|D|C|C-|C+|B-|B|B+|A-|A|A+","response":"string"}],"combinedRefinementDirectives":["specific code-actionable product change naming a screen/file"],"deferredHumanDirectives":["evidence/ops ask a human must run"]}',
     "",
     "Project context:",
     llmContext(input, pitchBrief),
@@ -695,6 +733,7 @@ async function tryRunLlmInvestorPanel(
         worstGrade: INVESTOR_GRADE_ORDER[worstRank] ?? "F",
         worstRank,
         combinedRefinementDirectives: [...new Set(parsed.combinedRefinementDirectives ?? [])].slice(0, 8),
+        deferredHumanDirectives: [...new Set(parsed.deferredHumanDirectives ?? [])].slice(0, 8),
         refinementRound,
       },
       input,
@@ -736,6 +775,88 @@ function responseFor(
       `${s.differentiation >= 65 ? "Wedge is identifiable." : "Distribution: who pulls this into the org and why switch now?"} ` +
       tighten
   );
+}
+
+export type InvestorDirectiveCategory =
+  | "product_ux"
+  | "positioning"
+  | "evidence"
+  | "ops"
+  | "foundry_meta";
+
+/**
+ * Classify an investor refinement directive so the loop only acts on
+ * product-shaped feedback.
+ *
+ * - `foundry_meta`: critiques of Foundry's own bookkeeping (BUILD_SPEC, ledger,
+ *   work packet, task IDs, "builder partial/zero-delta", tracker). An investor
+ *   never critiques our tooling — drop these entirely.
+ * - `evidence` / `ops`: real-world data or infra that needs devices/users/prod
+ *   (on-device p95, Yuka benchmarks, D1/D7 retention, Maestro/EAS/migration).
+ *   Surface to the human; never drive Cursor or block convergence.
+ * - `product_ux` / `positioning`: genuine, code-actionable product feedback —
+ *   the only category the builder loop should consume.
+ */
+export function classifyInvestorDirective(text: string): InvestorDirectiveCategory {
+  const t = text.toLowerCase();
+  if (
+    /\bbuild[_ ]?spec\b/.test(t) ||
+    /\bledger\b/.test(t) ||
+    /\bwork[_ ]?packet\b/.test(t) ||
+    /\bdir-\d+\b/.test(t) ||
+    /\bzero[- ]?delta\b/.test(t) ||
+    /builder\s*[=:]?\s*partial/.test(t) ||
+    /partial\/zero|partial or zero/.test(t) ||
+    /reconcile the tracker|the tracker\b/.test(t) ||
+    /grand[_ ]?wizard/.test(t) ||
+    /primary[_ ]?slice/.test(t) ||
+    (/\bfoundry\b/.test(t) && /(meta|artifact|internal|loop|tracker|tooling)/.test(t)) ||
+    /open build[_ ]?spec tasks/.test(t) ||
+    (/\bt[1-9]\b[^.]*\bt[1-9]\b/.test(t) && /\btask/.test(t))
+  ) {
+    return "foundry_meta";
+  }
+  if (
+    /\bp95\b/.test(t) ||
+    (/\blatency\b/.test(t) && /(measure|publish|benchmark|target hardware)/.test(t)) ||
+    /benchmark(ed)? against/.test(t) ||
+    (/\byuka\b/.test(t) && /(compar|benchmark|measure|publish|latency|speed)/.test(t)) ||
+    /\bd1\b|\bd7\b/.test(t) ||
+    /retention (cohort|numbers|rate|dashboard)/.test(t) ||
+    /cohort (numbers|evidence|data)/.test(t) ||
+    /repeat[- ]?scan rate/.test(t) ||
+    /recommendation acceptance/.test(t) ||
+    /real (numbers|users|data|cohort|traction)/.test(t) ||
+    /(publish|capture|measure)\b[^.]*(evidence|metrics|numbers|cohort)/.test(t)
+  ) {
+    return "evidence";
+  }
+  if (
+    /\bmaestro\b/.test(t) ||
+    /\bsimulator\b|\bsimctl\b|coresimulator/.test(t) ||
+    /\beas\b|testflight/.test(t) ||
+    /provisioning|aps-environment/.test(t) ||
+    /device proof|on (a )?(real )?device|target hardware/.test(t) ||
+    (/\bsupabase\b/.test(t) && /(migration|production|prod|deploy)/.test(t)) ||
+    /apply.*migration|migration.*production/.test(t) ||
+    /\bin production\b/.test(t)
+  ) {
+    return "ops";
+  }
+  if (
+    /\bthesis\b|one[- ]?liner|\belevator\b|positioning|\bpitch\b|must[- ]?ship|mvp boundary|convergence contract/.test(
+      t,
+    )
+  ) {
+    return "positioning";
+  }
+  return "product_ux";
+}
+
+/** Product-shaped directives the loop/Cursor should act on. */
+export function isLoopActionableInvestorDirective(text: string): boolean {
+  const c = classifyInvestorDirective(text);
+  return c === "product_ux" || c === "positioning";
 }
 
 function buildDirectives(
@@ -819,14 +940,33 @@ function finalizeInvestorPanelOutput(
     worstGrade: InvestorGrade;
     worstRank: number;
     combinedRefinementDirectives: string[];
+    deferredHumanDirectives?: string[];
     refinementRound: number;
   },
   input: StageInputComposition,
 ): InvestorPanelOutput {
   const grades = draft.investors.map((i) => i.grade);
   const t = computeInvestorTargetFields(grades, parseAutonomousInvestorConvergence(input.config.project.foundry));
+
+  // Keep only product-shaped directives in the loop-driving list; route evidence/
+  // ops items to a human checklist and drop Foundry-internal tracker chatter so
+  // the builder loop never churns on un-codeable or self-referential feedback.
+  const product: string[] = [];
+  const deferred: string[] = [];
+  for (const d of draft.deferredHumanDirectives ?? []) {
+    if (classifyInvestorDirective(d) !== "foundry_meta") deferred.push(d);
+  }
+  for (const d of draft.combinedRefinementDirectives) {
+    const cat = classifyInvestorDirective(d);
+    if (cat === "foundry_meta") continue;
+    if (cat === "evidence" || cat === "ops") deferred.push(d);
+    else product.push(d);
+  }
+
   return InvestorPanelOutputSchema.parse({
     ...draft,
+    combinedRefinementDirectives: [...new Set(product)].slice(0, 8),
+    deferredHumanDirectives: [...new Set(deferred)].slice(0, 8),
     meetsMinimumGradeA: t.meetsMinimumGradeA,
     meetsInvestorTarget: t.meetsInvestorTarget,
     averageInvestorRank: t.averageInvestorRank,
@@ -933,9 +1073,19 @@ export const investorPanelStage: Stage<StageInputComposition, InvestorPanelOutpu
         auto.enabled ? ` — autonomous mode: mean ≥ **${auto.minAverageGrade}**` : ""
       }`,
       validated.combinedRefinementDirectives.length
-        ? ["", "## Refinement directives", "", ...validated.combinedRefinementDirectives.map((d) => `- ${d}`), ""].join(
+        ? ["", "## Refinement directives (product — drive the loop)", "", ...validated.combinedRefinementDirectives.map((d) => `- ${d}`), ""].join(
             "\n",
           )
+        : "",
+      validated.deferredHumanDirectives.length
+        ? [
+            "",
+            "## Deferred to human (evidence / ops — not loop-actionable)",
+            "_These need real devices, real users, or production access. They do not drive Cursor and do not block convergence._",
+            "",
+            ...validated.deferredHumanDirectives.map((d) => `- ${d}`),
+            "",
+          ].join("\n")
         : "",
       "",
       "_Investor panel is for internal planning only; grades are not financial or legal advice._",
