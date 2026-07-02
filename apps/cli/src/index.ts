@@ -1594,6 +1594,81 @@ function describeFeedbackItem(item: FeedbackLedgerItem): string {
     .join(" ");
 }
 
+function inferFeedbackType(summary: string): FeedbackLedgerItem["type"] {
+  const s = summary.toLowerCase();
+  if (/\b(crash|fatal|exception|freeze|stuck|hung)\b/.test(s)) return "crash";
+  if (/\b(bug|broken|fails?|error|incorrect|wrong|regression)\b/.test(s)) return "bug";
+  if (/\b(love|great|nice|works well|smooth)\b/.test(s)) return "praise";
+  if (/\b(request|should|need|add|improve|enhance|support)\b/.test(s)) return "feature_request";
+  return "complaint";
+}
+
+function inferFeedbackPriority(summary: string): FeedbackLedgerItem["priority"] {
+  const s = summary.toLowerCase();
+  if (/\b(blocker|critical|urgent|cannot|can't|unable|won't|fails to|crash|data loss)\b/.test(s)) return "high";
+  if (/\b(minor|nit|polish|nice to have|cosmetic|copy)\b/.test(s)) return "low";
+  return "medium";
+}
+
+function normalizeFeedbackSummary(text: string): string {
+  return text
+    .replace(/^\s*(?:[-*•]\s+|\d+[.)]\s+)+/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Accept one large feedback dump and split it into individual actionable points.
+ * Supports bullet lists, numbered lists, or paragraph chunks separated by blank lines.
+ */
+function parseBatchFeedbackSummaries(raw: string): string[] {
+  const src = raw.replace(/\r\n/g, "\n").trim();
+  if (!src) return [];
+  const lines = src.split("\n");
+  const hasBullets = lines.some((line) => /^\s*(?:[-*•]\s+|\d+[.)]\s+)/.test(line));
+  if (hasBullets) {
+    const out: string[] = [];
+    let current = "";
+    for (const line of lines) {
+      const isBullet = /^\s*(?:[-*•]\s+|\d+[.)]\s+)/.test(line);
+      if (isBullet) {
+        if (current.trim()) out.push(normalizeFeedbackSummary(current));
+        current = line;
+      } else if (current.trim()) {
+        current += ` ${line.trim()}`;
+      } else if (line.trim()) {
+        current = line.trim();
+      }
+    }
+    if (current.trim()) out.push(normalizeFeedbackSummary(current));
+    return [...new Set(out.filter(Boolean))];
+  }
+
+  // Paragraph mode: split on blank lines, then normalize.
+  const chunks = src
+    .split(/\n\s*\n/g)
+    .map((chunk) => normalizeFeedbackSummary(chunk))
+    .filter(Boolean);
+  if (chunks.length > 1) return [...new Set(chunks)];
+
+  // Fallback: split semicolon-separated points.
+  const semi = src
+    .split(/\s*;\s+/)
+    .map((chunk) => normalizeFeedbackSummary(chunk))
+    .filter(Boolean);
+  return [...new Set(semi)];
+}
+
+async function readStdinText(): Promise<string> {
+  const chunks: Buffer[] = [];
+  return await new Promise((resolveStdin, reject) => {
+    process.stdin.on("data", (c) => chunks.push(Buffer.from(c)));
+    process.stdin.on("end", () => resolveStdin(Buffer.concat(chunks).toString("utf8")));
+    process.stdin.on("error", reject);
+    process.stdin.resume();
+  });
+}
+
 /** Open `shouldImplement` feedback text that is environmental (disk, builder.log, maestro, simctl, eas …). */
 function isEnvironmentalFeedbackItem(item: { summary?: string; type?: string }): boolean {
   return isEnvironmentalWorkItem(`${item.summary ?? ""} ${item.type ?? ""}`);
@@ -2514,6 +2589,94 @@ feedbackProgram
       ledger.updatedAt = now;
       await writeFeedbackLedger(repoPath, ledger);
       console.log(chalk.green(`Added: ${describeFeedbackItem(item)}`));
+    },
+  );
+
+feedbackProgram
+  .command("ingest")
+  .description("Ingest one multi-point feedback note and split it into individual ledger items")
+  .option("--repo <path>", "Path to target repo (defaults to current directory)")
+  .option("--file <path>", "Read the batch feedback text from a file")
+  .option("--stdin", "Read the batch feedback text from stdin")
+  .option("--image <paths...>", "Optional screenshot/image paths to attach in each entry note")
+  .option("--no-implement", "Add entries without auto-marking shouldImplement=true")
+  .option("--note <text>", "Optional note prefix added to each entry")
+  .argument("[text]", "One large feedback note (supports bullets/numbered lists/paragraphs)")
+  .action(
+    async (
+      text: string | undefined,
+      opts: {
+        repo?: string;
+        file?: string;
+        stdin?: boolean;
+        image?: string[];
+        implement?: boolean;
+        note?: string;
+      },
+    ) => {
+      const repoPath = resolveRepoPath(opts.repo);
+      const fromArg = (text ?? "").trim();
+      const fromFile = opts.file ? (await readFile(resolve(opts.file), "utf8")).trim() : "";
+      const fromStdin = opts.stdin ? (await readStdinText()).trim() : "";
+      const raw = [fromArg, fromFile, fromStdin].filter(Boolean).join("\n\n").trim();
+      if (!raw) {
+        console.error(
+          chalk.red(
+            "Missing batch feedback text. Pass a quoted note, or use --file, or pipe with --stdin.",
+          ),
+        );
+        process.exit(1);
+      }
+
+      const summaries = parseBatchFeedbackSummaries(raw);
+      if (summaries.length === 0) {
+        console.error(chalk.red("Could not extract individual feedback points from input."));
+        process.exit(1);
+      }
+
+      const imageList = Array.isArray(opts.image) ? opts.image.map((p) => p.trim()).filter(Boolean) : [];
+      const noteParts: string[] = [];
+      if (opts.note?.trim()) noteParts.push(opts.note.trim());
+      if (imageList.length > 0) noteParts.push(`images: ${imageList.join(", ")}`);
+      noteParts.push("Batch-ingested from one prompt; auto-split into individual entries.");
+      const baseNote = noteParts.join(" ");
+      const implement = opts.implement !== false;
+
+      const ledger = await readFeedbackLedger(repoPath);
+      const now = new Date().toISOString();
+      const created: FeedbackLedgerItem[] = [];
+      for (const summary of summaries) {
+        const item: FeedbackLedgerItem = {
+          id: feedbackIdFromSummary(summary),
+          type: inferFeedbackType(summary),
+          summary,
+          priority: inferFeedbackPriority(summary),
+          source: "manual:cli:ingest",
+          timestamp: now,
+          firstSeenAt: now,
+          lastSeenAt: now,
+          seenCount: 1,
+          status: "open",
+          repoActionable: true,
+          shouldImplement: implement,
+          implementationApproval: implement ? "auto" : "pending",
+          implementationNote: baseNote,
+          presentInLatestCollection: true,
+        };
+        ledger.items.unshift(item);
+        created.push(item);
+      }
+
+      ledger.updatedAt = now;
+      await writeFeedbackLedger(repoPath, ledger);
+
+      console.log(chalk.green(`Added ${created.length} feedback item(s) from one prompt:`));
+      created.slice(0, 12).forEach((item, idx) => {
+        console.log(chalk.green(`  ${idx + 1}. ${describeFeedbackItem(item)}`));
+      });
+      if (created.length > 12) {
+        console.log(chalk.gray(`  … +${created.length - 12} more (see ${feedbackLedgerPath(repoPath)})`));
+      }
     },
   );
 
