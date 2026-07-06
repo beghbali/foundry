@@ -291,7 +291,9 @@ export function resolveCursorAutomationSettings(
       raw?.grand_wizard_strict_model ?? raw?.qa_strict_model,
       "grandWizardStrictModel",
     ),
-    maxInnerLoops: Math.min(overrides?.maxInnerLoops ?? raw?.max_inner_loops ?? 3, 3),
+    // Keep a sane upper bound but do not hard-cap at 3. Larger feedback batches
+    // need more than three inner passes to close multiple items per outer cycle.
+    maxInnerLoops: Math.min(overrides?.maxInnerLoops ?? raw?.max_inner_loops ?? 3, 12),
     timeoutMinutes: overrides?.timeoutMinutes ?? raw?.timeout_minutes ?? 45,
   };
 }
