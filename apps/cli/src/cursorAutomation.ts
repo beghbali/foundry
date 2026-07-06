@@ -446,6 +446,17 @@ export function chooseBuilderModel(
   const economy = settings.builderEconomyModel;
   const pipelineQaRecommendation = pipelineQa?.recommendation;
   const pipelineQaCodeBlockerCount = separateManualAndCodeItems(pipelineQa?.blockers ?? []).code.length;
+  const heavyFeedbackLoad = feedbackImplementQueued >= 4;
+  const heavyBriefLoad =
+    briefCounts.mustShip + briefCounts.unresolvedGaps + briefCounts.runtime >= 2 || briefCounts.total >= 4;
+  const meatyWorkload = heavyFeedbackLoad || heavyBriefLoad || pipelineQaCodeBlockerCount > 0;
+  const meatyWhyParts: string[] = [];
+  if (heavyFeedbackLoad) meatyWhyParts.push(`feedback_open=${feedbackImplementQueued}`);
+  if (heavyBriefLoad)
+    meatyWhyParts.push(
+      `brief(must=${briefCounts.mustShip},gaps=${briefCounts.unresolvedGaps},runtime=${briefCounts.runtime},total=${briefCounts.total})`,
+    );
+  if (pipelineQaCodeBlockerCount > 0) meatyWhyParts.push(`qa_code_blockers=${pipelineQaCodeBlockerCount}`);
 
   if (stalledIterations > 0) {
     return { model: primary, reason: "stalled inner loop; escalating to primary builder model" };
@@ -461,6 +472,7 @@ export function chooseBuilderModel(
   if (
     settings.useBuilderEconomyNearRelease &&
     !investorBelowTarget &&
+    !meatyWorkload &&
     shouldUseNearReleaseEconomyBuilder(
       releaseStatus,
       pipelineQaRecommendation,
@@ -475,9 +487,15 @@ export function chooseBuilderModel(
   }
 
   if (innerLoopIndex > 1) {
+    if (meatyWorkload) {
+      return {
+        model: primary,
+        reason: `inner pass ${innerLoopIndex}: meaty workload — primary builder (${meatyWhyParts.join(" · ") || "complex slice"})`,
+      };
+    }
     return {
       model: fast,
-      reason: `inner pass ${innerLoopIndex}: refinement — fast builder (primary only when stalled)`,
+      reason: `inner pass ${innerLoopIndex}: light refinement — fast builder (no heavy brief/feedback/QA workload)`,
     };
   }
 

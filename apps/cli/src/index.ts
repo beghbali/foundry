@@ -4044,6 +4044,7 @@ program
           cycleInnerPasses = inner;
           const prePacketOpen = workPacketOpenCount(workPacket);
           const preQaBlockers = pipelineQa?.blockers?.length ?? 0;
+          const preFeedbackOpen = implementNowFeedbackCount;
           const briefSamples = sampleOpenPacketItems(workPacket, 14);
           const feedbackSamples =
             !stabilize && implementNowFeedbackCount > 0 ? await sampleImplementNowFeedback(repoPath, 8) : [];
@@ -4094,6 +4095,11 @@ program
             stabilize ? 0 : implementNowFeedbackCount,
             releaseOutput?.status,
             !investorPanelMetTarget(investorOutput, foundryConfig.project.foundry, loopProfile),
+          );
+          console.log(
+            chalk.gray(
+              `  Selection: packet_open=${activePacketCounts.total} · feedback_open=${preFeedbackOpen} · qa_code_blockers=${qaCodeBlockerCount} · model=${builderChoice.model}`,
+            ),
           );
           const builderSpinner = ora(`Cursor builder agent (${builderChoice.model})`).start();
           console.log(chalk.gray(`  Builder model reason: ${builderChoice.reason}`));
@@ -4422,6 +4428,7 @@ program
           }
           feedbackOutput = await readStageJson<PipelineFeedbackBrief>(repoPath, manifest, "feedback_agent");
           implementNowFeedbackCount = await countImplementNowFeedback(repoPath);
+          const feedbackResolvedThisPass = Math.max(0, preFeedbackOpen - implementNowFeedbackCount);
           builderRemainingBlockers = await readBuilderRemainingBlockers(repoPath);
           workPacket = await refreshWorkPacket(repoPath, workPacket, {
             briefOpenItems: stabilize
@@ -4448,6 +4455,18 @@ program
           });
           workPacket = await syncBuilderDirectivePacketClosure(repoPath, workPacket);
           activePacketCounts = packetBriefCounts(workPacket);
+          console.log(
+            chalk.gray(
+              `  Pass outcome: model=${builderChoice.model} · feedback_resolved=${feedbackResolvedThisPass} (remaining=${implementNowFeedbackCount}) · packet_open ${prePacketOpen}→${activePacketCounts.total} · qa_blockers ${preQaBlockers}→${pipelineQa?.blockers?.length ?? 0}`,
+            ),
+          );
+          if (preFeedbackOpen > 0 && feedbackResolvedThisPass === 0) {
+            console.log(
+              chalk.yellow(
+                "  Feedback throughput: 0 items resolved this pass despite open queue — next pass will continue with explicit feedback targets.",
+              ),
+            );
+          }
 
           // Stop only on durable ship — post-Cursor green without commits does not count.
           if (
