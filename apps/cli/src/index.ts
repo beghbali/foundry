@@ -1687,6 +1687,14 @@ async function countImplementNowFeedback(repoPath: string): Promise<number> {
   ).length;
 }
 
+async function sampleImplementNowFeedback(repoPath: string, maxItems = 8): Promise<string[]> {
+  const ledger = await readFeedbackLedger(repoPath);
+  return ledger.items
+    .filter((item) => item.status === "open" && item.shouldImplement && !isEnvironmentalFeedbackItem(item))
+    .slice(0, maxItems)
+    .map((item) => `[FEEDBACK] ${item.summary}`);
+}
+
 async function promptPendingFeedbackApprovals(
   repoPath: string,
   opts: { noWait: boolean; ownerEmails: Set<string> },
@@ -3907,10 +3915,14 @@ program
             const invMet = investorPanelMetTarget(investorOutput, foundryConfig.project.foundry, loopProfile);
             const feedbackQueued = implementNowFeedbackCount > 0;
             const actionableOpen = actionableWorkPacketOpenCount(workPacket);
+            // Keep iterating when implement-now feedback is queued, even if the
+            // packet is empty and release is already awaiting approval. Without
+            // this, the loop exits to approval and silently skips feedback work.
             const stayForConvergence =
-              autonomousInv.deferReleaseUntilInvestorTarget &&
-              actionableOpen > 0 &&
-              (!invMet || feedbackQueued || !contractGate.ok);
+              (feedbackQueued ||
+                (autonomousInv.deferReleaseUntilInvestorTarget &&
+                  actionableOpen > 0 &&
+                  (!invMet || !contractGate.ok)));
             if (stayForConvergence) {
               const why = feedbackQueued
                 ? "feedback queued for implementation"
@@ -4033,11 +4045,14 @@ program
           const prePacketOpen = workPacketOpenCount(workPacket);
           const preQaBlockers = pipelineQa?.blockers?.length ?? 0;
           const briefSamples = sampleOpenPacketItems(workPacket, 14);
+          const feedbackSamples =
+            !stabilize && implementNowFeedbackCount > 0 ? await sampleImplementNowFeedback(repoPath, 8) : [];
+          const targetLines = [...briefSamples, ...feedbackSamples];
           logInnerLoopTargets(
             inner,
             effectiveMaxInner,
             activePacketCounts.total,
-            briefSamples,
+            targetLines,
             pipelineQa,
           );
           console.log(
@@ -4059,7 +4074,7 @@ program
               inner,
               maxInner: effectiveMaxInner,
               briefCounts: activePacketCounts,
-              briefSamples,
+              briefSamples: targetLines,
               pipelineQa,
               builderRemainingBlockers,
               stabilize,
