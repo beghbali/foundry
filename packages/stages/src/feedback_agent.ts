@@ -556,6 +556,50 @@ function resolveFeedbackImplementation(
   "repoActionable" | "shouldImplement" | "implementationNote" | "submitterEmail" | "implementationApproval"
 > {
   const submitterEmail = raw.submitterEmail ?? prior?.submitterEmail;
+
+  // In-app (Supabase) feedback always waits for explicit approve / deny / defer in `foundry loop`.
+  if (raw.source === "supabase" && raw.type !== "praise") {
+    const priorApproval = prior?.implementationApproval;
+    const effectiveApproval = priorApproval === "auto" ? "pending" : priorApproval;
+    if (effectiveApproval === "approved") {
+      return {
+        submitterEmail,
+        repoActionable: true,
+        shouldImplement: true,
+        implementationApproval: "approved",
+        implementationNote: prior?.implementationNote ?? inferred.implementationNote,
+      };
+    }
+    if (effectiveApproval === "declined") {
+      return {
+        submitterEmail,
+        repoActionable: inferred.repoActionable || prior?.repoActionable || false,
+        shouldImplement: false,
+        implementationApproval: "declined",
+        implementationNote: prior?.implementationNote ?? "Denied during Foundry loop review.",
+      };
+    }
+    if (effectiveApproval === "postponed") {
+      return {
+        submitterEmail,
+        repoActionable: inferred.repoActionable || prior?.repoActionable || false,
+        shouldImplement: false,
+        implementationApproval: "postponed",
+        implementationNote:
+          prior?.implementationNote ?? "Deferred during Foundry loop — will re-prompt next cycle.",
+      };
+    }
+    return {
+      submitterEmail,
+      repoActionable: inferred.repoActionable || prior?.repoActionable || false,
+      shouldImplement: false,
+      implementationApproval: "pending",
+      implementationNote:
+        prior?.implementationNote ??
+        "In-app feedback — approve, deny, or defer during Foundry loop to queue for implementation.",
+    };
+  }
+
   const autoApproved = isAutoApprovedFeedback(raw.source, submitterEmail, ownerEmails);
 
   if (autoApproved && raw.type !== "praise") {
@@ -569,37 +613,6 @@ function resolveFeedbackImplementation(
         (raw.source.startsWith("manual:")
           ? "CLI/manual feedback — auto-approved for implementation."
           : "Owner feedback — auto-approved for implementation."),
-    };
-  }
-
-  if (raw.source === "supabase" && !autoApproved) {
-    const priorApproval = prior?.implementationApproval;
-    if (priorApproval === "approved") {
-      return {
-        submitterEmail,
-        repoActionable: true,
-        shouldImplement: true,
-        implementationApproval: "approved",
-        implementationNote: prior?.implementationNote ?? inferred.implementationNote,
-      };
-    }
-    if (priorApproval === "declined") {
-      return {
-        submitterEmail,
-        repoActionable: inferred.repoActionable || prior?.repoActionable || false,
-        shouldImplement: false,
-        implementationApproval: "declined",
-        implementationNote: prior?.implementationNote ?? "Declined during Foundry loop review.",
-      };
-    }
-    return {
-      submitterEmail,
-      repoActionable: inferred.repoActionable || prior?.repoActionable || false,
-      shouldImplement: false,
-      implementationApproval: "pending",
-      implementationNote:
-        prior?.implementationNote ??
-        `External feedback from ${submitterEmail ?? "unknown submitter"} — approve during Foundry loop to implement.`,
     };
   }
 

@@ -1695,6 +1695,16 @@ async function sampleImplementNowFeedback(repoPath: string, maxItems = 8): Promi
     .map((item) => `[FEEDBACK] ${item.summary}`);
 }
 
+function isAppFeedbackPendingReview(item: FeedbackLedgerItem): boolean {
+  return (
+    item.status === "open" &&
+    item.source === "supabase" &&
+    item.type !== "praise" &&
+    item.implementationApproval === "pending" &&
+    !item.shouldImplement
+  );
+}
+
 async function promptPendingFeedbackApprovals(
   repoPath: string,
   opts: { noWait: boolean; ownerEmails: Set<string> },
@@ -1703,23 +1713,20 @@ async function promptPendingFeedbackApprovals(
   let changed = false;
 
   for (const item of ledger.items) {
-    if (
-      item.status === "open" &&
-      item.source === "supabase" &&
-      item.implementationApproval === "postponed"
-    ) {
+    if (item.status !== "open" || item.source !== "supabase" || item.type === "praise") continue;
+    if (item.implementationApproval === "postponed") {
       item.implementationApproval = "pending";
+      item.shouldImplement = false;
+      changed = true;
+    } else if (item.implementationApproval === "auto") {
+      // Legacy owner auto-approve — require explicit loop review before builder work.
+      item.implementationApproval = "pending";
+      item.shouldImplement = false;
       changed = true;
     }
   }
 
-  const pending = ledger.items.filter(
-    (item) =>
-      item.status === "open" &&
-      item.source === "supabase" &&
-      item.implementationApproval === "pending" &&
-      !item.shouldImplement,
-  );
+  const pending = ledger.items.filter(isAppFeedbackPendingReview);
 
   if (pending.length === 0) {
     if (changed) {
@@ -1733,12 +1740,13 @@ async function promptPendingFeedbackApprovals(
   if (!interactive) {
     console.log(
       chalk.yellow(
-        `  ${pending.length} external feedback item(s) need approval — non-interactive mode; postponing until a TTY loop run.`,
+        `  ${pending.length} in-app feedback item(s) need review — non-interactive mode; deferring until a TTY loop run.`,
       ),
     );
     for (const item of pending) {
       if (item.implementationApproval !== "postponed") {
         item.implementationApproval = "postponed";
+        item.shouldImplement = false;
         changed = true;
       }
     }
@@ -1749,19 +1757,30 @@ async function promptPendingFeedbackApprovals(
     return countImplementNowFeedback(repoPath);
   }
 
-  console.log(chalk.bold(`\nFeedback approval (${pending.length} item(s) from other accounts)`));
-  console.log(chalk.gray("Actions: [a] approve  [n] decline  [p] postpone  [q] quit review\n"));
+  console.log(chalk.bold(`\nIn-app feedback review (${pending.length} item(s) from the app)`));
+  console.log(
+    chalk.gray(
+      "Review each item before the builder runs. Actions: [a] approve  [n] deny  [d] defer  [q] quit review\n",
+    ),
+  );
 
+  let approvedCount = 0;
+  let deniedCount = 0;
+  let deferredCount = 0;
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     for (let index = 0; index < pending.length; index++) {
       const current = pending[index]!;
-      console.log(chalk.bold(`${index + 1}/${pending.length} ${current.id}`));
-      console.log(`  from: ${current.submitterEmail ?? "unknown"}`);
+      const fresh = current.presentInLatestCollection ? chalk.cyan(" · new this run") : "";
+      console.log(chalk.bold(`${index + 1}/${pending.length} ${current.id}${fresh}`));
+      console.log(`  from: ${current.submitterEmail ?? "unknown app user"}`);
       console.log(`  ${current.type}/${current.priority}: ${truncateForDisplay(current.summary, 220)}`);
-      const answer = (await rl.question(chalk.cyan("  Action [a/n/p/q]: "))).trim().toLowerCase();
+      if (current.implementationNote) {
+        console.log(chalk.gray(`  note: ${truncateForDisplay(current.implementationNote, 160)}`));
+      }
+      const answer = (await rl.question(chalk.cyan("  Action [a/n/d/q]: "))).trim().toLowerCase();
       if (answer === "q") {
-        console.log(chalk.yellow("\nStopped feedback approval early.\n"));
+        console.log(chalk.yellow("\nStopped in-app feedback review early.\n"));
         break;
       }
 
@@ -1777,7 +1796,8 @@ async function promptPendingFeedbackApprovals(
           implementationApproval: "approved",
           lastSeenAt: now,
         };
-        console.log(chalk.green("  Approved for implementation.\n"));
+        approvedCount++;
+        console.log(chalk.green("  Approved — queued for implementation this cycle.\n"));
       } else if (answer === "n") {
         ledger.items[idx] = {
           ...ledger.items[idx]!,
@@ -1785,7 +1805,8 @@ async function promptPendingFeedbackApprovals(
           implementationApproval: "declined",
           lastSeenAt: now,
         };
-        console.log(chalk.gray("  Declined.\n"));
+        deniedCount++;
+        console.log(chalk.gray("  Denied — will not drive the builder.\n"));
       } else {
         ledger.items[idx] = {
           ...ledger.items[idx]!,
@@ -1793,7 +1814,8 @@ async function promptPendingFeedbackApprovals(
           implementationApproval: "postponed",
           lastSeenAt: now,
         };
-        console.log(chalk.gray("  Postponed until next loop.\n"));
+        deferredCount++;
+        console.log(chalk.gray("  Deferred — will re-prompt next loop.\n"));
       }
       changed = true;
     }
@@ -1804,6 +1826,13 @@ async function promptPendingFeedbackApprovals(
   if (changed) {
     ledger.updatedAt = new Date().toISOString();
     await writeFeedbackLedger(repoPath, ledger);
+  }
+  if (approvedCount + deniedCount + deferredCount > 0) {
+    console.log(
+      chalk.gray(
+        `  In-app feedback review: ${approvedCount} approved · ${deniedCount} denied · ${deferredCount} deferred`,
+      ),
+    );
   }
   return countImplementNowFeedback(repoPath);
 }
@@ -3752,7 +3781,7 @@ program
       if (implementNowFeedbackCount > 0) {
         console.log(
           chalk.cyan(
-            `  Feedback queue: ${implementNowFeedbackCount} open item(s) approved for implementation (CLI + owner auto-approved).`,
+            `  Feedback queue: ${implementNowFeedbackCount} open item(s) queued for implementation (approved in-app + CLI/manual).`,
           ),
         );
       }
