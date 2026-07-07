@@ -921,24 +921,32 @@ export async function summarizeCursorBuilderReportMd(repoPath: string): Promise<
     const fixed = countTopLevelNumberedLines(extractMarkdownSectionLines(raw, "## QA Blockers Fixed"));
     const remain = countTopLevelNumberedLines(extractMarkdownSectionLines(raw, "## Remaining Blockers"));
 
-    let feedbackTotal = feedbackResolved;
+    let feedbackResolvedCount = feedbackResolved;
+    let feedbackOpenCount = 0;
     try {
       const ledgerRaw = await readFile(join(repoPath, ".foundry", "feedback-ledger.json"), "utf8");
-      const ledger = JSON.parse(ledgerRaw) as { items?: Array<{ status?: string; shouldImplement?: boolean }> };
-      feedbackTotal = (ledger.items ?? []).filter((item) => item.status === "open" && item.shouldImplement === true).length;
+      const ledger = JSON.parse(ledgerRaw) as {
+        items?: Array<{ status?: string; shouldImplement?: boolean; source?: string; summary?: string }>;
+      };
+      const items = ledger.items ?? [];
+      const isMeta = (item: { source?: string; summary?: string }) => {
+        const s = (item.summary ?? "").toLowerCase();
+        return (
+          (item.source ?? "").startsWith("foundry:") ||
+          /\bautomation_log\b/.test(s) ||
+          /\bbuilder\.log\b/.test(s)
+        );
+      };
+      const actionable = items.filter(
+        (item) => item.shouldImplement === true && item.status !== "ignored" && !isMeta(item),
+      );
+      feedbackResolvedCount = actionable.filter((item) => item.status === "resolved").length;
+      feedbackOpenCount = actionable.filter((item) => item.status === "open").length;
     } catch {
-      const feedbackArtifact = await readLatestArtifact(repoPath, "feedback_agent/output.json");
-      if (feedbackArtifact) {
-        try {
-          const parsed = JSON.parse(feedbackArtifact) as { ledgerSummary?: { implementNowItems?: number } };
-          feedbackTotal = parsed.ledgerSummary?.implementNowItems ?? feedbackResolved;
-        } catch {
-          /* ignore parse errors */
-        }
-      }
+      feedbackOpenCount = feedbackResolved;
     }
 
-    return `brief ${brief.complete}/${brief.total} complete · feedback ${feedbackResolved}/${feedbackTotal} addressed · qa ${fixed} fixes noted · ${remain} remaining blockers`;
+    return `brief ${brief.complete}/${brief.total} complete · feedback ${feedbackResolvedCount} resolved · ${feedbackOpenCount} open · qa ${fixed} fixes noted · ${remain} remaining blockers`;
   } catch {
     return "(no CURSOR_BUILDER_REPORT.md)";
   }

@@ -79,6 +79,13 @@ import {
   type TestFlightSubmitResult,
 } from "./releaseAutomation.js";
 import {
+  buildCompletionRows,
+  captureCycleWorkScope,
+  logCompletionTable,
+  summarizeFeedbackLedgerCounts,
+  type CycleWorkScope,
+} from "./cycleCompletionReport.js";
+import {
   actionableWorkPacketOpenCount,
   createWorkPacket,
   filterBriefItemsForStabilizePhase,
@@ -3691,6 +3698,7 @@ program
       let cycleHadShipState = false;
       // Tracks whether an investor_panel actually ran (not skipped) this cycle.
       let cycleProducedInvestorPanel = false;
+      let cycleWorkScope: CycleWorkScope | undefined;
       let outerPipelineQa: PipelineIndependentQa | undefined;
       let cycleInnerPasses = 0;
       let cycleCursorProductFileCount = 0;
@@ -3843,6 +3851,16 @@ program
         stabilize,
       });
       workPacket = await syncDeferredPlumbingPacketClosure(repoPath, workPacket);
+      const cycleInvestorDirectives =
+        investorOutput?.combinedRefinementDirectives ??
+        (await sampleInvestorDirectiveTargets(repoPath, investorOutput, 12)).map((line) =>
+          line.replace(/^\[INVESTOR\]\s*/, ""),
+        );
+      cycleWorkScope = captureCycleWorkScope(
+        (await readFeedbackLedger(repoPath)).items,
+        workPacket,
+        cycleInvestorDirectives,
+      );
       let previousProgress: IterationProgress | undefined;
       let stagnantStreak = 0;
 
@@ -4533,6 +4551,19 @@ program
               `  Pass outcome: model=${builderChoice.model} · feedback_resolved=${feedbackResolvedThisPass} (remaining=${implementNowFeedbackCount}) · packet_open ${prePacketOpen}→${activePacketCounts.total} · qa_blockers ${preQaBlockers}→${pipelineQa?.blockers?.length ?? 0}`,
             ),
           );
+          if (cycleWorkScope) {
+            const ledgerNow = await readFeedbackLedger(repoPath);
+            const rows = await buildCompletionRows(
+              repoPath,
+              cycleWorkScope,
+              pipelineQa,
+              ledgerNow.items,
+            );
+            logCompletionTable(rows, pipelineQa, `Completion status · inner pass ${inner}`);
+            console.log(
+              chalk.gray(`  Feedback ledger: ${summarizeFeedbackLedgerCounts(ledgerNow.items)}`),
+            );
+          }
           if (preFeedbackOpen > 0 && feedbackResolvedThisPass === 0) {
             console.log(
               chalk.yellow(
@@ -4962,6 +4993,17 @@ program
         if (promotion.logPath) console.log(chalk.gray(`  Promotion log: ${promotion.logPath}`));
       } else if (alwaysPromoteToMain && builderOutput?.branchName?.startsWith("foundry/")) {
         console.log(chalk.gray(`  Skipping auto-promote: ${promoteDecision.reason}.`));
+      }
+
+      if (cycleWorkScope && cycleInnerPasses > 0) {
+        const ledgerFinal = await readFeedbackLedger(repoPath);
+        const finalRows = await buildCompletionRows(
+          repoPath,
+          cycleWorkScope,
+          pipelineQa,
+          ledgerFinal.items,
+        );
+        logCompletionTable(finalRows, pipelineQa, "Cycle completion summary");
       }
 
       logCycleQaSummary({
