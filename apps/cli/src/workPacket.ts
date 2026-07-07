@@ -120,9 +120,25 @@ export function isStructuralNonCodeBriefItem(text: string): boolean {
   return false;
 }
 
+/** Large out-of-slice data plumbing (receipt/OCR/commerce ingest) — defer, do not drive inner loops. */
+export function isDeferredPlumbingWorkPacketItem(text: string): boolean {
+  const t = text.toLowerCase();
+  return (
+    /\b(instacart|receipt\s*\/\s*instacart)\b/.test(t) ||
+    (/\breceipt\b/.test(t) && /\b(ingest|ocr|parse|parsing)\b/.test(t)) ||
+    /\bout-of-slice plumbing\b/.test(t) ||
+    /\bdata.?ingestion feature\b/.test(t) ||
+    /\bedge functions?\b/.test(t) && /\bingest\b/.test(t)
+  );
+}
+
 /** Open packet rows Cursor cannot productively close — manual lab work or builder-log echoes. */
 export function isNonActionableWorkPacketItem(text: string): boolean {
-  return isStructuralNonCodeBriefItem(text) || isNoOpPacketText(text);
+  return (
+    isStructuralNonCodeBriefItem(text) ||
+    isNoOpPacketText(text) ||
+    isDeferredPlumbingWorkPacketItem(text)
+  );
 }
 
 export function actionableWorkPacketOpenCount(packet: WorkPacket | undefined): number {
@@ -407,6 +423,10 @@ export async function createWorkPacket(input: WorkPacketSourceInput): Promise<Wo
   }
   for (const blocker of input.builderCodeBlockers) {
     if (isNoOpPacketText(blocker)) continue;
+    if (isDeferredPlumbingWorkPacketItem(blocker)) {
+      extraManual.add(`[builder:deferred] ${blocker}`);
+      continue;
+    }
     if (isEnvironmentalBuilderGap(blocker)) {
       extraManual.add(`[builder:env] ${blocker}`);
       continue;
@@ -577,6 +597,28 @@ export async function syncBuilderDirectivePacketClosure(
   return updated;
 }
 
+/** Close stale deferred-plumbing rows (e.g. Instacart/receipt ingest) left open from prior builder reports. */
+export async function syncDeferredPlumbingPacketClosure(
+  repoPath: string,
+  packet: WorkPacket,
+): Promise<WorkPacket> {
+  let changed = false;
+  const items = packet.items.map((item) => {
+    if (item.status !== "open" || !isDeferredPlumbingWorkPacketItem(item.text)) return item;
+    changed = true;
+    return { ...item, status: "closed" as const };
+  });
+  if (!changed) return packet;
+
+  const updated: WorkPacket = {
+    ...packet,
+    updatedAt: new Date().toISOString(),
+    items,
+  };
+  await writePacketFiles(repoPath, updated);
+  return updated;
+}
+
 export function workPacketOpenCount(packet: WorkPacket | undefined): number {
   if (!packet) return 0;
   return packet.items.filter((item) => item.status === "open").length;
@@ -603,7 +645,7 @@ export function workPacketSummaryLine(packet: WorkPacket | undefined): string {
 export function sampleOpenPacketItems(packet: WorkPacket | undefined, maxTotal: number, maxLineLen = 120): string[] {
   if (!packet) return [];
   return packet.items
-    .filter((item) => item.status === "open")
+    .filter((item) => item.status === "open" && !isNonActionableWorkPacketItem(item.text))
     .slice(0, maxTotal)
     .map((item) => `[${sectionLabel(item.section)}] ${truncate(item.text, maxLineLen)}`);
 }

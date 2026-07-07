@@ -82,6 +82,7 @@ import {
   actionableWorkPacketOpenCount,
   createWorkPacket,
   filterBriefItemsForStabilizePhase,
+  isDeferredPlumbingWorkPacketItem,
   isNonActionableWorkPacketItem,
   readCheckedBriefItems,
   readOpenBriefItems,
@@ -92,6 +93,7 @@ import {
   workPacketReopenCount,
   workPacketSummaryLine,
   syncBuilderDirectivePacketClosure,
+  syncDeferredPlumbingPacketClosure,
   type WorkPacket,
 } from "./workPacket.js";
 
@@ -904,7 +906,7 @@ async function buildWorkPacketForRun(params: {
   ]);
   const builderSeparated = separateManualAndCodeItems([
     ...extractBuilderBlockers(params.builder),
-    ...params.builderRemainingBlockers,
+    ...params.builderRemainingBlockers.filter((b) => !isDeferredPlumbingWorkPacketItem(b)),
   ]);
   let projectBuilderDirectives: string[] | undefined;
   if (!primarySlice || primarySlice.tasks.length === 0) {
@@ -1686,6 +1688,26 @@ async function countImplementNowFeedback(repoPath: string): Promise<number> {
   return ledger.items.filter(
     (item) => item.status === "open" && item.shouldImplement && !isEnvironmentalFeedbackItem(item),
   ).length;
+}
+
+async function sampleInvestorDirectiveTargets(
+  repoPath: string,
+  investor: InvestorPanelBrief | undefined,
+  maxItems = 6,
+): Promise<string[]> {
+  let directives = investor?.combinedRefinementDirectives ?? [];
+  if (directives.length === 0) {
+    try {
+      const raw = await readFile(join(repoPath, ".foundry", "INVESTOR_PANEL_STATE.json"), "utf8");
+      const state = JSON.parse(raw) as { lastDirectives?: string[] };
+      directives = state.lastDirectives ?? [];
+    } catch {
+      /* no persisted investor state */
+    }
+  }
+  return directives
+    .slice(0, maxItems)
+    .map((d) => `[INVESTOR] ${truncateForDisplay(d, 200)}`);
 }
 
 async function sampleImplementNowFeedback(repoPath: string, maxItems = 8): Promise<string[]> {
@@ -3820,6 +3842,7 @@ program
         builderRemainingBlockers,
         stabilize,
       });
+      workPacket = await syncDeferredPlumbingPacketClosure(repoPath, workPacket);
       let previousProgress: IterationProgress | undefined;
       let stagnantStreak = 0;
 
@@ -4050,6 +4073,7 @@ program
               codeChanged: false,
             });
             workPacket = await syncBuilderDirectivePacketClosure(repoPath, workPacket);
+            workPacket = await syncDeferredPlumbingPacketClosure(repoPath, workPacket);
             activePacketCounts = packetBriefCounts(workPacket);
           }
           // Guard: don't invoke Cursor when there is literally nothing to do.
@@ -4090,9 +4114,13 @@ program
           const preQaBlockers = pipelineQa?.blockers?.length ?? 0;
           const preFeedbackOpen = implementNowFeedbackCount;
           const briefSamples = sampleOpenPacketItems(workPacket, 14);
+          const investorSamples =
+            loopProfile === "investor" && !stabilize
+              ? await sampleInvestorDirectiveTargets(repoPath, investorOutput, 6)
+              : [];
           const feedbackSamples =
             !stabilize && implementNowFeedbackCount > 0 ? await sampleImplementNowFeedback(repoPath, 8) : [];
-          const targetLines = [...briefSamples, ...feedbackSamples];
+          const targetLines = [...briefSamples, ...investorSamples, ...feedbackSamples];
           logInnerLoopTargets(
             inner,
             effectiveMaxInner,
@@ -4498,6 +4526,7 @@ program
             codeChanged: builderRun.hadCodeChanges,
           });
           workPacket = await syncBuilderDirectivePacketClosure(repoPath, workPacket);
+          workPacket = await syncDeferredPlumbingPacketClosure(repoPath, workPacket);
           activePacketCounts = packetBriefCounts(workPacket);
           console.log(
             chalk.gray(
