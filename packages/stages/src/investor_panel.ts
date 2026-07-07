@@ -6,26 +6,26 @@ import { promisify } from "node:util";
 import { writeStageMarkdown } from "@foundry/core/artifacts";
 import { readBuildSpecFromRepo, readBuildSpecLedger } from "@foundry/core/buildSpec";
 import { resolveFoundryCursorModel } from "@foundry/core/cursorModels";
+import {
+  buildHeuristicRemovalDirectives,
+  buildPersonaMemoryPromptSection,
+  buildSurfaceInventoryLines,
+  directiveMatchesAddressedParent,
+  filterGenericDirectives,
+  filterStaleDirectives,
+  mergeInvestorDirectives,
+  normalizeRemovalDirective,
+  parseInvestorPanelSettings,
+  reconcilePersonaMemories,
+  type InvestorPanelStateV2,
+  type PersonaId,
+} from "./investorPanelMemory.js";
 
 const execFileAsync = promisify(execFile);
 
 const INVESTOR_PANEL_STATE_REL = ".foundry/INVESTOR_PANEL_STATE.json";
 
-type InvestorPanelState = {
-  lastPitchAt: string;
-  lastHeadSha: string;
-  lastCompletedTaskIds: string[];
-  lastGrades: Record<string, string>;
-  /**
-   * Refinement directives from the previous pitch. The runner-side gate refuses
-   * to re-pitch until each directive's matching parent in BUILD_SPEC_LEDGER is
-   * recorded as ADDRESSED — investors should never see the same critique twice
-   * without engineering work behind it.
-   */
-  lastDirectives?: string[];
-  /** Mean rank from the last pitch (for the trend section). */
-  lastAverageRank?: number;
-};
+type InvestorPanelState = InvestorPanelStateV2;
 
 async function readInvestorPanelState(repoPath: string): Promise<InvestorPanelState | undefined> {
   try {
@@ -162,9 +162,11 @@ export async function recordInvestorPanelPitched(
   grades: Record<string, string>,
   directives: ReadonlyArray<string>,
   averageRank: number,
+  personas?: InvestorPanelState["personas"],
 ): Promise<void> {
   const head = await gitHeadSha(repoPath);
   const ledger = await readBuildSpecLedger(repoPath);
+  const prior = await readInvestorPanelState(repoPath);
   await writeInvestorPanelState(repoPath, {
     lastPitchAt: new Date().toISOString(),
     lastHeadSha: head,
@@ -172,6 +174,7 @@ export async function recordInvestorPanelPitched(
     lastGrades: grades,
     lastDirectives: [...directives],
     lastAverageRank: averageRank,
+    personas: personas ?? prior?.personas,
   });
 }
 
@@ -180,25 +183,11 @@ export async function recordInvestorPanelPitched(
  * the ledger's addressed parent directives. Uses normalized prefix + a couple
  * of distinctive content words to avoid the LLM rewording a directive past us.
  */
-function directiveMatchesAddressedParent(
+function directiveMatchesAddressedParentLocal(
   directive: string,
   addressedTexts: ReadonlyArray<string>,
 ): boolean {
-  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
-  const a = norm(directive);
-  if (a.length === 0) return false;
-  const aPrefix = a.slice(0, 40);
-  const aWords = new Set(a.split(" ").filter((w) => w.length > 4));
-  for (const p of addressedTexts) {
-    const b = norm(p);
-    if (b.length === 0) continue;
-    if (b.includes(aPrefix) || a.includes(b.slice(0, 40))) return true;
-    const bWords = new Set(b.split(" ").filter((w) => w.length > 4));
-    let overlap = 0;
-    for (const w of aWords) if (bWords.has(w)) overlap++;
-    if (overlap >= 3 && overlap / Math.max(1, aWords.size) >= 0.4) return true;
-  }
-  return false;
+  return directiveMatchesAddressedParent(directive, addressedTexts);
 }
 
 /**
@@ -213,7 +202,7 @@ export async function unaddressedDirectivesSinceLastPitch(repoPath: string): Pro
   if (!state || !state.lastDirectives || state.lastDirectives.length === 0) return [];
   const ledger = await readBuildSpecLedger(repoPath);
   const addressedTexts = Object.values(ledger.addressedParents ?? {}).map((p) => p.text);
-  return state.lastDirectives.filter((d) => !directiveMatchesAddressedParent(d, addressedTexts));
+  return state.lastDirectives.filter((d) => !directiveMatchesAddressedParentLocal(d, addressedTexts));
 }
 import {
   INVESTOR_GRADE_ORDER,
@@ -257,6 +246,8 @@ const PersonaSchema = z.object({
   displayName: z.string(),
   grade: GradeZod,
   response: z.string(),
+  /** Persona-specific refinement directives (file-anchored). */
+  directives: z.array(z.string()).optional(),
 });
 
 export const InvestorPanelOutputSchema = z.object({
@@ -644,29 +635,194 @@ function llmContext(input: StageInputComposition, pitchBrief: string): string {
   return JSON.stringify(payload, null, 2);
 }
 
-function llmPrompt(input: StageInputComposition, pitchBrief: string): string {
+async function gatherSurfaceInventory(
+  input: StageInputComposition,
+  repoPath: string,
+): Promise<{ topFiles: string[]; wontShip: string[]; parkedFeatures: string[]; mustShipCount: number }> {
+  const state = await readInvestorPanelState(repoPath);
+  const sinceSha = state?.lastHeadSha ?? "";
+  const diff = await gitDiffStatSinceSha(repoPath, sinceSha);
+  const cc = ConvergenceContractOutputSchema.safeParse(input.convergenceContract);
+  const pd = ProductDefinitionOutputSchema.safeParse(input.productDefinition);
+  const wontShip = cc.success
+    ? cc.data.mvpBoundary.mustNotShipYet
+    : pd.success
+      ? pd.data.scope.wontShip
+      : [];
+  const parkedFeatures = cc.success ? cc.data.mvpBoundary.mustNotShipYet : [];
+  const mustShipCount = cc.success ? cc.data.mvpBoundary.mustShip.length : pd.success ? pd.data.scope.mustShip.length : 0;
+  return { topFiles: diff.topFiles, wontShip, parkedFeatures, mustShipCount };
+}
+
+function elonDeletionPrompt(input: StageInputComposition, pitchBrief: string, surfaceLines: string[]): string {
+  return [
+    "You are Elon Musk doing Step 0 of his process: DELETE before you optimize or add.",
+    "Review the product surfaces below. Do NOT suggest additions, polish, or new features.",
+    "",
+    "Return 2-5 removal directives only. Each MUST:",
+    "- Start with `[remove]`",
+    "- Name a specific screen/component file (`.tsx` / `.ts`) or testID to delete",
+    "- Include how to verify absence (test or Maestro assertion)",
+    "",
+    "Output STRICT JSON only: {\"removalDirectives\":[\"[remove] …\"]}",
+    "",
+    "Product context:",
+    pitchBrief,
+    "",
+    "Surface inventory:",
+    ...surfaceLines,
+    "",
+    "Full project JSON (product-facing only):",
+    llmContext(input, pitchBrief),
+  ].join("\n");
+}
+
+const ElonDeletionLlmSchema = z.object({
+  removalDirectives: z.array(z.string()).default([]),
+});
+
+async function runLlmJsonSubcall(
+  ctx: RunContext,
+  input: StageInputComposition,
+  prompt: string,
+  logLabel: string,
+): Promise<string | undefined> {
+  const command =
+    input.config.project.cursor_automation?.command ?? process.env.FOUNDRY_CURSOR_AGENT_CMD ?? "agent";
+  const model = resolveFoundryCursorModel(
+    input.config.project.cursor_automation?.investor_panel_model ??
+      input.config.project.cursor_automation?.qa_model,
+    "investorPanelModel",
+  );
+  const modelName = model.trim().toLowerCase();
+  const modelArgs =
+    modelName === "auto" || modelName === "default"
+      ? ["--model", shellQuote("auto")]
+      : ["--model", shellQuote(model)];
+  const shellCommand = [
+    command,
+    "-p",
+    "--output-format",
+    "text",
+    "--force",
+    "--trust",
+    "--approve-mcps",
+    "--workspace",
+    shellQuote(ctx.repoPath),
+    ...modelArgs,
+    shellQuote(prompt),
+  ].join(" ");
+
+  const result = await execShell(shellCommand, ctx.repoPath, 5 * 60_000);
+  if (result.exitCode !== 0) {
+    ctx.logger(`[investor_panel] ${logLabel} unavailable`, {
+      stderr: result.stderr.slice(0, 300),
+    });
+    return undefined;
+  }
+  return extractJsonObject(`${result.stdout}\n${result.stderr}`);
+}
+
+async function tryRunElonDeletionPass(
+  ctx: RunContext,
+  input: StageInputComposition,
+  pitchBrief: string,
+  settings: ReturnType<typeof parseInvestorPanelSettings>,
+): Promise<string[]> {
+  if (!settings.elonDeletionPass) return [];
+
+  const inventory = await gatherSurfaceInventory(input, ctx.repoPath);
+  const surfaceLines = buildSurfaceInventoryLines(inventory);
+  const prompt = elonDeletionPrompt(input, pitchBrief, surfaceLines);
+  const raw = await runLlmJsonSubcall(ctx, input, prompt, "elon_deletion_pass");
+
+  if (raw) {
+    try {
+      const parsed = ElonDeletionLlmSchema.parse(JSON.parse(raw) as unknown);
+      const normalized = parsed.removalDirectives.map(normalizeRemovalDirective).filter((d) => d.length > 0);
+      if (normalized.length > 0) {
+        ctx.logger("[investor_panel] elon deletion pass", { count: normalized.length });
+        return normalized.slice(0, 6);
+      }
+    } catch (err) {
+      ctx.logger("[investor_panel] elon deletion pass parse failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  const heuristic = buildHeuristicRemovalDirectives({
+    wontShip: inventory.wontShip,
+    parkedFeatures: inventory.parkedFeatures,
+    topFiles: inventory.topFiles,
+    minCount: settings.minDeletionDirectives,
+  });
+  if (heuristic.length > 0) {
+    ctx.logger("[investor_panel] elon deletion pass heuristic fallback", { count: heuristic.length });
+  }
+  return heuristic;
+}
+
+async function buildPersonaMemorySectionForPrompt(
+  input: StageInputComposition,
+  repoPath: string,
+  settings: ReturnType<typeof parseInvestorPanelSettings>,
+): Promise<string> {
+  const state = await readInvestorPanelState(repoPath);
+  const ledger = await readBuildSpecLedger(repoPath);
+  const addressedTexts = Object.values(ledger.addressedParents ?? {}).map((p) => p.text);
+  const qaEv = QaEvidenceSchema.safeParse(input.independentQa);
+  return buildPersonaMemoryPromptSection({
+    state,
+    addressedTexts,
+    qaRecommendation: qaEv.success ? qaEv.data.recommendation : undefined,
+    qaBlockers: qaEv.success ? qaEv.data.blockers?.length ?? 0 : undefined,
+    settings,
+  });
+}
+
+function llmPrompt(
+  input: StageInputComposition,
+  pitchBrief: string,
+  personaMemorySection: string,
+  removalDirectives: string[],
+): string {
+  const removalBlock =
+    removalDirectives.length > 0
+      ? [
+          "",
+          "**ELON DELETION PASS (Step 0 — already run; honor these removals in grading):**",
+          ...removalDirectives.map((d) => `- ${d}`),
+          "",
+        ].join("\n")
+      : "";
+
   return [
     "You are GPT-5.4 acting as an investor-panel simulator for internal product planning.",
     "Evaluate this app and monetization plan using three distinct archetype voices:",
-    "- Elon Musk",
-    "- Steve Jobs",
-    "- Andreessen Horowitz",
+    "- Elon Musk — delete before add; first-principles; falsifiable metrics",
+    "- Steve Jobs — one hero flow; first-session delight; invisible product",
+    "- Andreessen Horowitz — monetization, distribution, retention proof",
     "",
     "Requirements:",
     "- Keep the pitch brief to 4-7 lines.",
     "- For each investor, return one grade from: F, D, C, C-, C+, B-, B, B+, A-, A, A+",
     "- Each investor response must be brief (max ~90 words).",
+    "- Each investor MUST return their own `directives` array (0-3 items) — persona-specific, file-anchored product changes. Do not copy the same directive across personas.",
     "- GRADE THE PRODUCT A USER EXPERIENCES: the scan→verdict flow, first-session clarity/delight, differentiation, and the monetization model. Use `qaSummary` (recommendation/score) and `convergenceContract` (thesis, singular loop, isConverged, openObjections) as evidence. Do NOT credit capability that is only declared in scope.",
-    "- READ the **SHIPPED SINCE LAST PITCH** section. If shipped product work addresses a prior directive, ACKNOWLEDGE it and move your grade up. If nothing relevant shipped, hold or lower the grade and explain why.",
+    "- READ the **SHIPPED SINCE LAST PITCH** and **PERSONA MEMORY** sections. If shipped work addresses a prior directive, ACKNOWLEDGE it and move your grade up. When all prior asks are delivered and QA is ship, grade A/A+ and say the product is exceptional.",
     "- CRITICAL — NEVER comment on or grade Foundry's internal tooling: build specs, ledgers, work packets, task IDs (e.g. 't1', 'dir-29'), 'builder partial / zero-delta', tracker reconciliation, primary slices, or the loop itself. These are NOT the product. Ignore any objection phrased in those terms entirely — do not echo it as a directive and do not let it affect the grade.",
     "- CRITICAL — do NOT lower the PRODUCT grade for go-to-market EVIDENCE that requires real devices or real users (on-device latency / p95, Yuka benchmark numbers, D1/D7 retention, cohort / acceptance numbers, production migration verification). Grade the product as built. Put any such ask in `deferredHumanDirectives` (a human runs them), never in `combinedRefinementDirectives`.",
     "- Treat only PRODUCT/UX/positioning items in `convergenceContract.openObjections` (status open/regressed) as grade-affecting; objections tagged category 'evidence' or 'ops' are non-code and must not lower the product grade.",
-    "- Reward narrowing and parking discipline (one singular loop, parked features). Penalise cluttered, multi-bet pitches.",
-    "- When grades are below the A-band, put concrete PRODUCT refinement directives in `combinedRefinementDirectives`. Each MUST be specific and code-actionable: name the screen / component / file and the exact change (e.g. \"In `ProductResultScreen.tsx`, replace the secondary card stack with …\"). No vague prose ('tighten', 'delight', 'polish'), no tooling, no evidence asks. If you have no product-shaped change to request, return an empty array.",
+    "- Reward narrowing, deletion, and parking discipline (one singular loop, parked features removed from UI). Penalise cluttered, multi-bet pitches.",
+    "- When grades are below A-band, put concrete PRODUCT refinement directives in each persona's `directives` and the combined list. Each MUST name the screen / component / file and the exact change. No vague prose ('tighten', 'delight', 'polish'). Prefer `[remove]` directives when clutter is the problem.",
+    "- When grades are A or A+, responses must praise specific shipped work; `directives` and `combinedRefinementDirectives` should be empty unless there is a concrete regression.",
     "- Output STRICT JSON only. No markdown fences, no prose before/after.",
     "",
     "JSON schema:",
-    '{"pitchBrief":"string","investors":[{"id":"elon_musk|steve_jobs|andreessen_horowitz","displayName":"string","grade":"F|D|C|C-|C+|B-|B|B+|A-|A|A+","response":"string"}],"combinedRefinementDirectives":["specific code-actionable product change naming a screen/file"],"deferredHumanDirectives":["evidence/ops ask a human must run"]}',
+    '{"pitchBrief":"string","investors":[{"id":"elon_musk|steve_jobs|andreessen_horowitz","displayName":"string","grade":"F|D|C|C-|C+|B-|B|B+|A-|A|A+","response":"string","directives":["file-anchored change"]}],"combinedRefinementDirectives":["union of persona directives + removals"],"deferredHumanDirectives":["evidence/ops ask a human must run"]}',
+    personaMemorySection,
+    removalBlock,
     "",
     "Project context:",
     llmContext(input, pitchBrief),
@@ -678,7 +834,20 @@ async function tryRunLlmInvestorPanel(
   input: StageInputComposition,
   pitchBrief: string,
   refinementRound: number,
-): Promise<InvestorPanelOutput | undefined> {
+  removalDirectives: string[],
+  personaMemorySection: string,
+): Promise<
+  | {
+      pitchBrief: string;
+      investors: z.infer<typeof PersonaSchema>[];
+      worstGrade: InvestorGrade;
+      worstRank: number;
+      combinedRefinementDirectives: string[];
+      deferredHumanDirectives: string[];
+      refinementRound: number;
+    }
+  | undefined
+> {
   const command =
     input.config.project.cursor_automation?.command ?? process.env.FOUNDRY_CURSOR_AGENT_CMD ?? "agent";
   const model = resolveFoundryCursorModel(
@@ -686,7 +855,7 @@ async function tryRunLlmInvestorPanel(
       input.config.project.cursor_automation?.qa_model,
     "investorPanelModel",
   );
-  const prompt = llmPrompt(input, pitchBrief);
+  const prompt = llmPrompt(input, pitchBrief, personaMemorySection, removalDirectives);
   const modelName = model.trim().toLowerCase();
   const modelArgs =
     modelName === "auto" || modelName === "default"
@@ -726,18 +895,20 @@ async function tryRunLlmInvestorPanel(
     const parsed = InvestorPanelLlmDraftSchema.parse(JSON.parse(raw) as unknown);
     const ranks = parsed.investors.map((p) => investorGradeRank(p.grade));
     const worstRank = Math.min(...ranks);
-    return finalizeInvestorPanelOutput(
-      {
-        pitchBrief: parsed.pitchBrief?.trim() || pitchBrief,
-        investors: parsed.investors,
-        worstGrade: INVESTOR_GRADE_ORDER[worstRank] ?? "F",
-        worstRank,
-        combinedRefinementDirectives: [...new Set(parsed.combinedRefinementDirectives ?? [])].slice(0, 8),
-        deferredHumanDirectives: [...new Set(parsed.deferredHumanDirectives ?? [])].slice(0, 8),
-        refinementRound,
-      },
-      input,
+    const mergedDirectives = mergeInvestorDirectives(
+      removalDirectives,
+      parsed.investors.map((i) => ({ id: i.id, directives: i.directives })),
+      parsed.combinedRefinementDirectives ?? [],
     );
+    return {
+      pitchBrief: parsed.pitchBrief?.trim() || pitchBrief,
+      investors: parsed.investors,
+      worstGrade: INVESTOR_GRADE_ORDER[worstRank] ?? "F",
+      worstRank,
+      combinedRefinementDirectives: mergedDirectives,
+      deferredHumanDirectives: [...new Set(parsed.deferredHumanDirectives ?? [])].slice(0, 8),
+      refinementRound,
+    };
   } catch (err) {
     ctx.logger("[investor_panel] llm parse failed; invalid JSON shape", {
       error: err instanceof Error ? err.message : String(err),
@@ -754,7 +925,9 @@ function responseFor(
   const tighten =
     investorGradeRank(grade) < INVESTOR_ALL_A_MINUS_RANK
       ? " To reach an A-band memo, tighten scope to one heroic claim, add a single crisp success metric with a date, and show how software margins improve as usage grows."
-      : " This is fundable at the memo level; ship a narrow wedge and instrument the one metric that proves the loop.";
+      : investorGradeRank(grade) >= investorGradeRank("A")
+        ? " This is exceptional — ship it."
+        : " This is fundable at the memo level; ship a narrow wedge and instrument the one metric that proves the loop.";
 
   if (id === "elon_musk") {
     return (
@@ -862,11 +1035,19 @@ export function isLoopActionableInvestorDirective(text: string): boolean {
 function buildDirectives(
   investors: z.infer<typeof PersonaSchema>[],
   s: Signals,
+  removalDirectives: string[] = [],
 ): string[] {
-  const d: string[] = [];
+  const d: string[] = [...removalDirectives.map(normalizeRemovalDirective)];
   for (const inv of investors) {
     if (investorGradeRank(inv.grade) >= INVESTOR_ALL_A_MINUS_RANK) continue;
     if (inv.id === "elon_musk") {
+      if (d.length === 0) {
+        d.push(
+          normalizeRemovalDirective(
+            "Remove one secondary card stack or duplicate CTA from the primary scan screen; test asserts only one hero action remains.",
+          ),
+        );
+      }
       d.push("Add one 10× bolder milestone and a dated, falsifiable success metric tied to the flywheel.");
       if (s.metricsAlignment < 65) d.push("Align `metrics.yaml` targets explicitly to the primary loop metric.");
     } else if (inv.id === "steve_jobs") {
@@ -877,7 +1058,7 @@ function buildDirectives(
       if (s.monetization < 68) d.push("Justify recurring value vs one-time utility; tighten gates to post-value moments.");
     }
   }
-  return [...new Set(d)].slice(0, 8);
+  return [...new Set(d)].slice(0, 10);
 }
 
 /**
@@ -942,8 +1123,10 @@ function finalizeInvestorPanelOutput(
     combinedRefinementDirectives: string[];
     deferredHumanDirectives?: string[];
     refinementRound: number;
+    removalDirectives?: string[];
   },
   input: StageInputComposition,
+  addressedTexts: string[] = [],
 ): InvestorPanelOutput {
   const grades = draft.investors.map((i) => i.grade);
   const t = computeInvestorTargetFields(grades, parseAutonomousInvestorConvergence(input.config.project.foundry));
@@ -956,16 +1139,29 @@ function finalizeInvestorPanelOutput(
   for (const d of draft.deferredHumanDirectives ?? []) {
     if (classifyInvestorDirective(d) !== "foundry_meta") deferred.push(d);
   }
-  for (const d of draft.combinedRefinementDirectives) {
+  const merged = mergeInvestorDirectives(
+    draft.removalDirectives ?? [],
+    draft.investors.map((i) => ({ id: i.id as PersonaId, directives: i.directives })),
+    draft.combinedRefinementDirectives,
+  );
+  const staleFiltered = filterStaleDirectives(merged, addressedTexts);
+  const genericFiltered = filterGenericDirectives(staleFiltered, addressedTexts, {
+    requireFileAnchor: grades.every((g) => investorGradeRank(g) < investorGradeRank("A")),
+  });
+
+  for (const d of genericFiltered) {
     const cat = classifyInvestorDirective(d);
     if (cat === "foundry_meta") continue;
     if (cat === "evidence" || cat === "ops") deferred.push(d);
     else product.push(d);
   }
 
+  // When all personas are A-band, clear directives so the loop converges to "exceptional".
+  const allABand = grades.every((g) => investorGradeRank(g) >= INVESTOR_ALL_A_MINUS_RANK);
+
   return InvestorPanelOutputSchema.parse({
     ...draft,
-    combinedRefinementDirectives: [...new Set(product)].slice(0, 8),
+    combinedRefinementDirectives: allABand ? [] : [...new Set(product)].slice(0, 10),
     deferredHumanDirectives: [...new Set(deferred)].slice(0, 8),
     meetsMinimumGradeA: t.meetsMinimumGradeA,
     meetsInvestorTarget: t.meetsInvestorTarget,
@@ -981,18 +1177,36 @@ export const investorPanelStage: Stage<StageInputComposition, InvestorPanelOutpu
   outputSchema: InvestorPanelOutputSchema,
   async run(ctx: RunContext, input: StageInputComposition): Promise<InvestorPanelOutput> {
     const refinementRound = input.investorRefinement?.round ?? 0;
+    const panelSettings = parseInvestorPanelSettings(input.config.project.foundry);
     ctx.logger("[investor_panel] evaluating", {
       project: input.config.project.project_name,
       refinementRound,
+      personaMemory: panelSettings.personaMemory,
+      elonDeletionPass: panelSettings.elonDeletionPass,
     });
 
     const pitchBrief = await buildPitchBrief(input, ctx.repoPath);
-    const llmOutput = await tryRunLlmInvestorPanel(ctx, input, pitchBrief, refinementRound);
+    const ledger = await readBuildSpecLedger(ctx.repoPath);
+    const addressedTexts = Object.values(ledger.addressedParents ?? {}).map((p) => p.text);
+    const personaMemorySection = await buildPersonaMemorySectionForPrompt(input, ctx.repoPath, panelSettings);
+    const removalDirectives = await tryRunElonDeletionPass(ctx, input, pitchBrief, panelSettings);
+    const llmDraft = await tryRunLlmInvestorPanel(
+      ctx,
+      input,
+      pitchBrief,
+      refinementRound,
+      removalDirectives,
+      personaMemorySection,
+    );
 
     let output: InvestorPanelOutput;
     let modeLabel = "GPT-5.4";
-    if (llmOutput) {
-      output = llmOutput;
+    if (llmDraft) {
+      output = finalizeInvestorPanelOutput(
+        { ...llmDraft, removalDirectives },
+        input,
+        addressedTexts,
+      );
     } else if (!investorHeuristicFallbackAllowed()) {
       ctx.logger("[investor_panel] LLM unavailable — failing closed (no heuristic grades)", {
         hint: "set FOUNDRY_INVESTOR_ALLOW_HEURISTIC=1 to opt into the document-only heuristic fallback",
@@ -1039,15 +1253,21 @@ export const investorPanelStage: Stage<StageInputComposition, InvestorPanelOutpu
           worstGrade: INVESTOR_GRADE_ORDER[worstRank] ?? "F",
           worstRank,
           combinedRefinementDirectives:
-            ranks.every((r) => r >= INVESTOR_ALL_A_MINUS_RANK) ? [] : buildDirectives(personas, adj),
+            ranks.every((r) => r >= INVESTOR_ALL_A_MINUS_RANK) ? [] : buildDirectives(personas, adj, removalDirectives),
           refinementRound,
+          removalDirectives,
         },
         input,
+        addressedTexts,
       );
       modeLabel = "heuristic fallback";
     }
 
     const validated = output;
+
+    if (removalDirectives.length > 0) {
+      modeLabel = `${modeLabel} + Elon deletion pass (${removalDirectives.length})`;
+    }
 
     const auto = parseAutonomousInvestorConvergence(input.config.project.foundry);
     const md = [
@@ -1059,10 +1279,13 @@ export const investorPanelStage: Stage<StageInputComposition, InvestorPanelOutpu
       "",
       `## Archetype investors (${modeLabel})`,
       "",
-      ...validated.investors.map(
-        (i) =>
-          `### ${i.displayName} — **${i.grade}**\n\n${i.response}\n`,
-      ),
+      ...validated.investors.map((i) => {
+        const dirs =
+          i.directives?.length && i.directives.length > 0
+            ? `\n\n**Directives:**\n${i.directives.map((d) => `- ${d}`).join("\n")}`
+            : "";
+        return `### ${i.displayName} — **${i.grade}**\n\n${i.response}${dirs}\n`;
+      }),
       "",
       "## Verdict",
       "",
@@ -1072,6 +1295,15 @@ export const investorPanelStage: Stage<StageInputComposition, InvestorPanelOutpu
       `- **Meets investor target (pipeline bar):** ${validated.meetsInvestorTarget ? "yes" : "no"}${
         auto.enabled ? ` — autonomous mode: mean ≥ **${auto.minAverageGrade}**` : ""
       }`,
+      removalDirectives.length
+        ? [
+            "",
+            "## Elon deletion pass (Step 0 — remove before add)",
+            "",
+            ...removalDirectives.map((d) => `- ${d}`),
+            "",
+          ].join("\n")
+        : "",
       validated.combinedRefinementDirectives.length
         ? ["", "## Refinement directives (product — drive the loop)", "", ...validated.combinedRefinementDirectives.map((d) => `- ${d}`), ""].join(
             "\n",
@@ -1098,11 +1330,31 @@ export const investorPanelStage: Stage<StageInputComposition, InvestorPanelOutpu
     for (const inv of validated.investors) {
       gradesMap[inv.displayName] = inv.grade;
     }
+
+    const priorState = await readInvestorPanelState(ctx.repoPath);
+    const pitchAt = new Date().toISOString();
+    const personaMemories = panelSettings.personaMemory
+      ? reconcilePersonaMemories(
+          priorState,
+          validated.investors.map((i) => ({
+            id: i.id,
+            grade: i.grade,
+            response: i.response,
+            directives: i.directives,
+          })),
+          validated.combinedRefinementDirectives,
+          removalDirectives,
+          addressedTexts,
+          pitchAt,
+        )
+      : priorState?.personas;
+
     await recordInvestorPanelPitched(
       ctx.repoPath,
       gradesMap,
       validated.combinedRefinementDirectives,
       validated.averageInvestorRank,
+      personaMemories,
     );
 
     return validated;

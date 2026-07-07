@@ -161,6 +161,20 @@ export const ProjectYamlSchema = z.object({
               defer_release_prompt_until_investor_target: z.boolean().optional(),
             })
             .optional(),
+          /**
+           * Investor panel persona memory and Elon's delete-first pass.
+           * Defaults: persona_memory=true, elon_deletion_pass=true, min_deletion_directives=2.
+           */
+          investor_panel: z
+            .object({
+              /** Per-persona thread memory across pitches (default true). */
+              persona_memory: z.boolean().optional(),
+              /** Run Elon's removal audit before the main panel grade (default true). */
+              elon_deletion_pass: z.boolean().optional(),
+              /** Minimum `[remove]` directives from the deletion pass when LLM/heuristic runs. */
+              min_deletion_directives: z.coerce.number().int().min(0).optional(),
+            })
+            .optional(),
         })
         .optional(),
     ),
