@@ -163,7 +163,7 @@ export const ProjectYamlSchema = z.object({
             .optional(),
           /**
            * Investor panel persona memory and Elon's delete-first pass.
-           * Defaults: persona_memory=true, elon_deletion_pass=true, min_deletion_directives=2.
+           * Defaults: persona_memory=true, elon_deletion_pass=true, min_deletion_directives=1.
            */
           investor_panel: z
             .object({

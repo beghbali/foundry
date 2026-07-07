@@ -18,7 +18,7 @@ describe("investorPanelMemory", () => {
     expect(parseInvestorPanelSettings(undefined)).toEqual({
       personaMemory: true,
       elonDeletionPass: true,
-      minDeletionDirectives: 2,
+      minDeletionDirectives: 1,
     });
   });
 
@@ -90,7 +90,7 @@ describe("investorPanelMemory", () => {
       addressedTexts: ["Collapse ScanScreen cards on ScanScreen to one priority selector"],
       qaRecommendation: "ship",
       qaBlockers: 0,
-      settings: { personaMemory: true, elonDeletionPass: true, minDeletionDirectives: 2 },
+      settings: { personaMemory: true, elonDeletionPass: true, minDeletionDirectives: 1 },
     });
     expect(section).toContain("CONVERGENCE — EXCEPTIONAL");
     expect(section).toContain("exceptional");

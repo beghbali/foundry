@@ -67,7 +67,7 @@ export function parseInvestorPanelSettings(foundry: { investor_panel?: unknown }
     block?.elon_deletion_pass === undefined ? true : yamlTruthy(block.elon_deletion_pass) || !yamlFalsy(block.elon_deletion_pass);
   const rawMin = block?.min_deletion_directives;
   const minDeletionDirectives =
-    typeof rawMin === "number" && Number.isFinite(rawMin) ? Math.max(0, Math.floor(rawMin)) : 2;
+    typeof rawMin === "number" && Number.isFinite(rawMin) ? Math.max(0, Math.floor(rawMin)) : 1;
   return { personaMemory, elonDeletionPass, minDeletionDirectives };
 }
 
