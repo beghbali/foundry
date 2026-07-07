@@ -24,6 +24,7 @@ import {
   writeBuildSpecLedger,
 } from "@foundry/core/buildSpec";
 import {
+  isAutoApprovedFeedback,
   resolveFeedbackOwnerEmails,
   type FeedbackImplementationApproval,
 } from "@foundry/core/feedbackPolicy";
@@ -1695,7 +1696,8 @@ async function sampleImplementNowFeedback(repoPath: string, maxItems = 8): Promi
     .map((item) => `[FEEDBACK] ${item.summary}`);
 }
 
-function isAppFeedbackPendingReview(item: FeedbackLedgerItem): boolean {
+function isAppFeedbackPendingReview(item: FeedbackLedgerItem, ownerEmails: Set<string>): boolean {
+  if (isAutoApprovedFeedback(item.source, item.submitterEmail, ownerEmails)) return false;
   return (
     item.status === "open" &&
     item.source === "supabase" &&
@@ -1703,6 +1705,17 @@ function isAppFeedbackPendingReview(item: FeedbackLedgerItem): boolean {
     item.implementationApproval === "pending" &&
     !item.shouldImplement
   );
+}
+
+type FeedbackReviewAction = "approve" | "deny" | "defer" | "quit";
+
+function parseFeedbackReviewAction(raw: string): FeedbackReviewAction | undefined {
+  const answer = raw.trim().toLowerCase();
+  if (answer === "q" || answer === "quit") return "quit";
+  if (answer === "y" || answer === "yes" || answer === "a" || answer === "approve") return "approve";
+  if (answer === "n" || answer === "no" || answer === "deny" || answer === "decline") return "deny";
+  if (answer === "d" || answer === "defer" || answer === "p" || answer === "postpone") return "defer";
+  return undefined;
 }
 
 async function promptPendingFeedbackApprovals(
@@ -1714,19 +1727,15 @@ async function promptPendingFeedbackApprovals(
 
   for (const item of ledger.items) {
     if (item.status !== "open" || item.source !== "supabase" || item.type === "praise") continue;
+    if (isAutoApprovedFeedback(item.source, item.submitterEmail, opts.ownerEmails)) continue;
     if (item.implementationApproval === "postponed") {
-      item.implementationApproval = "pending";
-      item.shouldImplement = false;
-      changed = true;
-    } else if (item.implementationApproval === "auto") {
-      // Legacy owner auto-approve — require explicit loop review before builder work.
       item.implementationApproval = "pending";
       item.shouldImplement = false;
       changed = true;
     }
   }
 
-  const pending = ledger.items.filter(isAppFeedbackPendingReview);
+  const pending = ledger.items.filter((item) => isAppFeedbackPendingReview(item, opts.ownerEmails));
 
   if (pending.length === 0) {
     if (changed) {
@@ -1757,10 +1766,10 @@ async function promptPendingFeedbackApprovals(
     return countImplementNowFeedback(repoPath);
   }
 
-  console.log(chalk.bold(`\nIn-app feedback review (${pending.length} item(s) from the app)`));
+  console.log(chalk.bold(`\nIn-app feedback review (${pending.length} item(s) from other accounts)`));
   console.log(
     chalk.gray(
-      "Review each item before the builder runs. Actions: [a] approve  [n] deny  [d] defer  [q] quit review\n",
+      "Review each item before the builder runs. Actions: [y] approve  [n] deny  [d] defer  [q] quit (also: approve/deny/defer)\n",
     ),
   );
 
@@ -1778,17 +1787,23 @@ async function promptPendingFeedbackApprovals(
       if (current.implementationNote) {
         console.log(chalk.gray(`  note: ${truncateForDisplay(current.implementationNote, 160)}`));
       }
-      const answer = (await rl.question(chalk.cyan("  Action [a/n/d/q]: "))).trim().toLowerCase();
-      if (answer === "q") {
+      const answerRaw = await rl.question(chalk.cyan("  Action [y/n/d/q]: "));
+      const action = parseFeedbackReviewAction(answerRaw);
+      if (action === "quit") {
         console.log(chalk.yellow("\nStopped in-app feedback review early.\n"));
         break;
+      }
+      if (!action) {
+        console.log(chalk.yellow("  Unrecognized action — use y/n/d/q or approve/deny/defer.\n"));
+        index--;
+        continue;
       }
 
       const idx = ledger.items.findIndex((item) => item.id === current.id);
       if (idx < 0) continue;
 
       const now = new Date().toISOString();
-      if (answer === "a" || answer === "y") {
+      if (action === "approve") {
         ledger.items[idx] = {
           ...ledger.items[idx]!,
           shouldImplement: true,
@@ -1798,7 +1813,7 @@ async function promptPendingFeedbackApprovals(
         };
         approvedCount++;
         console.log(chalk.green("  Approved — queued for implementation this cycle.\n"));
-      } else if (answer === "n") {
+      } else if (action === "deny") {
         ledger.items[idx] = {
           ...ledger.items[idx]!,
           shouldImplement: false,
@@ -3781,7 +3796,7 @@ program
       if (implementNowFeedbackCount > 0) {
         console.log(
           chalk.cyan(
-            `  Feedback queue: ${implementNowFeedbackCount} open item(s) queued for implementation (approved in-app + CLI/manual).`,
+            `  Feedback queue: ${implementNowFeedbackCount} open item(s) queued for implementation (owner/CLI auto-approved + loop-approved in-app).`,
           ),
         );
       }

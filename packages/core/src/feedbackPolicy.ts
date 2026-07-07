@@ -21,7 +21,7 @@ export function resolveFeedbackOwnerEmails(
   );
 }
 
-/** In-app feedback collected via Supabase always requires explicit loop review. */
+/** In-app feedback collected via Supabase (shake/long-press, edge function). */
 export function isAppFeedbackSource(source: string): boolean {
   return source === "supabase";
 }
@@ -32,8 +32,16 @@ export function isAutoApprovedFeedback(
   submitterEmail: string | undefined,
   ownerEmails: Set<string>,
 ): boolean {
-  if (isAppFeedbackSource(source)) return false;
   if (source === "manual:cli" || source.startsWith("manual:")) return true;
   const email = normalizeFeedbackEmail(submitterEmail);
   return email ? ownerEmails.has(email) : false;
+}
+
+/** Non-owner in-app feedback waits for explicit approve / deny / defer in `foundry loop`. */
+export function isAppFeedbackPendingLoopReview(
+  source: string,
+  submitterEmail: string | undefined,
+  ownerEmails: Set<string>,
+): boolean {
+  return isAppFeedbackSource(source) && !isAutoApprovedFeedback(source, submitterEmail, ownerEmails);
 }

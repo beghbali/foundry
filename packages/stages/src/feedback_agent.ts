@@ -557,8 +557,18 @@ function resolveFeedbackImplementation(
 > {
   const submitterEmail = raw.submitterEmail ?? prior?.submitterEmail;
 
-  // In-app (Supabase) feedback always waits for explicit approve / deny / defer in `foundry loop`.
+  // Owner in-app feedback goes straight to the builder; other accounts wait for loop review.
   if (raw.source === "supabase" && raw.type !== "praise") {
+    if (isAutoApprovedFeedback(raw.source, submitterEmail, ownerEmails)) {
+      return {
+        submitterEmail,
+        repoActionable: true,
+        shouldImplement: true,
+        implementationApproval: "auto",
+        implementationNote:
+          prior?.implementationNote ?? "Owner in-app feedback — auto-approved for implementation.",
+      };
+    }
     const priorApproval = prior?.implementationApproval;
     const effectiveApproval = priorApproval === "auto" ? "pending" : priorApproval;
     if (effectiveApproval === "approved") {
