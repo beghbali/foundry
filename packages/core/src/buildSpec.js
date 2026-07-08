@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
@@ -320,6 +321,80 @@ export function taskIsConcrete(task) {
     if (/\.(tsx?|jsx?|md|yaml|yml|sql|json|sh)\b/.test(task.task))
         return true;
     return !isVagueDirective(task.task);
+}
+/** Normalize directive/packet text for fuzzy overlap checks. */
+export function normDirectiveText(s) {
+    return s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+}
+/** True when `directive` is recognizably represented in addressed parent/task texts. */
+export function directiveMatchesAddressedText(directive, addressedTexts) {
+    const a = normDirectiveText(directive);
+    if (a.length === 0)
+        return false;
+    const aPrefix = a.slice(0, 40);
+    const aWords = new Set(a.split(" ").filter((w) => w.length > 4));
+    for (const p of addressedTexts) {
+        const b = normDirectiveText(p);
+        if (b.length === 0)
+            continue;
+        if (b.includes(aPrefix) || a.includes(b.slice(0, 40)))
+            return true;
+        const bWords = new Set(b.split(" ").filter((w) => w.length > 4));
+        let overlap = 0;
+        for (const w of aWords)
+            if (bWords.has(w))
+                overlap++;
+        if (overlap >= 3 && overlap / Math.max(1, aWords.size) >= 0.4)
+            return true;
+    }
+    return false;
+}
+/** Product file paths referenced in an investor/builder directive (for `[remove]` verification). */
+export function extractRemovalTargetPaths(directive) {
+    const paths = new Set();
+    for (const m of directive.matchAll(/`?(apps\/[^\s`]+?\.(?:tsx?|jsx?))`?/gi)) {
+        paths.add(m[1]);
+    }
+    for (const m of directive.matchAll(/\b(apps\/[^\s`]+?\.(?:tsx?|jsx?))\b/gi)) {
+        paths.add(m[1]);
+    }
+    return [...paths];
+}
+export function collectBuildSpecAddressedTexts(spec, ledger) {
+    const out = [];
+    for (const p of Object.values(ledger.addressedParents ?? {})) {
+        if (p.text?.trim())
+            out.push(p.text);
+    }
+    if (spec) {
+        for (const slice of spec.slices) {
+            for (const task of slice.tasks) {
+                if (task.id in ledger.tasks)
+                    out.push(task.task);
+            }
+        }
+        for (const parent of spec.parentDirectives) {
+            if (parent.text?.trim())
+                out.push(parent.text);
+        }
+    }
+    return out;
+}
+/**
+ * Whether an investor directive appears implemented: ledger/task fuzzy match,
+ * or `[remove]` screen files absent on disk.
+ */
+export function investorDirectiveAppearsBuilt(directive, addressedTexts, repoPath) {
+    if (directiveMatchesAddressedText(directive, addressedTexts))
+        return true;
+    const removalPaths = extractRemovalTargetPaths(directive);
+    const screenRemovals = removalPaths.filter((p) => /Screen\.tsx$/i.test(p));
+    if (/^\[remove\]/i.test(directive.trim()) &&
+        screenRemovals.length > 0 &&
+        screenRemovals.every((rel) => !existsSync(join(repoPath, rel)))) {
+        return true;
+    }
+    return false;
 }
 /** Ops, device-lab, artifact, and infra noise — not product slices for Cursor. */
 export function isEnvironmentalWorkItem(text) {

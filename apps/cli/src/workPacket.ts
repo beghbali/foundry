@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { mintBriefItemId, parseBriefIdComment, stripBriefIdComment } from "@foundry/core/briefIntent";
-import { isEnvironmentalWorkItem, type BuildSpecSlice } from "@foundry/core/buildSpec";
+import { isEnvironmentalWorkItem, normDirectiveText, readBuildSpecLedger, type BuildSpecSlice } from "@foundry/core/buildSpec";
 
 export type WorkPacketSection =
   | "qa"
@@ -137,7 +137,8 @@ export function isNonActionableWorkPacketItem(text: string): boolean {
   return (
     isStructuralNonCodeBriefItem(text) ||
     isNoOpPacketText(text) ||
-    isDeferredPlumbingWorkPacketItem(text)
+    isDeferredPlumbingWorkPacketItem(text) ||
+    isMetaBuilderFeedbackPacketItem(text)
   );
 }
 
@@ -295,6 +296,32 @@ function packetPaths(repoPath: string): { json: string; md: string } {
 
 function choosePacketItems(candidates: WorkPacketItem[], maxItems: number): WorkPacketItem[] {
   return candidates.slice(0, maxItems);
+}
+
+function isMetaBuilderFeedbackPacketItem(text: string): boolean {
+  const t = text.trim();
+  if (/\*\*Feedback `fb-/.test(t) && t.length < 200 && /\/\s*$/.test(t)) return true;
+  if (/\bopen feedback ledger items with\b/i.test(t)) return true;
+  if (/^automation_log:/i.test(t)) return true;
+  return false;
+}
+
+function packetTextBody(text: string): string {
+  return normDirectiveText(stripBriefIdComment(text).replace(/^\[[^\]]+\]\s*/, ""));
+}
+
+function briefTextMatchesPacket(checkedText: string, packetText: string): boolean {
+  const a = normDirectiveText(checkedText);
+  const b = packetTextBody(packetText);
+  if (!a || !b) return false;
+  const aPrefix = a.slice(0, 40);
+  const bPrefix = b.slice(0, 40);
+  return b.includes(aPrefix) || a.includes(bPrefix);
+}
+
+function buildSpecTaskIdFromPacketText(text: string): string | undefined {
+  const m = /^\[([^\]]+)\]/.exec(text.trim());
+  return m?.[1];
 }
 
 function isNoOpPacketText(text: string): boolean {
@@ -498,17 +525,23 @@ export async function refreshWorkPacket(
   packet: WorkPacket,
   signals: PacketSignals,
 ): Promise<WorkPacket> {
+  const ledger = await readBuildSpecLedger(repoPath);
+  const completedTaskIds = new Set(Object.keys(ledger.tasks ?? {}));
   const openKeys = new Set<string>();
   for (const item of signals.briefOpenItems) openKeys.add(packetItemKey(item));
   for (const item of signals.qaCodeBlockers) openKeys.add(normalizeKey(item));
   for (const item of signals.builderCodeBlockers) openKeys.add(normalizeKey(item));
   const checkedKeys = new Set(signals.checkedBriefItems.map((item) => packetItemKey(item)));
+  const checkedTexts = signals.checkedBriefItems.map((item) => item.text);
 
   const manualKeys = new Set(signals.manualOnly.map((item) => normalizeKey(item)));
   const items = packet.items.map((item) => {
     const next = { ...item };
     let nextStatus: WorkPacketStatus = "open";
-    if (manualKeys.has(item.key)) {
+    const taskId = buildSpecTaskIdFromPacketText(item.text);
+    if (taskId && completedTaskIds.has(taskId)) {
+      nextStatus = "closed";
+    } else if (manualKeys.has(item.key)) {
       nextStatus = "manual_only";
     } else if (item.source === "brief") {
       // Config-injected builder-directives are `source: "brief"` but never
@@ -519,13 +552,19 @@ export async function refreshWorkPacket(
       // prior status when the brief signals say nothing about them.
       if (checkedKeys.has(item.key)) {
         nextStatus = "closed";
+      } else if (checkedTexts.some((ct) => briefTextMatchesPacket(ct, item.text))) {
+        nextStatus = "closed";
       } else if (openKeys.has(item.key)) {
         nextStatus = "open";
       } else {
         nextStatus = item.status;
       }
     } else if (item.source === "qa" || item.source === "builder") {
-      nextStatus = openKeys.has(item.key) ? "open" : "closed";
+      if (isMetaBuilderFeedbackPacketItem(item.text)) {
+        nextStatus = "closed";
+      } else {
+        nextStatus = openKeys.has(item.key) ? "open" : "closed";
+      }
     } else if (signals.codeChanged && !openKeys.has(item.key)) {
       nextStatus = "closed";
     }
@@ -585,6 +624,45 @@ export async function syncBuilderDirectivePacketClosure(
     if (item.status !== "open" || !item.text.includes("[builder-directive]")) return item;
     changed = true;
     return { ...item, status: "closed" as const };
+  });
+  if (!changed) return packet;
+
+  const updated: WorkPacket = {
+    ...packet,
+    updatedAt: new Date().toISOString(),
+    items,
+  };
+  await writePacketFiles(repoPath, updated);
+  return updated;
+}
+
+/** Close BUILD_SPEC task rows when the ledger marks the task complete or the brief checks it off. */
+export async function syncBuildSpecTaskPacketClosure(
+  repoPath: string,
+  packet: WorkPacket,
+): Promise<WorkPacket> {
+  const ledger = await readBuildSpecLedger(repoPath);
+  const completedTaskIds = new Set(Object.keys(ledger.tasks ?? {}));
+  const checked = await readCheckedBriefItems(join(repoPath, ".foundry", "CURSOR_BRIEF.md"));
+  const checkedTexts = checked.map((c) => c.text);
+
+  let changed = false;
+  const items = packet.items.map((item) => {
+    if (item.status !== "open") return item;
+    const taskId = buildSpecTaskIdFromPacketText(item.text);
+    if (taskId && completedTaskIds.has(taskId)) {
+      changed = true;
+      return { ...item, status: "closed" as const };
+    }
+    if (checkedTexts.some((ct) => briefTextMatchesPacket(ct, item.text))) {
+      changed = true;
+      return { ...item, status: "closed" as const };
+    }
+    if (isMetaBuilderFeedbackPacketItem(item.text)) {
+      changed = true;
+      return { ...item, status: "closed" as const };
+    }
+    return item;
   });
   if (!changed) return packet;
 

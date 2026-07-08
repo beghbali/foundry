@@ -4,7 +4,13 @@ import { join } from "node:path";
 
 import type { PipelineIndependentQa } from "./cursorAutomation.js";
 import { truncateForDisplay } from "./cursorAutomation.js";
-import { isEnvironmentalWorkItem } from "@foundry/core/buildSpec";
+import {
+  collectBuildSpecAddressedTexts,
+  investorDirectiveAppearsBuilt,
+  isEnvironmentalWorkItem,
+  readBuildSpecFromRepo,
+  readBuildSpecLedger,
+} from "@foundry/core/buildSpec";
 import { isDeferredPlumbingWorkPacketItem, isNonActionableWorkPacketItem, type WorkPacket } from "./workPacket.js";
 
 export type FeedbackLedgerItem = {
@@ -86,6 +92,25 @@ export function summarizeFeedbackLedgerCounts(items: FeedbackLedgerItem[]): stri
   return `${resolved} resolved · ${open} open`;
 }
 
+async function scanScreenTrendRemoved(repoPath: string): Promise<boolean> {
+  try {
+    const raw = await readFile(join(repoPath, "apps/mobile/src/screens/ScanScreen.tsx"), "utf8");
+    return !raw.includes("gc_scan_gut_score_trend");
+  } catch {
+    return false;
+  }
+}
+
+async function investorDirectiveBuilt(
+  repoPath: string,
+  directive: string,
+  addressedTexts: string[],
+): Promise<boolean> {
+  if (investorDirectiveAppearsBuilt(directive, addressedTexts, repoPath)) return true;
+  if (/gc_scan_gut_score_trend/i.test(directive) && (await scanScreenTrendRemoved(repoPath))) return true;
+  return false;
+}
+
 export async function buildCompletionRows(
   repoPath: string,
   scope: CycleWorkScope,
@@ -97,6 +122,10 @@ export async function buildCompletionRows(
     qa?.recommendation === "ship" &&
     (qa?.blockers?.length ?? 0) === 0 &&
     qa?.testsPassed !== false;
+
+  const spec = await readBuildSpecFromRepo(repoPath);
+  const buildLedger = await readBuildSpecLedger(repoPath);
+  const addressedTexts = collectBuildSpecAddressedTexts(spec, buildLedger);
 
   const rows: CompletionRow[] = [];
 
@@ -113,11 +142,12 @@ export async function buildCompletionRows(
   }
 
   for (const directive of scope.investorDirectives) {
+    const built = await investorDirectiveBuilt(repoPath, directive, addressedTexts);
     rows.push({
       kind: "Investor",
       label: directive,
-      built: false,
-      tested: false,
+      built,
+      tested: built && qaShip,
     });
   }
 

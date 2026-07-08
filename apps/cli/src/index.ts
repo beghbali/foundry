@@ -100,6 +100,7 @@ import {
   workPacketReopenCount,
   workPacketSummaryLine,
   syncBuilderDirectivePacketClosure,
+  syncBuildSpecTaskPacketClosure,
   syncDeferredPlumbingPacketClosure,
   type WorkPacket,
 } from "./workPacket.js";
@@ -3850,6 +3851,7 @@ program
         builderRemainingBlockers,
         stabilize,
       });
+      workPacket = await syncBuildSpecTaskPacketClosure(repoPath, workPacket);
       workPacket = await syncDeferredPlumbingPacketClosure(repoPath, workPacket);
       const cycleInvestorDirectives =
         investorOutput?.combinedRefinementDirectives ??
@@ -4091,6 +4093,7 @@ program
               codeChanged: false,
             });
             workPacket = await syncBuilderDirectivePacketClosure(repoPath, workPacket);
+            workPacket = await syncBuildSpecTaskPacketClosure(repoPath, workPacket);
             workPacket = await syncDeferredPlumbingPacketClosure(repoPath, workPacket);
             activePacketCounts = packetBriefCounts(workPacket);
           }
@@ -4544,6 +4547,7 @@ program
             codeChanged: builderRun.hadCodeChanges,
           });
           workPacket = await syncBuilderDirectivePacketClosure(repoPath, workPacket);
+          workPacket = await syncBuildSpecTaskPacketClosure(repoPath, workPacket);
           workPacket = await syncDeferredPlumbingPacketClosure(repoPath, workPacket);
           activePacketCounts = packetBriefCounts(workPacket);
           console.log(
