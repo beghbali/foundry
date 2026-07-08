@@ -16,11 +16,15 @@ import {
 } from "@foundry/core/investorGrades";
 import {
   applyBuildSpecTaskCompletions,
+  collectBuildSpecAddressedTexts,
   computeUpstreamFingerprint,
+  dedupeInvestorDirectives,
+  filterUnbuiltInvestorDirectives,
   isEnvironmentalWorkItem,
   primaryBuildSpecSlice,
   readBuildSpecFromRepo,
   readBuildSpecLedger,
+  reconcileInvestorDirectivesInLedger,
   writeBuildSpecLedger,
 } from "@foundry/core/buildSpec";
 import {
@@ -873,6 +877,15 @@ async function updateBuildSpecLedgerFromPass(
       );
     }
   }
+
+  const reconciledInvestor = await reconcileInvestorDirectivesInLedger(repoPath);
+  if (reconciledInvestor.length > 0) {
+    console.log(
+      chalk.green(
+        `  BUILD_SPEC_LEDGER: reconciled ${reconciledInvestor.length} investor directive(s) from shipped code.`,
+      ),
+    );
+  }
 }
 
 async function buildWorkPacketForRun(params: {
@@ -1713,9 +1726,23 @@ async function sampleInvestorDirectiveTargets(
       /* no persisted investor state */
     }
   }
-  return directives
+  const spec = await readBuildSpecFromRepo(repoPath);
+  const ledger = await readBuildSpecLedger(repoPath);
+  const addressedTexts = collectBuildSpecAddressedTexts(spec, ledger);
+  return filterUnbuiltInvestorDirectives(directives, addressedTexts, repoPath)
     .slice(0, maxItems)
     .map((d) => `[INVESTOR] ${truncateForDisplay(d, 200)}`);
+}
+
+async function countUnbuiltInvestorDirectives(
+  repoPath: string,
+  directives: string[],
+): Promise<number> {
+  if (directives.length === 0) return 0;
+  const spec = await readBuildSpecFromRepo(repoPath);
+  const ledger = await readBuildSpecLedger(repoPath);
+  const addressedTexts = collectBuildSpecAddressedTexts(spec, ledger);
+  return filterUnbuiltInvestorDirectives(directives, addressedTexts, repoPath).length;
 }
 
 async function sampleImplementNowFeedback(repoPath: string, maxItems = 8): Promise<string[]> {
@@ -3853,11 +3880,12 @@ program
       });
       workPacket = await syncBuildSpecTaskPacketClosure(repoPath, workPacket);
       workPacket = await syncDeferredPlumbingPacketClosure(repoPath, workPacket);
-      const cycleInvestorDirectives =
+      const cycleInvestorDirectives = dedupeInvestorDirectives(
         investorOutput?.combinedRefinementDirectives ??
-        (await sampleInvestorDirectiveTargets(repoPath, investorOutput, 12)).map((line) =>
-          line.replace(/^\[INVESTOR\]\s*/, ""),
-        );
+          (await sampleInvestorDirectiveTargets(repoPath, investorOutput, 12)).map((line) =>
+            line.replace(/^\[INVESTOR\]\s*/, ""),
+          ),
+      );
       cycleWorkScope = captureCycleWorkScope(
         (await readFeedbackLedger(repoPath)).items,
         workPacket,
@@ -4577,31 +4605,43 @@ program
           }
 
           // Stop only on durable ship — post-Cursor green without commits does not count.
+          // Keep going while investor directives are still unbuilt (e.g. ScanScreen collapse).
+          const unbuiltInvestorCount = cycleWorkScope
+            ? await countUnbuiltInvestorDirectives(repoPath, cycleWorkScope.investorDirectives)
+            : 0;
           if (
             loopProfile === "investor" &&
             actionableWorkPacketOpenCount(workPacket) === 0 &&
             implementNowFeedbackCount === 0 &&
             isDurableLoopShip(durableCtx)
           ) {
-            console.log(
-              chalk.cyan(
-                "\n  Durable QA ship with no actionable work-packet items — stopping inner loop.",
-              ),
-            );
-            if (!cycleProducedInvestorPanel) {
-              const ip = await runInvestorPanelForLoop({
-                repoPath,
-                pipelineName: opts.pipeline,
-                foundryRoot,
-                manifest,
-                loopProfile,
-                spinnerLabel: "Running investor_panel (durable QA ship)...",
-              });
-              manifest = ip.manifest;
-              investorOutput = ip.investorOutput;
-              if (ip.ran) cycleProducedInvestorPanel = true;
+            if (unbuiltInvestorCount > 0) {
+              console.log(
+                chalk.cyan(
+                  `\n  Durable QA ship but ${unbuiltInvestorCount} investor directive(s) still unbuilt — continuing inner loop.`,
+                ),
+              );
+            } else {
+              console.log(
+                chalk.cyan(
+                  "\n  Durable QA ship with no actionable work-packet items — stopping inner loop.",
+                ),
+              );
+              if (!cycleProducedInvestorPanel) {
+                const ip = await runInvestorPanelForLoop({
+                  repoPath,
+                  pipelineName: opts.pipeline,
+                  foundryRoot,
+                  manifest,
+                  loopProfile,
+                  spinnerLabel: "Running investor_panel (durable QA ship)...",
+                });
+                manifest = ip.manifest;
+                investorOutput = ip.investorOutput;
+                if (ip.ran) cycleProducedInvestorPanel = true;
+              }
+              break;
             }
-            break;
           }
           if (
             isQaShipClean(pipelineQa) &&

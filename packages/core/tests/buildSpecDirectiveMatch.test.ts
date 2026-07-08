@@ -4,9 +4,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   collectBuildSpecAddressedTexts,
+  dedupeInvestorDirectives,
   directiveMatchesAddressedText,
   extractRemovalTargetPaths,
+  filterUnbuiltInvestorDirectives,
   investorDirectiveAppearsBuilt,
+  reconcileInvestorDirectivesInLedger,
 } from "../src/buildSpec.js";
 
 describe("buildSpec directive matching", () => {
@@ -75,5 +78,26 @@ describe("buildSpec directive matching", () => {
     );
     expect(texts.some((t) => t.includes("MealScanScreen"))).toBe(true);
     expect(texts.some((t) => t.includes("Account utility"))).toBe(true);
+  });
+
+  it("dedupes investor directives by removal path", () => {
+    const d1 = "[remove] apps/mobile/src/screens/MealScanScreen.tsx — delete file";
+    const d2 = "[remove] apps/mobile/src/screens/MealScanScreen.tsx and apps/mobile/src/screens/ShelfScanScreen.tsx — delete both";
+    const deduped = dedupeInvestorDirectives([d1, d2]);
+    expect(deduped).toHaveLength(2);
+    const onlyMeal = dedupeInvestorDirectives([d1, d1]);
+    expect(onlyMeal).toHaveLength(1);
+  });
+
+  it("filters built removal directives from unbuilt list", () => {
+    const tmp = join(process.cwd(), ".tmp-buildspec-filter-test");
+    rmSync(tmp, { recursive: true, force: true });
+    mkdirSync(join(tmp, "apps/mobile/src/screens"), { recursive: true });
+    const built =
+      "[remove] apps/mobile/src/screens/MealScanScreen.tsx — delete the meal scan surface";
+    const unbuilt = "apps/mobile/src/screens/ScanScreen.tsx — collapse pre-scan cards";
+    const filtered = filterUnbuiltInvestorDirectives([built, unbuilt], [], tmp);
+    expect(filtered).toEqual([unbuilt]);
+    rmSync(tmp, { recursive: true, force: true });
   });
 });

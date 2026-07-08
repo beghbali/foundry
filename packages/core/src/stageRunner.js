@@ -2,8 +2,9 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import YAML from "yaml";
 import { z } from "zod";
-import { writeStageJson, writeStageMarkdown } from "./artifacts.js";
+import { writeStageJson, writeStageMarkdown, readLatestArtifact } from "./artifacts.js";
 import { loadFoundryConfig } from "./config.js";
+import { collectBuildSpecAddressedTexts, investorDirectiveAppearsBuilt, isEnvironmentalWorkItem, readBuildSpecFromRepo, readBuildSpecLedger, } from "./buildSpec.js";
 import { parseAutonomousInvestorConvergence, withInvestorLoopAutonomousDefaultsIfNeeded, } from "./investorGrades.js";
 import { STAGES_ELIGIBLE_FOR_REUSE, computeRepoFingerprint, fingerprintStageInput, isStageReuseEnabled, rememberStageOutput, tryGetReusableStageOutput, } from "./pipelineStageCache.js";
 import { getStageInput, } from "./stageInputs.js";
@@ -239,38 +240,43 @@ async function unaddressedInvestorDirectivesSinceLastPitch(repoPath) {
     const dirs = state?.lastDirectives ?? [];
     if (dirs.length === 0)
         return [];
-    let ledger;
+    const spec = await readBuildSpecFromRepo(repoPath);
+    const ledger = await readBuildSpecLedger(repoPath);
+    const addressedTexts = collectBuildSpecAddressedTexts(spec, ledger);
+    let maestroRequired = false;
     try {
-        const raw = await readFile(join(repoPath, ".foundry", "BUILD_SPEC_LEDGER.json"), "utf8");
-        ledger = JSON.parse(raw);
+        const cfg = await loadFoundryConfig(repoPath);
+        maestroRequired = cfg.project.qa_automation?.maestro?.required ?? false;
     }
     catch {
-        return [...dirs];
+        /* optional */
     }
-    const addressed = Object.values(ledger.addressedParents ?? {}).map((p) => p.text);
-    const norm = (s) => s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
-    const matches = (a, b) => {
-        const na = norm(a);
-        const nb = norm(b);
-        if (!na || !nb)
-            return false;
-        if (nb.includes(na.slice(0, 40)) || na.includes(nb.slice(0, 40)))
-            return true;
-        const aw = new Set(na.split(" ").filter((w) => w.length > 4));
-        const bw = new Set(nb.split(" ").filter((w) => w.length > 4));
-        let overlap = 0;
-        for (const w of aw)
-            if (bw.has(w))
-                overlap++;
-        return overlap >= 3 && overlap / Math.max(1, aw.size) >= 0.4;
-    };
-    return dirs.filter((d) => !addressed.some((p) => matches(d, p)));
+    return dirs.filter((d) => {
+        if (isManualInvestorDirective(d)) {
+            if (/maestro|gc_intro_brand|first.session (demo|screencast)/i.test(d) && !maestroRequired)
+                return false;
+            if (/cold scans|device benchmark json from account/i.test(d))
+                return false;
+        }
+        return !investorDirectiveAppearsBuilt(d, addressedTexts, repoPath);
+    });
 }
 async function shouldSkipInvestorPanelStage(repoPath, priorOutputs, projectFoundry, options) {
     const relaxInvestorGates = parseAutonomousInvestorConvergence(projectFoundry).relaxedInvestorGates;
     const builderRaw = priorOutputs["builder"];
     const builder = BuilderRunnerShape.safeParse(builderRaw);
-    const qa = IndependentQaRunnerShape.safeParse(priorOutputs["independent_qa"]);
+    let qaRaw = priorOutputs["independent_qa"];
+    if (qaRaw === undefined) {
+        try {
+            const raw = await readLatestArtifact(repoPath, "independent_qa/output.json");
+            if (raw)
+                qaRaw = JSON.parse(raw);
+        }
+        catch {
+            /* fall through */
+        }
+    }
+    const qa = IndependentQaRunnerShape.safeParse(qaRaw);
     const convergenceRaw = priorOutputs["convergence_contract"];
     const convergence = ConvergenceContractRunnerShape.safeParse(convergenceRaw);
     const convergenceInPipeline = convergenceRaw !== undefined;

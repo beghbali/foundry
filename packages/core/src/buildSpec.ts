@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -419,6 +419,27 @@ export function collectBuildSpecAddressedTexts(
   return out;
 }
 
+/** ScanScreen pre-scan collapse — must be verified on disk, not ledger fuzzy-match alone. */
+function isScanScreenCollapseDirective(directive: string): boolean {
+  return (
+    /ScanScreen\.tsx/i.test(directive) &&
+    (/pre-scan cards|firstScanPrimer|single priority selector|gc_scan_context_picker|gc_last_result_banner/i.test(
+      directive,
+    ))
+  );
+}
+
+function scanScreenCollapseAppearsBuilt(repoPath: string): boolean {
+  try {
+    const raw = readFileSync(join(repoPath, "apps/mobile/src/screens/ScanScreen.tsx"), "utf8");
+    if (raw.includes("gc_scan_gut_score_trend")) return false;
+    if (/gutScoreTrend|handleTrendPress/i.test(raw)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Whether an investor directive appears implemented: ledger/task fuzzy match,
  * or `[remove]` screen files absent on disk.
@@ -428,6 +449,10 @@ export function investorDirectiveAppearsBuilt(
   addressedTexts: ReadonlyArray<string>,
   repoPath: string,
 ): boolean {
+  if (isScanScreenCollapseDirective(directive)) {
+    return scanScreenCollapseAppearsBuilt(repoPath);
+  }
+
   if (directiveMatchesAddressedText(directive, addressedTexts)) return true;
 
   const removalPaths = extractRemovalTargetPaths(directive);
@@ -440,7 +465,89 @@ export function investorDirectiveAppearsBuilt(
     return true;
   }
 
+  if (/gc_scan_gut_score_trend/i.test(directive)) {
+    try {
+      const raw = readFileSync(join(repoPath, "apps/mobile/src/screens/ScanScreen.tsx"), "utf8");
+      if (!raw.includes("gc_scan_gut_score_trend")) return true;
+    } catch {
+      /* file missing — not built */
+    }
+  }
+
   return false;
+}
+
+/** Collapse near-duplicate investor directives (same removal paths or same normalized stem). */
+export function dedupeInvestorDirectives(directives: ReadonlyArray<string>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const d of directives) {
+    const removalPaths = extractRemovalTargetPaths(d).sort().join("|");
+    const key = removalPaths || normDirectiveText(d).slice(0, 72);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(d);
+  }
+  return out;
+}
+
+/** Investor directives that still need engineering work (not ledger-matched and not verified on disk). */
+export function filterUnbuiltInvestorDirectives(
+  directives: ReadonlyArray<string>,
+  addressedTexts: ReadonlyArray<string>,
+  repoPath: string,
+): string[] {
+  return dedupeInvestorDirectives(
+    directives.filter((d) => !investorDirectiveAppearsBuilt(d, addressedTexts, repoPath)),
+  );
+}
+
+/**
+ * Mark investor `lastDirectives` as addressed in BUILD_SPEC_LEDGER when shipped
+ * code satisfies them (file removals, trend chip absent, etc.) so the panel can re-pitch.
+ */
+export async function reconcileInvestorDirectivesInLedger(repoPath: string): Promise<string[]> {
+  type InvestorState = { lastDirectives?: string[] };
+  let state: InvestorState;
+  try {
+    state = JSON.parse(
+      await readFile(join(repoPath, ".foundry/INVESTOR_PANEL_STATE.json"), "utf8"),
+    ) as InvestorState;
+  } catch {
+    return [];
+  }
+  const directives = state.lastDirectives ?? [];
+  if (directives.length === 0) return [];
+
+  const spec = await readBuildSpecFromRepo(repoPath);
+  const ledger = await readBuildSpecLedger(repoPath);
+  const addressedTexts = collectBuildSpecAddressedTexts(spec, ledger);
+  const addressedMap = { ...(ledger.addressedParents ?? {}) };
+  const addressedValues = Object.values(addressedMap).map((p) => p.text);
+  const newly: string[] = [];
+
+  for (let i = 0; i < directives.length; i++) {
+    const d = directives[i]!;
+    if (directiveMatchesAddressedText(d, addressedValues)) continue;
+    if (!investorDirectiveAppearsBuilt(d, addressedTexts, repoPath)) continue;
+
+    const slug = normDirectiveText(d).slice(0, 28).replace(/\s+/g, "_") || `dir_${i}`;
+    const id = `investor_reconcile_${i}_${slug}`;
+    if (id in addressedMap) continue;
+    addressedMap[id] = {
+      text: d,
+      source: "investor_panel",
+      addressedAt: new Date().toISOString(),
+    };
+    newly.push(d.slice(0, 96));
+  }
+
+  if (newly.length > 0) {
+    ledger.addressedParents = addressedMap;
+    ledger.updatedAt = new Date().toISOString();
+    await writeBuildSpecLedger(repoPath, ledger);
+  }
+  return newly;
 }
 
 /** Ops, device-lab, artifact, and infra noise — not product slices for Cursor. */

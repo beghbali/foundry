@@ -92,23 +92,12 @@ export function summarizeFeedbackLedgerCounts(items: FeedbackLedgerItem[]): stri
   return `${resolved} resolved · ${open} open`;
 }
 
-async function scanScreenTrendRemoved(repoPath: string): Promise<boolean> {
-  try {
-    const raw = await readFile(join(repoPath, "apps/mobile/src/screens/ScanScreen.tsx"), "utf8");
-    return !raw.includes("gc_scan_gut_score_trend");
-  } catch {
-    return false;
-  }
-}
-
 async function investorDirectiveBuilt(
   repoPath: string,
   directive: string,
   addressedTexts: string[],
 ): Promise<boolean> {
-  if (investorDirectiveAppearsBuilt(directive, addressedTexts, repoPath)) return true;
-  if (/gc_scan_gut_score_trend/i.test(directive) && (await scanScreenTrendRemoved(repoPath))) return true;
-  return false;
+  return investorDirectiveAppearsBuilt(directive, addressedTexts, repoPath);
 }
 
 export async function buildCompletionRows(
