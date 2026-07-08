@@ -2405,20 +2405,36 @@ export function shouldRunCursorAutomation(
     investorTargetMet?: boolean;
     /** False when `convergence_contract` is not converged or still has open/regressed objections. */
     contractConvergenceMet?: boolean;
+    /**
+     * Investor file-anchored directives still unverified on disk / ledger.
+     * Keeps the Cursor builder alive when the packet/brief are empty but product
+     * work from the last investor pitch remains (e.g. ScanScreen collapse).
+     */
+    unbuiltInvestorDirectiveCount?: number;
   },
 ): boolean {
   const hasActionableBriefWork = briefCounts.total > 0;
   const feedbackCount = opts?.stabilize ? 0 : implementNowFeedbackCount;
-  const hasQueuedImplementationWork = feedbackCount > 0;
+  const investorWork =
+    !opts?.stabilize && (opts?.unbuiltInvestorDirectiveCount ?? 0) > 0;
+  const hasQueuedImplementationWork = feedbackCount > 0 || investorWork;
+  const deferAutonomousRelease = Boolean(
+    opts?.autonomousDeferRelease &&
+      (opts?.investorTargetMet === false || opts?.contractConvergenceMet === false) &&
+      // Grade-chasing alone is not enough — require packet/feedback/investor
+      // product work, otherwise we burn Cursor inventing filler.
+      (hasActionableBriefWork || hasQueuedImplementationWork),
+  );
 
   if (releaseStatus === "approved" || releaseStatus === "auto_approved") return false;
 
-  // QA is green and nothing actionable remains — never burn Cursor quota, even when
-  // investor convergence still wants a higher grade (run investor_panel instead).
+  // QA is green and no packet/feedback/investor product work remains — skip Cursor
+  // (re-pitch via investor_panel instead of inventing filler).
   if (
     pipelineQaRecommendation === "ship" &&
     !hasActionableBriefWork &&
-    !hasQueuedImplementationWork
+    !hasQueuedImplementationWork &&
+    !deferAutonomousRelease
   ) {
     return false;
   }
@@ -2426,7 +2442,8 @@ export function shouldRunCursorAutomation(
   if (
     releaseStatus === "awaiting_approval" &&
     !hasActionableBriefWork &&
-    !hasQueuedImplementationWork
+    !hasQueuedImplementationWork &&
+    !deferAutonomousRelease
   ) {
     return false;
   }

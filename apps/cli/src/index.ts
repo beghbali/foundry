@@ -1745,6 +1745,32 @@ async function countUnbuiltInvestorDirectives(
   return filterUnbuiltInvestorDirectives(directives, addressedTexts, repoPath).length;
 }
 
+/** Current investor directives for Cursor targeting — live panel output, else persisted state. */
+async function loadInvestorDirectiveList(
+  repoPath: string,
+  investor: InvestorPanelBrief | undefined,
+): Promise<string[]> {
+  let directives = investor?.combinedRefinementDirectives ?? [];
+  if (directives.length === 0) {
+    try {
+      const raw = await readFile(join(repoPath, ".foundry", "INVESTOR_PANEL_STATE.json"), "utf8");
+      const state = JSON.parse(raw) as { lastDirectives?: string[] };
+      directives = state.lastDirectives ?? [];
+    } catch {
+      /* no persisted investor state */
+    }
+  }
+  return directives;
+}
+
+async function countCurrentUnbuiltInvestorDirectives(
+  repoPath: string,
+  investor: InvestorPanelBrief | undefined,
+): Promise<number> {
+  const directives = await loadInvestorDirectiveList(repoPath, investor);
+  return countUnbuiltInvestorDirectives(repoPath, directives);
+}
+
 async function sampleImplementNowFeedback(repoPath: string, maxItems = 8): Promise<string[]> {
   const ledger = await readFeedbackLedger(repoPath);
   return ledger.items
@@ -4012,6 +4038,10 @@ program
         let previousSignature = "";
         let repeatedNoProgressCount = 0;
         const contractGate = await readContractConvergenceGate(repoPath);
+        let unbuiltInvestorCount =
+          loopProfile === "investor" && !stabilize
+            ? await countCurrentUnbuiltInvestorDirectives(repoPath, investorOutput)
+            : 0;
         while (
           shouldRunCursorAutomation(
             releaseOutput?.status,
@@ -4023,6 +4053,7 @@ program
               autonomousDeferRelease: autonomousInv.deferReleaseUntilInvestorTarget,
               investorTargetMet: investorPanelMetTarget(investorOutput, foundryConfig.project.foundry, loopProfile),
               contractConvergenceMet: contractGate.ok,
+              unbuiltInvestorDirectiveCount: unbuiltInvestorCount,
             },
           )
         ) {
@@ -4030,20 +4061,22 @@ program
             const invMet = investorPanelMetTarget(investorOutput, foundryConfig.project.foundry, loopProfile);
             const feedbackQueued = implementNowFeedbackCount > 0;
             const actionableOpen = actionableWorkPacketOpenCount(workPacket);
-            // Keep iterating when implement-now feedback is queued, even if the
-            // packet is empty and release is already awaiting approval. Without
-            // this, the loop exits to approval and silently skips feedback work.
+            // Keep iterating when implement-now feedback or investor product work
+            // is queued, even if the packet is empty and release is awaiting approval.
             const stayForConvergence =
-              (feedbackQueued ||
-                (autonomousInv.deferReleaseUntilInvestorTarget &&
-                  actionableOpen > 0 &&
-                  (!invMet || !contractGate.ok)));
+              feedbackQueued ||
+              unbuiltInvestorCount > 0 ||
+              (autonomousInv.deferReleaseUntilInvestorTarget &&
+                actionableOpen > 0 &&
+                (!invMet || !contractGate.ok));
             if (stayForConvergence) {
               const why = feedbackQueued
                 ? "feedback queued for implementation"
-                : !invMet
-                  ? "investor mean grade below configured target"
-                  : `contract not ready (${contractGate.detail})`;
+                : unbuiltInvestorCount > 0
+                  ? `${unbuiltInvestorCount} investor directive(s) still unbuilt`
+                  : !invMet
+                    ? "investor mean grade below configured target"
+                    : `contract not ready (${contractGate.detail})`;
               console.log(
                 chalk.cyan(
                   `\n  Release is awaiting_approval with QA ship + 0 blockers — continuing Cursor (${why}).`,
@@ -4124,18 +4157,25 @@ program
             workPacket = await syncBuildSpecTaskPacketClosure(repoPath, workPacket);
             workPacket = await syncDeferredPlumbingPacketClosure(repoPath, workPacket);
             activePacketCounts = packetBriefCounts(workPacket);
+            if (loopProfile === "investor" && !stabilize) {
+              unbuiltInvestorCount = await countCurrentUnbuiltInvestorDirectives(
+                repoPath,
+                investorOutput,
+              );
+            }
           }
           // Guard: don't invoke Cursor when there is literally nothing to do.
           // Without this, the inner loop fires off a Cursor pass with
           // "Build targets (0): (none ...)", and Cursor either invents
           // make-work that breaks QA, crashes with exit 1, or trips the
           // abort-on-no-product-changes guard and kills the outer loop.
-          // Instead, force a one-off investor_panel run from the current
-          // (good) QA-ship state and break out.
+          // Investor file-anchored directives that are still unbuilt on disk
+          // count as real work — do not skip just because the packet emptied.
           if (
             loopProfile === "investor" &&
             activePacketCounts.total === 0 &&
             implementNowFeedbackCount === 0 &&
+            unbuiltInvestorCount === 0 &&
             pipelineQa?.recommendation === "ship" &&
             (pipelineQa?.blockers?.length ?? 0) === 0
           ) {
@@ -4156,6 +4196,18 @@ program
             investorOutput = ip.investorOutput;
             if (ip.ran) cycleProducedInvestorPanel = true;
             break;
+          }
+          if (
+            loopProfile === "investor" &&
+            unbuiltInvestorCount > 0 &&
+            activePacketCounts.total === 0 &&
+            implementNowFeedbackCount === 0
+          ) {
+            console.log(
+              chalk.cyan(
+                `\n  Work packet empty but ${unbuiltInvestorCount} investor directive(s) still unbuilt — continuing Cursor builder.`,
+              ),
+            );
           }
           inner++;
           cycleInnerPasses = inner;

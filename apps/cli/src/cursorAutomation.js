@@ -1512,9 +1512,11 @@ export async function runBuilderAgent(repoPath, manifest, settings, modelOverrid
 export function shouldRunCursorAutomation(releaseStatus, briefCounts, pipelineQaRecommendation, implementNowFeedbackCount = 0, opts) {
     const hasActionableBriefWork = briefCounts.total > 0;
     const feedbackCount = opts?.stabilize ? 0 : implementNowFeedbackCount;
-    const hasQueuedImplementationWork = feedbackCount > 0;
+    const investorWork = !opts?.stabilize && (opts?.unbuiltInvestorDirectiveCount ?? 0) > 0;
+    const hasQueuedImplementationWork = feedbackCount > 0 || investorWork;
     const deferAutonomousRelease = Boolean(opts?.autonomousDeferRelease &&
-        (opts?.investorTargetMet === false || opts?.contractConvergenceMet === false));
+        (opts?.investorTargetMet === false || opts?.contractConvergenceMet === false) &&
+        (hasActionableBriefWork || hasQueuedImplementationWork));
     if (releaseStatus === "approved" || releaseStatus === "auto_approved")
         return false;
     if (releaseStatus === "awaiting_approval" &&
@@ -1524,7 +1526,7 @@ export function shouldRunCursorAutomation(releaseStatus, briefCounts, pipelineQa
         return false;
     }
     // Pipeline QA already green — skip Cursor only when there is no remaining implementation work
-    // (unless we are deferring release until investor convergence).
+    // (unless we are deferring release until investor convergence with real work left).
     if (pipelineQaRecommendation === "ship" &&
         !hasActionableBriefWork &&
         !hasQueuedImplementationWork &&
@@ -1534,7 +1536,6 @@ export function shouldRunCursorAutomation(releaseStatus, briefCounts, pipelineQa
     return (hasActionableBriefWork ||
         hasQueuedImplementationWork ||
         pipelineQaRecommendation !== "ship" ||
-        releaseStatus === "awaiting_approval" ||
         releaseStatus === "blocked_by_qa" ||
         releaseStatus === "blocked_pre_release");
 }
