@@ -4007,7 +4007,16 @@ program
 
       if (cursorSettings.enabled) {
         let activePacketCounts = packetBriefCounts(workPacket);
-        if (pipelineQa?.recommendation === "ship" && implementNowFeedbackCount === 0 && activePacketCounts.total === 0) {
+        let unbuiltInvestorCount =
+          loopProfile === "investor" && !stabilize
+            ? await countCurrentUnbuiltInvestorDirectives(repoPath, investorOutput)
+            : 0;
+        if (
+          pipelineQa?.recommendation === "ship" &&
+          implementNowFeedbackCount === 0 &&
+          activePacketCounts.total === 0 &&
+          unbuiltInvestorCount === 0
+        ) {
           const parts = [
             "Skipping Cursor builder inner loop: pipeline `independent_qa` recommends ship and no active work-packet or feedback items remain.",
           ];
@@ -4017,6 +4026,12 @@ program
           console.log(
             chalk.cyan(
               `  ${implementNowFeedbackCount} feedback item(s) queued for implementation; continuing Cursor builder (${qaLabel}).`,
+            ),
+          );
+        } else if (pipelineQa?.recommendation === "ship" && unbuiltInvestorCount > 0 && activePacketCounts.total === 0) {
+          console.log(
+            chalk.cyan(
+              `  QA is green and packet is empty, but ${unbuiltInvestorCount} investor directive(s) still unbuilt — continuing Cursor builder.`,
             ),
           );
         } else if (pipelineQa?.recommendation === "ship" && activePacketCounts.total > 0) {
@@ -4038,10 +4053,6 @@ program
         let previousSignature = "";
         let repeatedNoProgressCount = 0;
         const contractGate = await readContractConvergenceGate(repoPath);
-        let unbuiltInvestorCount =
-          loopProfile === "investor" && !stabilize
-            ? await countCurrentUnbuiltInvestorDirectives(repoPath, investorOutput)
-            : 0;
         while (
           shouldRunCursorAutomation(
             releaseOutput?.status,
@@ -4658,9 +4669,14 @@ program
 
           // Stop only on durable ship — post-Cursor green without commits does not count.
           // Keep going while investor directives are still unbuilt (e.g. ScanScreen collapse).
-          const unbuiltInvestorCount = cycleWorkScope
-            ? await countUnbuiltInvestorDirectives(repoPath, cycleWorkScope.investorDirectives)
-            : 0;
+          // Reuse the outer `let` — do not redeclare `const unbuiltInvestorCount` in this
+          // while-body (that shadows the outer binding and triggers TDZ at the top of the loop).
+          unbuiltInvestorCount =
+            loopProfile === "investor" && !stabilize
+              ? await countCurrentUnbuiltInvestorDirectives(repoPath, investorOutput)
+              : cycleWorkScope
+                ? await countUnbuiltInvestorDirectives(repoPath, cycleWorkScope.investorDirectives)
+                : 0;
           if (
             loopProfile === "investor" &&
             actionableWorkPacketOpenCount(workPacket) === 0 &&
