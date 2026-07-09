@@ -30,6 +30,8 @@ function packetItemKey(item) {
 }
 /** Not addressable by a normal Cursor coding pass — ops, GTM, hosted DB, or device-lab ACs. */
 export function isStructuralNonCodeBriefItem(text) {
+    if (isEnvironmentalWorkItem(text))
+        return true;
     const t = text.toLowerCase();
     if (/repeatable acquisition|acquisition channel|business\/marketing|marketing item/i.test(text))
         return true;
@@ -39,7 +41,44 @@ export function isStructuralNonCodeBriefItem(text) {
         return true;
     if (/supabase db push|hosted database|apply to the hosted|migration.*apply/i.test(t))
         return true;
+    if (/physical hardware capture|cold scans on target hardware|screencast.*first.session/i.test(t))
+        return true;
     return false;
+}
+export function isDeferredPlumbingWorkPacketItem(text) {
+    const t = text.toLowerCase();
+    return (/\b(instacart|receipt\s*\/\s*instacart)\b/.test(t) ||
+        (/\breceipt\b/.test(t) && /\b(ingest|ocr|parse|parsing)\b/.test(t)) ||
+        /\bout-of-slice plumbing\b/.test(t) ||
+        /\bdata.?ingestion feature\b/.test(t) ||
+        (/\bedge functions?\b/.test(t) && /\bingest\b/.test(t)));
+}
+function isMetaBuilderFeedbackPacketItem(text) {
+    const t = text.trim();
+    if (/^\*\*Feedback(?: item)? `fb-[a-f0-9]+`\*\*/i.test(t) && t.length < 220)
+        return true;
+    if (/\*\*Feedback `fb-/.test(t) && t.length < 200 && /\/\s*$/.test(t))
+        return true;
+    if (/^\*\*`dir-\d+[-a-z0-9]*`\*\*/i.test(t) && t.length < 220)
+        return true;
+    if (/^note:\s*the packet tasks\b/i.test(t))
+        return true;
+    if (/\bcarry `?files\[\]`? that are `?rg`? command/i.test(t))
+        return true;
+    if (/\bopen feedback ledger items with\b/i.test(t))
+        return true;
+    if (/^automation_log:/i.test(t))
+        return true;
+    if (/convergencecontract\.mvpboundary/i.test(t) && t.length < 220)
+        return true;
+    return false;
+}
+/** Open packet rows Cursor cannot productively close — manual lab work or builder-log echoes. */
+export function isNonActionableWorkPacketItem(text) {
+    return (isStructuralNonCodeBriefItem(text) ||
+        isNoOpPacketText(text) ||
+        isDeferredPlumbingWorkPacketItem(text) ||
+        isMetaBuilderFeedbackPacketItem(text));
 }
 function priorityForSection(section) {
     switch (section) {
@@ -254,8 +293,13 @@ export async function createWorkPacket(input) {
             reopenCount: 0,
         });
     };
-    for (const blocker of input.qaCodeBlockers)
+    for (const blocker of input.qaCodeBlockers) {
+        if (isNonActionableWorkPacketItem(blocker) || isEnvironmentalWorkItem(blocker)) {
+            extraManual.add(`[qa:env] ${blocker}`);
+            continue;
+        }
         push("qa", "qa", blocker);
+    }
     if (input.buildSpecPrimarySlice) {
         const slice = input.buildSpecPrimarySlice;
         if (slice.tasks.length > 0) {
@@ -283,12 +327,24 @@ export async function createWorkPacket(input) {
     for (const blocker of input.builderCodeBlockers) {
         if (isNoOpPacketText(blocker))
             continue;
+        if (isMetaBuilderFeedbackPacketItem(blocker)) {
+            extraManual.add(`[builder:meta] ${blocker}`);
+            continue;
+        }
+        if (isDeferredPlumbingWorkPacketItem(blocker)) {
+            extraManual.add(`[builder:deferred] ${blocker}`);
+            continue;
+        }
         if (isEnvironmentalBuilderGap(blocker)) {
             extraManual.add(`[builder:env] ${blocker}`);
             continue;
         }
         if (isStructuralNonCodeBriefItem(blocker)) {
             extraManual.add(`[builder] ${blocker}`);
+            continue;
+        }
+        if (isNonActionableWorkPacketItem(blocker)) {
+            extraManual.add(`[builder:noise] ${blocker}`);
             continue;
         }
         push("builder", isRuntimeFailureBuilderBlocker(blocker) ? "runtime" : "builder", blocker);
@@ -411,9 +467,27 @@ export function sampleOpenPacketItems(packet, maxTotal, maxLineLen = 120) {
     if (!packet)
         return [];
     return packet.items
-        .filter((item) => item.status === "open")
+        .filter((item) => item.status === "open" && !isNonActionableWorkPacketItem(item.text))
         .slice(0, maxTotal)
         .map((item) => `[${sectionLabel(item.section)}] ${truncate(item.text, maxLineLen)}`);
+}
+export async function syncNonActionablePacketClosure(repoPath, packet) {
+    let changed = false;
+    const items = packet.items.map((item) => {
+        if (item.status !== "open" || !isNonActionableWorkPacketItem(item.text))
+            return item;
+        changed = true;
+        return { ...item, status: "closed" };
+    });
+    if (!changed)
+        return packet;
+    const updated = {
+        ...packet,
+        updatedAt: new Date().toISOString(),
+        items,
+    };
+    await writePacketFiles(repoPath, updated);
+    return updated;
 }
 function truncate(text, maxLen) {
     const one = text.replace(/\s+/g, " ").trim();

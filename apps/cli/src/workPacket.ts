@@ -300,9 +300,15 @@ function choosePacketItems(candidates: WorkPacketItem[], maxItems: number): Work
 
 function isMetaBuilderFeedbackPacketItem(text: string): boolean {
   const t = text.trim();
+  // Truncated CURSOR_BUILDER_REPORT echoes — headers without a real product ask.
+  if (/^\*\*Feedback(?: item)? `fb-[a-f0-9]+`\*\*/i.test(t) && t.length < 220) return true;
   if (/\*\*Feedback `fb-/.test(t) && t.length < 200 && /\/\s*$/.test(t)) return true;
+  if (/^\*\*`dir-\d+[-a-z0-9]*`\*\*/i.test(t) && t.length < 220) return true;
+  if (/^note:\s*the packet tasks\b/i.test(t)) return true;
+  if (/\bcarry `?files\[\]`? that are `?rg`? command/i.test(t)) return true;
   if (/\bopen feedback ledger items with\b/i.test(t)) return true;
   if (/^automation_log:/i.test(t)) return true;
+  if (/convergencecontract\.mvpboundary/i.test(t) && t.length < 220) return true;
   return false;
 }
 
@@ -400,7 +406,13 @@ export async function createWorkPacket(input: WorkPacketSourceInput): Promise<Wo
     /* first packet */
   }
 
-  for (const blocker of input.qaCodeBlockers) push("qa", "qa", blocker);
+  for (const blocker of input.qaCodeBlockers) {
+    if (isNonActionableWorkPacketItem(blocker) || isEnvironmentalWorkItem(blocker)) {
+      extraManual.add(`[qa:env] ${blocker}`);
+      continue;
+    }
+    push("qa", "qa", blocker);
+  }
 
   // When the pipeline is QA-clean there are no live `qa` blockers, so a naive
   // rebuild would drop the leading QA row entirely. Because pkt-N ids are
@@ -450,6 +462,10 @@ export async function createWorkPacket(input: WorkPacketSourceInput): Promise<Wo
   }
   for (const blocker of input.builderCodeBlockers) {
     if (isNoOpPacketText(blocker)) continue;
+    if (isMetaBuilderFeedbackPacketItem(blocker)) {
+      extraManual.add(`[builder:meta] ${blocker}`);
+      continue;
+    }
     if (isDeferredPlumbingWorkPacketItem(blocker)) {
       extraManual.add(`[builder:deferred] ${blocker}`);
       continue;
@@ -460,6 +476,11 @@ export async function createWorkPacket(input: WorkPacketSourceInput): Promise<Wo
     }
     if (isStructuralNonCodeBriefItem(blocker)) {
       extraManual.add(`[builder] ${blocker}`);
+      continue;
+    }
+    // Truncated report headers are not product work — never drive Cursor.
+    if (isNonActionableWorkPacketItem(blocker)) {
+      extraManual.add(`[builder:noise] ${blocker}`);
       continue;
     }
     push("builder", isRuntimeFailureBuilderBlocker(blocker) ? "runtime" : "builder", blocker);
@@ -683,6 +704,28 @@ export async function syncDeferredPlumbingPacketClosure(
   let changed = false;
   const items = packet.items.map((item) => {
     if (item.status !== "open" || !isDeferredPlumbingWorkPacketItem(item.text)) return item;
+    changed = true;
+    return { ...item, status: "closed" as const };
+  });
+  if (!changed) return packet;
+
+  const updated: WorkPacket = {
+    ...packet,
+    updatedAt: new Date().toISOString(),
+    items,
+  };
+  await writePacketFiles(repoPath, updated);
+  return updated;
+}
+
+/** Close meta/env noise rows (truncated report headers, boot-simulator asks) so they never drive Cursor. */
+export async function syncNonActionablePacketClosure(
+  repoPath: string,
+  packet: WorkPacket,
+): Promise<WorkPacket> {
+  let changed = false;
+  const items = packet.items.map((item) => {
+    if (item.status !== "open" || !isNonActionableWorkPacketItem(item.text)) return item;
     changed = true;
     return { ...item, status: "closed" as const };
   });

@@ -565,6 +565,10 @@ export function isEnvironmentalWorkItem(text: string): boolean {
     /\bmaestro\b/.test(t) ||
     /\bsimctl\b/.test(t) ||
     /coresimulator/.test(t) ||
+    /boot an ios simulator/.test(t) ||
+    /no booted simulator/.test(t) ||
+    /connect a device/.test(t) && /re-run/.test(t) ||
+    /environmental — not a code failure/.test(t) ||
     /provisioning profile/.test(t) ||
     /\baps-environment\b/.test(t) ||
     /\beas\b/.test(t) ||
@@ -586,8 +590,8 @@ export function isEnvironmentalWorkItem(text: string): boolean {
     /empty at source/.test(t) ||
     /\(informational\)/.test(t) ||
     /primarysliceanchors.*mitigat/.test(t) ||
-    /convergence-contract-sync/.test(t) && /contract (line|block|sync)/.test(t) ||
-    /foundry-root-artifacts/.test(t) && /regression guard/.test(t)
+    (/convergence-contract-sync/.test(t) && /contract (line|block|sync)/.test(t)) ||
+    (/foundry-root-artifacts/.test(t) && /regression guard/.test(t))
   );
 }
 

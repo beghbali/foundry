@@ -106,6 +106,7 @@ import {
   syncBuilderDirectivePacketClosure,
   syncBuildSpecTaskPacketClosure,
   syncDeferredPlumbingPacketClosure,
+  syncNonActionablePacketClosure,
   type WorkPacket,
 } from "./workPacket.js";
 
@@ -3906,6 +3907,7 @@ program
       });
       workPacket = await syncBuildSpecTaskPacketClosure(repoPath, workPacket);
       workPacket = await syncDeferredPlumbingPacketClosure(repoPath, workPacket);
+      workPacket = await syncNonActionablePacketClosure(repoPath, workPacket);
       const cycleInvestorDirectives = dedupeInvestorDirectives(
         investorOutput?.combinedRefinementDirectives ??
           (await sampleInvestorDirectiveTargets(repoPath, investorOutput, 12)).map((line) =>
@@ -4167,6 +4169,7 @@ program
             workPacket = await syncBuilderDirectivePacketClosure(repoPath, workPacket);
             workPacket = await syncBuildSpecTaskPacketClosure(repoPath, workPacket);
             workPacket = await syncDeferredPlumbingPacketClosure(repoPath, workPacket);
+            workPacket = await syncNonActionablePacketClosure(repoPath, workPacket);
             activePacketCounts = packetBriefCounts(workPacket);
             if (loopProfile === "investor" && !stabilize) {
               unbuiltInvestorCount = await countCurrentUnbuiltInvestorDirectives(
@@ -4640,6 +4643,7 @@ program
           workPacket = await syncBuilderDirectivePacketClosure(repoPath, workPacket);
           workPacket = await syncBuildSpecTaskPacketClosure(repoPath, workPacket);
           workPacket = await syncDeferredPlumbingPacketClosure(repoPath, workPacket);
+          workPacket = await syncNonActionablePacketClosure(repoPath, workPacket);
           activePacketCounts = packetBriefCounts(workPacket);
           console.log(
             chalk.gray(

@@ -478,9 +478,21 @@ export async function reconcileInvestorDirectivesInLedger(repoPath) {
 /** Ops, device-lab, artifact, and infra noise — not product slices for Cursor. */
 export function isEnvironmentalWorkItem(text) {
     const t = text.toLowerCase();
-    return (/\bmaestro\b/.test(t) ||
+    return (/^automation_log:/.test(t.trim()) ||
+        /\bbuilder\.log\b/.test(t) ||
+        /\[process-error\]/.test(t) ||
+        /connection lost.*reconnecting/.test(t) ||
+        /physical hardware capture/.test(t) ||
+        /\bcold scans? on target hardware\b/.test(t) ||
+        /device benchmark json from account after/.test(t) ||
+        /investors must (still )?run \d+\+ cold scans/.test(t) ||
+        /\bmaestro\b/.test(t) ||
         /\bsimctl\b/.test(t) ||
         /coresimulator/.test(t) ||
+        /boot an ios simulator/.test(t) ||
+        /no booted simulator/.test(t) ||
+        (/connect a device/.test(t) && /re-run/.test(t)) ||
+        /environmental — not a code failure/.test(t) ||
         /provisioning profile/.test(t) ||
         /\baps-environment\b/.test(t) ||
         /\beas\b/.test(t) ||
@@ -493,7 +505,17 @@ export function isEnvironmentalWorkItem(text) {
         /playwright chromium/.test(t) ||
         /repository-wide hygiene/.test(t) ||
         /external to the repository/.test(t) ||
-        /not by product code/.test(t));
+        /not by product code/.test(t) ||
+        /grand wizard upstream/.test(t) ||
+        (/build_spec/.test(t) && /tasks\[\]/.test(t) && /empty/.test(t)) ||
+        /mitigated in product/.test(t) ||
+        /foundry loop --reset-spec/.test(t) ||
+        /upstream llm decomposition/.test(t) ||
+        /empty at source/.test(t) ||
+        /\(informational\)/.test(t) ||
+        /primarysliceanchors.*mitigat/.test(t) ||
+        (/convergence-contract-sync/.test(t) && /contract (line|block|sync)/.test(t)) ||
+        (/foundry-root-artifacts/.test(t) && /regression guard/.test(t)));
 }
 export function slugifySliceId(title) {
     return (title
